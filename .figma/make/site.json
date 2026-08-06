@@ -1,0 +1,10 @@
+{
+  "description": "CloudWise offers AI-driven cloud recommendations for businesses, simplifying provider selection and optimizing costs with an intuitive, user-friendly interface.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
