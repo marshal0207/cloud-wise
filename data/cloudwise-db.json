@@ -1,0 +1,194 @@
+{
+  "contacts": [
+    {
+      "id": "contact_1786785510736_jrdcy",
+      "name": "Alex Morgan",
+      "email": "alex@example.com",
+      "subject": "Consultation",
+      "message": "Test inquiry message",
+      "createdAt": "2026-08-15T09:18:30.736Z"
+    },
+    {
+      "id": "contact_1786790127380_qtieq",
+      "name": "Dhruvi",
+      "email": "dhruvik@gmail.com",
+      "subject": "Cloud Resource Consultation",
+      "message": "!!",
+      "createdAt": "2026-08-15T10:35:27.380Z"
+    }
+  ],
+  "estimations": [
+    {
+      "id": "est_1786786870375_oxnvc",
+      "appType": "AI / ML Model Inference & Training",
+      "vcpu": 18,
+      "ram": 84,
+      "storage": 500,
+      "traffic": "1,000,000 req/day",
+      "region": "Asia Pacific (Tokyo)",
+      "performanceTier": "High Performance",
+      "budgetTier": "Economy",
+      "calculatedResult": {
+        "minCost": 32130,
+        "maxCost": 47250,
+        "suggestedInstances": 5,
+        "bandwidthGB": 1800
+      },
+      "createdAt": "2026-08-15T09:41:10.376Z"
+    },
+    {
+      "id": "est_1786787315708_6jc15",
+      "appType": "Microservices & Web APIs",
+      "vcpu": 8,
+      "ram": 32,
+      "storage": 500,
+      "traffic": "1,000,000 req/day",
+      "region": "Gujarat (GIFT City / Gandhinagar)",
+      "performanceTier": "High Performance",
+      "budgetTier": "Balanced",
+      "calculatedResult": {
+        "minCost": 13607,
+        "maxCost": 20010,
+        "suggestedInstances": 2,
+        "bandwidthGB": 720
+      },
+      "createdAt": "2026-08-15T09:48:35.708Z"
+    },
+    {
+      "id": "est_1786787675201_rmo21",
+      "appType": "Microservices & Web APIs",
+      "vcpu": 8,
+      "ram": 32,
+      "storage": 500,
+      "traffic": "1,000,000 req/day",
+      "region": "Gujarat (GIFT City / Gandhinagar)",
+      "performanceTier": "High Performance",
+      "budgetTier": "Balanced",
+      "calculatedResult": {
+        "minCost": 13607,
+        "maxCost": 20010,
+        "suggestedInstances": 2,
+        "bandwidthGB": 720
+      },
+      "createdAt": "2026-08-15T09:54:35.201Z"
+    },
+    {
+      "id": "est_1786789965372_di6ny",
+      "appType": "Microservices & Web APIs",
+      "vcpu": 8,
+      "ram": 32,
+      "storage": 500,
+      "traffic": "1,000,000 req/day",
+      "region": "Gujarat (GIFT City / Gandhinagar)",
+      "performanceTier": "High Performance",
+      "budgetTier": "Balanced",
+      "calculatedResult": {
+        "minCost": 13607,
+        "maxCost": 20010,
+        "suggestedInstances": 2,
+        "bandwidthGB": 720
+      },
+      "createdAt": "2026-08-15T10:32:45.372Z"
+    },
+    {
+      "id": "est_1786789971146_a6ux1",
+      "appType": "Microservices & Web APIs",
+      "vcpu": 8,
+      "ram": 72,
+      "storage": 500,
+      "traffic": "1,000,000 req/day",
+      "region": "Gujarat (GIFT City / Gandhinagar)",
+      "performanceTier": "High Performance",
+      "budgetTier": "Balanced",
+      "calculatedResult": {
+        "minCost": 19863,
+        "maxCost": 29210,
+        "suggestedInstances": 2,
+        "bandwidthGB": 1320
+      },
+      "createdAt": "2026-08-15T10:32:51.146Z"
+    }
+  ],
+  "deployments": [
+    {
+      "id": "dep_1786790004493_zvf1b",
+      "environmentName": "cloudwise-prod-cluster",
+      "provider": "AWS",
+      "monthlyCost": 12280,
+      "specs": {
+        "vcpu": 8,
+        "ram": 32,
+        "storage": "500 GB NVMe SSD",
+        "network": "10 Gbps"
+      },
+      "region": "Gujarat (GIFT City / Gandhinagar)",
+      "status": "deployed",
+      "ipAddress": "35.195.179.95",
+      "endpointUrl": "https://cloudwise-prod-cluster.cloudwise.app",
+      "logs": [
+        "[4:03:24 pm] Provisioning initiated for cloudwise-prod-cluster...",
+        "[4:03:24 pm] Allocating elastic IP 35.195.179.95...",
+        "[4:03:24 pm] Mounting storage and establishing VPC routes...",
+        "[4:03:24 pm] Health probes passed. Deployment live at https://cloudwise-prod-cluster.cloudwise.app"
+      ],
+      "createdAt": "2026-08-15T10:33:24.493Z"
+    }
+  ],
+  "waitlist": [
+    {
+      "id": "wait_1786785518115_xsuu7",
+      "email": "dev@cloudwise.app",
+      "source": "test",
+      "createdAt": "2026-08-15T09:18:38.115Z"
+    }
+  ],
+  "optimizations": [],
+  "users": [
+    {
+      "id": "user_1786786656863_0ynyl",
+      "name": "Rohan Mehta",
+      "company": "TechMatrix India",
+      "email": "rohan.mehta@techmatrix.in",
+      "passwordHash": "5db73116a4bfa7874f4b32b015571793eb2ab4344c0ba92bb50f14994fb9affd69ea283220226f797f2cbe6f730ac887a50723908f99cde982113b187fdcf322",
+      "salt": "7b030c2fbffc376c527b10a1d4d49bf9",
+      "createdAt": "2026-08-15T09:37:36.863Z"
+    },
+    {
+      "id": "user_1786786834479_n4mxc",
+      "name": "Dhruvi",
+      "company": "charusat",
+      "email": "dhruvi@gmail.com",
+      "passwordHash": "1ddc0800ccc9e0557e2367c133a5d0a078d888c8775b2ceb53d77a3304c00d9ed76e3d80c9b1cdbe3488dbf2fef0dd7e55eb25d72173bf168f5ecc843b4b2163",
+      "salt": "dbf8af1aee4d8ddc21dee5ea3bf2f44c",
+      "createdAt": "2026-08-15T09:40:34.479Z"
+    },
+    {
+      "id": "user_1786787291328_zkrxh",
+      "name": "Priya Sharma",
+      "company": "Kavya Tech",
+      "email": "priya.sharma@kavyatech.in",
+      "passwordHash": "c0f67a68ec3295f66c3d9e6bb76c95d083c04c36d09cb0d8d253d18d3300de102d114396568d6801b71fb2d3dcf01cd9a503729e5766d3346a0eceedb70b0310",
+      "salt": "435fe498b913a3bfcd7cc9d6604d220c",
+      "createdAt": "2026-08-15T09:48:11.328Z"
+    },
+    {
+      "id": "user_1786787479315_kwfhw",
+      "name": "Dhruvi",
+      "company": "xyz",
+      "email": "dhruvii@gmail.com",
+      "passwordHash": "603c466c7e4bfa6a46c9d9281c93d1060238406c67c58e6aeb38d3f982e482a8ff90ec105c216601f18ce54dc9872927504900e67ee2ff085a633061e8f234eb",
+      "salt": "def417a55707699838da26d519839875",
+      "createdAt": "2026-08-15T09:51:19.315Z"
+    },
+    {
+      "id": "user_1786789938994_v0f27",
+      "name": "Dhruvi",
+      "company": "Charusat",
+      "email": "dhruvik@gmail.com",
+      "passwordHash": "91b2e83a94fce10cbb51a1a576c09dbbd7c4a12fc369ed808019ddbc82be44795c6aedd4d0de6ab35d09e4c44189fdaba594c2cdd31fbdcc7cdc25ee16a95a57",
+      "salt": "4b655dbbbd6984dd2bd5c146bc5b6cff",
+      "createdAt": "2026-08-15T10:32:18.994Z"
+    }
+  ],
+  "projects": []
+}
