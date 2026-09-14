@@ -4,7 +4,7 @@ import { Cloud, Github, Twitter, Linkedin, ArrowUpRight } from 'lucide-react';
 
 export const Footer: React.FC = () => {
   return (
-    <footer className="border-t border-slate-800/80 bg-slate-950/80 pt-12 pb-24 sm:pb-16 text-slate-400 text-sm">
+    <footer className="border-t border-slate-800/80 bg-slate-950/80 pt-12 pb-16 text-slate-400 text-sm">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <div className="grid grid-cols-1 md:grid-cols-4 gap-8 mb-10">
           

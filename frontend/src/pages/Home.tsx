@@ -127,95 +127,99 @@ export const Home: React.FC = () => {
     <div className="min-h-screen space-y-24 pb-20">
       
       {/* Hero Section */}
-      <section className="relative pt-12 md:pt-20 lg:pt-24 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center space-y-8">
-        
-        {/* Glow backdrop */}
-        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-96 h-96 bg-cyan-500/15 blur-[120px] rounded-full pointer-events-none -z-10" />
-        
-        <motion.div 
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.5 }}
-          className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-cyan-500/10 border border-cyan-500/30 text-cyan-300 text-xs font-semibold tracking-wide uppercase shadow-lg shadow-cyan-500/10"
-        >
-          <Sparkles className="w-3.5 h-3.5 text-cyan-400" />
-          <span>Next-Generation Cloud Resource Optimization</span>
-        </motion.div>
-
-        <motion.h1 
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.5, delay: 0.1 }}
-          className="text-4xl sm:text-6xl lg:text-7xl font-extrabold tracking-tight text-white max-w-5xl mx-auto leading-[1.15]"
-        >
-          Cloud Infrastructure Planning{' '}
-          <span className="text-gradient">Simplified & Cost-Optimized</span>
-        </motion.h1>
-
-        <motion.p 
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.5, delay: 0.2 }}
-          className="text-slate-400 text-lg sm:text-xl max-w-3xl mx-auto leading-relaxed"
-        >
-          Stop over-provisioning and wasting money on unoptimized cloud instances. CloudWise guides you through an end-to-end workflow to size, compare, generate deployment code, deploy, and tune workloads.
-        </motion.p>
-
-        {/* Hero CTAs */}
-        <motion.div 
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.5, delay: 0.3 }}
-          className="flex flex-col sm:flex-row items-center justify-center gap-4 pt-4"
-        >
-          {user ? (
-            <Link
-              to="/projects"
-              className="w-full sm:w-auto px-8 py-4 rounded-xl bg-gradient-to-r from-cyan-400 via-cyan-500 to-blue-600 hover:from-cyan-300 hover:to-blue-500 text-slate-950 font-bold text-base transition-all shadow-xl shadow-cyan-500/25 flex items-center justify-center gap-2 group active:scale-95"
-            >
-              <FolderPlus className="w-5 h-5" />
-              <span>Go to My Projects</span>
-              <ArrowRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
-            </Link>
-          ) : (
-            <Link
-              to="/auth"
-              className="w-full sm:w-auto px-8 py-4 rounded-xl bg-gradient-to-r from-cyan-400 via-cyan-500 to-blue-600 hover:from-cyan-300 hover:to-blue-500 text-slate-950 font-bold text-base transition-all shadow-xl shadow-cyan-500/25 flex items-center justify-center gap-2 group active:scale-95"
-            >
-              <UserPlus className="w-5 h-5" />
-              <span>Sign Up / Login</span>
-              <ArrowRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
-            </Link>
-          )}
-
-          <Link
-            to="/recommendation"
-            className="w-full sm:w-auto px-8 py-4 rounded-xl bg-slate-900/90 border border-slate-700/80 hover:border-cyan-500/50 hover:bg-slate-800/90 text-white font-semibold text-base transition-all flex items-center justify-center gap-2 active:scale-95"
+      <section className="relative mx-auto max-w-7xl px-4 pb-8 pt-14 sm:px-6 lg:px-8 lg:pb-12 lg:pt-20">
+        <div className="pointer-events-none absolute left-1/4 top-1/3 -z-10 h-72 w-72 rounded-full bg-cyan-500/10 blur-[120px]" />
+        <div className="grid items-center gap-12 lg:grid-cols-[0.9fr_1.1fr] lg:gap-16">
+          <motion.div
+            initial={{ opacity: 0, x: -24 }}
+            animate={{ opacity: 1, x: 0 }}
+            transition={{ duration: 0.55 }}
+            className="space-y-7"
           >
-            <span>Compare Cloud Providers</span>
-          </Link>
-        </motion.div>
+            <div className="inline-flex items-center gap-2 rounded-full border border-cyan-500/30 bg-cyan-500/10 px-4 py-1.5 text-xs font-semibold uppercase tracking-wide text-cyan-300">
+              <Sparkles className="h-3.5 w-3.5 text-cyan-400" />
+              <span>Cloud resource intelligence</span>
+            </div>
 
-        {/* Metrics Grid */}
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 max-w-4xl mx-auto pt-10">
-          <div className="glass-card p-4 rounded-xl text-center space-y-1">
-            <p className="text-2xl sm:text-3xl font-bold text-cyan-400">32%</p>
-            <p className="text-xs text-slate-400 font-medium">Avg. Cost Savings</p>
-          </div>
-          <div className="glass-card p-4 rounded-xl text-center space-y-1">
-            <p className="text-2xl sm:text-3xl font-bold text-indigo-400">4 Major</p>
-            <p className="text-xs text-slate-400 font-medium">Clouds Supported</p>
-          </div>
-          <div className="glass-card p-4 rounded-xl text-center space-y-1">
-            <p className="text-2xl sm:text-3xl font-bold text-teal-400">99.99%</p>
-            <p className="text-xs text-slate-400 font-medium">SLA Target Accuracy</p>
-          </div>
-          <div className="glass-card p-4 rounded-xl text-center space-y-1">
-            <p className="text-2xl sm:text-3xl font-bold text-amber-400">&lt; 2 min</p>
-            <p className="text-xs text-slate-400 font-medium">Estimation to Deploy</p>
-          </div>
+            <div className="space-y-1">
+              <p className="text-4xl font-extrabold tracking-tight text-white sm:text-6xl">COST</p>
+              <p className="text-5xl font-black tracking-tight text-gradient sm:text-7xl">OPTIMIZATION</p>
+              <p className="text-4xl font-extrabold tracking-tight text-white sm:text-6xl">&amp; AUTO DEPLOY.</p>
+            </div>
+
+            <p className="max-w-xl text-base leading-relaxed text-slate-400 sm:text-lg">
+              Size workloads accurately, remove cloud waste, and move from a recommendation to a production-ready deployment in one guided workflow.
+            </p>
+
+            <div className="flex flex-col gap-3 sm:flex-row">
+              {user ? (
+                <Link to="/projects" className="flex items-center justify-center gap-2 rounded-lg bg-cyan-400 px-6 py-3.5 text-sm font-bold text-slate-950 shadow-lg shadow-cyan-500/20 transition-all hover:bg-cyan-300 active:scale-95">
+                  <FolderPlus className="h-4 w-4" />
+                  Go to My Projects
+                  <ArrowRight className="h-4 w-4" />
+                </Link>
+              ) : (
+                <Link to="/auth" className="flex items-center justify-center gap-2 rounded-lg bg-cyan-400 px-6 py-3.5 text-sm font-bold text-slate-950 shadow-lg shadow-cyan-500/20 transition-all hover:bg-cyan-300 active:scale-95">
+                  <UserPlus className="h-4 w-4" />
+                  Start Planning
+                  <ArrowRight className="h-4 w-4" />
+                </Link>
+              )}
+              <Link to="/recommendation" className="flex items-center justify-center gap-2 rounded-lg border border-slate-700 bg-slate-900/80 px-6 py-3.5 text-sm font-semibold text-white transition-colors hover:border-cyan-500/50 hover:bg-slate-800">
+                Compare Providers
+              </Link>
+            </div>
+
+            <div className="grid max-w-lg grid-cols-3 gap-3 border-t border-slate-800/80 pt-5">
+              <div><p className="text-xl font-bold text-cyan-400">32%</p><p className="text-[11px] text-slate-500">Avg. savings</p></div>
+              <div><p className="text-xl font-bold text-cyan-400">4</p><p className="text-[11px] text-slate-500">Cloud providers</p></div>
+              <div><p className="text-xl font-bold text-cyan-400">&lt;2 min</p><p className="text-[11px] text-slate-500">To deploy</p></div>
+            </div>
+          </motion.div>
+
+          <motion.div
+            initial={{ opacity: 0, x: 24 }}
+            animate={{ opacity: 1, x: 0 }}
+            transition={{ duration: 0.55, delay: 0.1 }}
+            className="relative"
+          >
+            <div className="absolute -right-2 top-6 h-full w-1 rounded-full bg-cyan-400 shadow-[0_0_18px_rgba(34,211,238,0.7)]" />
+            <div className="overflow-hidden rounded-xl border border-slate-700 bg-slate-950/95 shadow-2xl shadow-cyan-950/30">
+              <div className="flex items-center justify-between border-b border-slate-800 px-5 py-4">
+                <div className="flex items-center gap-2 text-sm font-bold text-white">
+                  <Rocket className="h-4 w-4 text-cyan-400" />
+                  AUTO DEPLOY WORKFLOW
+                </div>
+                <span className="rounded border border-cyan-500/30 bg-cyan-500/10 px-2 py-1 font-mono text-[10px] text-cyan-300">RUN 04 / 05</span>
+              </div>
+              <div className="space-y-5 p-5 sm:p-7">
+                <div className="flex items-center justify-between rounded-lg border border-cyan-500/30 bg-slate-900/80 p-4">
+                  <div>
+                    <div className="flex items-center gap-2 text-sm font-bold text-white"><span className="h-2 w-2 animate-pulse rounded-full bg-emerald-400" />Provisioning live</div>
+                    <p className="mt-1 text-xs text-slate-500">Production cluster · Mumbai region</p>
+                  </div>
+                  <span className="text-xs font-bold text-emerald-400">ACTIVE</span>
+                </div>
+
+                <div className="space-y-3">
+                  {['Validating workload profile', 'Selecting lowest-cost instance', 'Generating deployment files', 'Provisioning cloud resources'].map((step, index) => (
+                    <div key={step} className="flex items-center gap-3 rounded-lg border border-slate-800 bg-slate-900/50 px-3 py-3">
+                      <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-400" />
+                      <span className="flex-1 text-xs font-semibold text-slate-200">{step}</span>
+                      <span className="font-mono text-[10px] text-slate-500">0{index + 1}</span>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="rounded-lg border border-slate-800 bg-black/30 p-4 font-mono text-[11px] leading-6 text-slate-400">
+                  <p><span className="text-cyan-400">&gt;</span> cloudwise plan --optimize</p>
+                  <p><span className="text-emerald-400">✓</span> Estimated monthly cost: <span className="text-white">₹14,280</span></p>
+                  <p><span className="text-emerald-400">✓</span> Deployment target ready</p>
+                </div>
+              </div>
+            </div>
+          </motion.div>
         </div>
-
       </section>
 
       {/* Interactive CloudWise Workflow Section */}

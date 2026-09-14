@@ -111,6 +111,18 @@ export const defaultEstimation: EstimationData = {
 
 export const defaultRecommendations: RecommendationOption[] = [
   {
+    id: 'aws-free-tier-demo',
+    title: 'AWS Free Tier Demo (t3.micro)',
+    provider: 'AWS',
+    badge: 'Budget Option',
+    specs: { vcpu: 2, ram: 1, storage: '20 GB EBS', network: 'Up to 5 Gbps' },
+    monthlyCost: 0,
+    hourlyCost: 0,
+    reliability: 'Free Tier eligible (account dependent)',
+    features: ['Single-instance deployment', '20 GB EBS storage', 'Basic Docker workload', 'Free Tier usage limits enforced'],
+    reasoning: 'A small single-instance profile for CloudWise demo deployments. AWS Free Tier eligibility depends on the account and remaining usage allowance.'
+  },
+  {
     id: 'aws-rec-1',
     title: 'AWS Production Cluster (c6i.xlarge)',
     provider: 'AWS',

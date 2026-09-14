@@ -71,7 +71,12 @@ export const Contact: React.FC = () => {
     <div className="min-h-screen max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10 space-y-12">
       
       {/* Header */}
-      <div className="text-center space-y-3 max-w-3xl mx-auto">
+      <motion.div
+        initial={{ opacity: 0, x: -24 }}
+        animate={{ opacity: 1, x: 0 }}
+        transition={{ duration: 0.45, delay: 0.08, ease: [0.22, 1, 0.36, 1] }}
+        className="text-center space-y-3 max-w-3xl mx-auto"
+      >
         <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-cyan-500/10 border border-cyan-500/30 text-cyan-300 text-xs font-semibold">
           <Mail className="w-3.5 h-3.5" />
           <span>Contact CloudWise</span>
@@ -82,12 +87,17 @@ export const Contact: React.FC = () => {
         <p className="text-slate-400 text-sm sm:text-base leading-relaxed">
           Have questions about multi-cloud estimation, custom enterprise SLA matching, or cost optimization strategies? Send us a message below.
         </p>
-      </div>
+      </motion.div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
         
         {/* Contact Information & Support Cards */}
-        <div className="space-y-6 lg:col-span-1">
+        <motion.div
+          initial={{ opacity: 0, x: -32 }}
+          animate={{ opacity: 1, x: 0 }}
+          transition={{ duration: 0.5, delay: 0.16, ease: [0.22, 1, 0.36, 1] }}
+          className="space-y-6 lg:col-span-1"
+        >
           
           <div className="glass-panel p-6 rounded-3xl space-y-6 border border-slate-800">
             <h3 className="text-base font-bold text-white flex items-center gap-2">
@@ -140,10 +150,15 @@ export const Contact: React.FC = () => {
             </p>
           </div>
 
-        </div>
+        </motion.div>
 
         {/* Contact Form Column */}
-        <div className="lg:col-span-2 glass-panel p-6 sm:p-8 rounded-3xl border border-slate-800 space-y-6">
+        <motion.div
+          initial={{ opacity: 0, x: 40 }}
+          animate={{ opacity: 1, x: 0 }}
+          transition={{ duration: 0.55, delay: 0.2, ease: [0.22, 1, 0.36, 1] }}
+          className="lg:col-span-2 glass-panel p-6 sm:p-8 rounded-3xl border border-slate-800 space-y-6"
+        >
           
           {submitted ? (
             <motion.div
@@ -253,7 +268,7 @@ export const Contact: React.FC = () => {
             </form>
           )}
 
-        </div>
+        </motion.div>
 
       </div>
 

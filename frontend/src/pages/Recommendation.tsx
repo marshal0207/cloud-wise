@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { 
@@ -20,13 +20,49 @@ export const Recommendation: React.FC = () => {
   const { estimation, availableRecommendations, selectedRecommendation, setSelectedRecommendation } = useCloudWise();
   
   const [detailModalItem, setDetailModalItem] = useState<RecommendationOption | null>(null);
+  const [recommendations, setRecommendations] = useState(availableRecommendations);
+  const [awsPricingStatus, setAwsPricingStatus] = useState<'loading' | 'live' | 'estimate'>('loading');
+
+  useEffect(() => {
+    const loadAwsPricing = async () => {
+      try {
+        const response = await fetch(
+          `/api/pricing/aws?instanceType=c6i.xlarge&region=${encodeURIComponent('Asia Pacific (Mumbai)')}`
+        );
+        const data = await response.json();
+        if (!response.ok || !data.success) {
+          throw new Error(data.error || 'AWS pricing unavailable');
+        }
+
+        setRecommendations((current) => current.map((recommendation) => (
+          recommendation.id === 'aws-rec-1'
+            ? {
+                ...recommendation,
+                monthlyCost: data.data.monthlyInr,
+                hourlyCost: data.data.hourlyUsd,
+                reasoning: `${(recommendation.reasoning || '').split(' Live AWS Pricing API rate:')[0]} Live AWS Pricing API rate: $${data.data.hourlyUsd}/hour, converted at ₹${data.data.usdToInrRate}/USD.`
+              }
+            : recommendation
+        )));
+        setAwsPricingStatus('live');
+      } catch {
+        setAwsPricingStatus('estimate');
+      }
+    };
+
+    loadAwsPricing();
+  }, []);
+
+  const selectedDisplayRecommendation = recommendations.find(
+    (recommendation) => recommendation.id === selectedRecommendation.id
+  ) || selectedRecommendation;
 
   const handleSelectAndProceed = (rec: RecommendationOption) => {
     setSelectedRecommendation(rec);
     navigate('/generate');
   };
 
-  const aiPick = availableRecommendations.find((r) => r.badge === 'Recommended') || availableRecommendations[0];
+  const aiPick = recommendations.find((r) => r.badge === 'Recommended') || recommendations[0];
 
   return (
     <div className="min-h-screen max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10 space-y-10">
@@ -42,6 +78,9 @@ export const Recommendation: React.FC = () => {
         </h1>
         <p className="text-slate-400 text-sm sm:text-base leading-relaxed">
           Based on your workload profile (<strong className="text-cyan-300">{estimation.appType}</strong> requiring ~{estimation.vcpu} vCPUs & {estimation.ram}GB RAM in {estimation.region}), we matched 4 top cloud configurations.
+        </p>
+        <p className="text-[11px] text-slate-500">
+          AWS pricing: {awsPricingStatus === 'loading' ? 'loading live rate...' : awsPricingStatus === 'live' ? 'live AWS Pricing API' : 'estimated fallback'}; other providers are estimated.
         </p>
       </div>
 
@@ -77,20 +116,20 @@ export const Recommendation: React.FC = () => {
         <div className="space-y-1 text-center md:text-left">
           <span className="text-xs font-semibold text-slate-400">Currently Selected Configuration</span>
           <p className="text-xl font-bold text-white flex items-center gap-2 justify-center md:justify-start">
-            <span>{selectedRecommendation.title}</span>
+            <span>{selectedDisplayRecommendation.title}</span>
             <span className="px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300 text-xs font-semibold border border-cyan-500/40">
-              {selectedRecommendation.badge}
+              {selectedDisplayRecommendation.badge}
             </span>
           </p>
           <p className="text-xs text-slate-400">
-            {selectedRecommendation.specs.vcpu} vCPU • {selectedRecommendation.specs.ram}GB RAM • {selectedRecommendation.specs.storage} • {selectedRecommendation.reliability}
+            {selectedDisplayRecommendation.specs.vcpu} vCPU • {selectedDisplayRecommendation.specs.ram}GB RAM • {selectedDisplayRecommendation.specs.storage} • {selectedDisplayRecommendation.reliability}
           </p>
         </div>
 
         <div className="flex items-center gap-4">
           <div className="text-right">
             <span className="text-[11px] text-slate-400 block">Est. Cost</span>
-            <span className="text-2xl font-extrabold text-cyan-400">{formatINR(selectedRecommendation.monthlyCost)}/mo</span>
+            <span className="text-2xl font-extrabold text-cyan-400">{formatINR(selectedDisplayRecommendation.monthlyCost)}/mo</span>
           </div>
           <button
             onClick={() => handleSelectAndProceed(selectedRecommendation)}
@@ -104,7 +143,7 @@ export const Recommendation: React.FC = () => {
 
       {/* Cards Comparison Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-        {availableRecommendations.map((rec) => {
+        {recommendations.map((rec) => {
           const isSelected = selectedRecommendation.id === rec.id;
 
           const getBadgeColor = (badge: string) => {
@@ -218,9 +257,9 @@ export const Recommendation: React.FC = () => {
 
       {/* Continue to File Generation Action Bar */}
       <div className="glass-panel p-6 rounded-3xl text-center space-y-4 max-w-xl mx-auto border border-cyan-500/20">
-        <h4 className="text-base font-bold text-white">Accept {selectedRecommendation.provider} Configuration?</h4>
+        <h4 className="text-base font-bold text-white">Accept {selectedDisplayRecommendation.provider} Configuration?</h4>
         <p className="text-xs text-slate-400">
-          Selected <strong className="text-cyan-300">{selectedRecommendation.title}</strong> at {formatINR(selectedRecommendation.monthlyCost)}/month. Proceed to generate Dockerfile and CI/CD code.
+          Selected <strong className="text-cyan-300">{selectedDisplayRecommendation.title}</strong> at {formatINR(selectedDisplayRecommendation.monthlyCost)}/month. Proceed to generate Dockerfile and CI/CD code.
         </p>
         <button
           onClick={() => handleSelectAndProceed(selectedRecommendation)}

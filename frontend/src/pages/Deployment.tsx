@@ -32,8 +32,16 @@ export const Deployment: React.FC = () => {
   const [envName, setEnvName] = useState(deployment.environmentName || 'cloudwise-prod-cluster');
   const [autoScaling, setAutoScaling] = useState(true);
   const [dailyBackup, setDailyBackup] = useState(true);
+  const [showDeployConfirmation, setShowDeployConfirmation] = useState(false);
+  const storageGb = Number(selectedRecommendation.specs.storage.match(/\d+/)?.[0] || 0);
+  const deploymentEligible = selectedRecommendation.specs.vcpu <= 2
+    && selectedRecommendation.specs.ram <= 2
+    && storageGb <= 30;
 
   const handleDeploy = async (simulateError = false) => {
+    if (!deploymentEligible) {
+      return;
+    }
     startSimulatedDeployment(envName, simulateError);
     try {
       await fetch('/api/deploy', {
@@ -52,6 +60,11 @@ export const Deployment: React.FC = () => {
     } catch (err) {
       console.warn('Backend deployment tracking skipped:', err);
     }
+  };
+
+  const handleConfirmDeployment = () => {
+    setShowDeployConfirmation(false);
+    void handleDeploy(false);
   };
 
   const steps = [
@@ -182,7 +195,7 @@ export const Deployment: React.FC = () => {
             {deployment.status === 'idle' && (
               <div className="space-y-2 pt-2">
                 <button
-                  onClick={() => handleDeploy(false)}
+                  onClick={() => setShowDeployConfirmation(true)}
                   className="w-full py-4 rounded-xl bg-gradient-to-r from-cyan-400 via-cyan-500 to-blue-600 hover:from-cyan-300 hover:to-blue-500 text-slate-950 font-bold text-sm transition-all shadow-xl shadow-cyan-500/25 flex items-center justify-center gap-2 active:scale-98"
                 >
                   <Rocket className="w-5 h-5" />
@@ -385,6 +398,65 @@ export const Deployment: React.FC = () => {
         </div>
 
       </div>
+
+      {showDeployConfirmation && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
+          <div className="glass-panel max-w-lg w-full p-6 sm:p-8 rounded-3xl space-y-6 border border-cyan-500/40 shadow-2xl">
+            <div className="space-y-2">
+              <span className="text-xs font-bold text-cyan-400 uppercase tracking-wider">Deployment Confirmation</span>
+              <h3 className="text-2xl font-extrabold text-white">Use this configuration?</h3>
+              <p className="text-xs text-slate-400 leading-relaxed">
+                Review the selected plan before starting the provisioning pipeline. Cancel to return without deploying.
+              </p>
+            </div>
+
+            <div className="bg-slate-900/80 p-4 rounded-2xl border border-slate-800 space-y-3 text-xs">
+              <div className="flex items-center justify-between gap-4">
+                <span className="text-slate-400">Provider and plan</span>
+                <span className="font-bold text-white text-right">{selectedRecommendation.provider} · {selectedRecommendation.title}</span>
+              </div>
+              <div className="flex items-center justify-between gap-4">
+                <span className="text-slate-400">Region</span>
+                <span className="font-bold text-white text-right">{estimation.region}</span>
+              </div>
+              <div className="flex items-center justify-between gap-4">
+                <span className="text-slate-400">Resources</span>
+                <span className="font-bold text-white text-right">{selectedRecommendation.specs.vcpu} vCPU · {selectedRecommendation.specs.ram} GB RAM</span>
+              </div>
+              <div className="flex items-center justify-between gap-4">
+                <span className="text-slate-400">Storage</span>
+                <span className="font-bold text-white text-right">{selectedRecommendation.specs.storage}</span>
+              </div>
+              <div className="flex items-center justify-between gap-4 border-t border-slate-800 pt-3">
+                <span className="text-slate-400">Estimated monthly cost</span>
+                <span className="font-extrabold text-cyan-300 text-base">{formatINR(selectedRecommendation.monthlyCost)}/mo</span>
+              </div>
+            </div>
+
+            {!deploymentEligible && (
+              <div className="p-4 rounded-2xl bg-amber-500/10 border border-amber-500/40 text-amber-200 text-xs leading-relaxed">
+                This selected plan exceeds the AWS Free Tier demo limit. Choose a plan with up to 2 vCPU, 2 GB RAM, and 30 GB storage before deploying.
+              </div>
+            )}
+
+            <div className="flex flex-col-reverse sm:flex-row gap-3">
+              <button
+                onClick={() => setShowDeployConfirmation(false)}
+                className="flex-1 py-3.5 rounded-xl bg-slate-900 border border-slate-700 text-slate-200 font-semibold text-xs hover:bg-slate-800"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleConfirmDeployment}
+                disabled={!deploymentEligible}
+                className="flex-1 py-3.5 rounded-xl bg-gradient-to-r from-cyan-400 to-blue-600 hover:from-cyan-300 hover:to-blue-500 text-slate-950 font-bold text-xs transition-all shadow-lg shadow-cyan-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {deploymentEligible ? 'Confirm & Start Deployment' : 'Plan Exceeds Free Tier'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
     </div>
   );

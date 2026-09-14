@@ -1,5 +1,6 @@
 import React from 'react';
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
+import { AnimatePresence, motion } from 'framer-motion';
 import { 
   Home as HomeIcon, 
   Folder,
@@ -16,7 +17,7 @@ import {
 import { CloudWiseProvider } from '@/context/CloudWiseContext';
 import { Header } from '@/components/Header';
 import { Footer } from '@/components/Footer';
-import { NavBar, NavItem } from '@/components/ui/tubelight-navbar';
+import { SlideTabItem } from '@/components/ui/slide-tabs';
 
 import { Home } from '@/pages/Home';
 import { Projects } from '@/pages/Projects';
@@ -29,7 +30,7 @@ import { About } from '@/pages/About';
 import { Contact } from '@/pages/Contact';
 import { Auth } from '@/pages/Auth';
 
-const navItems: NavItem[] = [
+const navItems: SlideTabItem[] = [
   { name: 'Home', url: '/', icon: HomeIcon },
   { name: 'Projects', url: '/projects', icon: Folder },
   { name: 'Estimation', url: '/estimation', icon: Calculator },
@@ -41,6 +42,38 @@ const navItems: NavItem[] = [
   { name: 'Contact', url: '/contact', icon: Mail },
 ];
 
+const AnimatedRoutes: React.FC = () => {
+  const location = useLocation();
+
+  return (
+    <AnimatePresence mode="wait" initial={false}>
+      <motion.div
+        key={location.pathname}
+        initial={{ opacity: 0, y: 12 }}
+        animate={{ opacity: 1, x: 0, y: 0 }}
+        exit={{ opacity: 0, y: -8 }}
+        transition={{ duration: 0.28, ease: [0.22, 1, 0.36, 1] }}
+        className="min-h-full"
+      >
+        <Routes location={location}>
+          <Route path="/" element={<Home />} />
+          <Route path="/projects" element={<Projects />} />
+          <Route path="/estimation" element={<Estimation />} />
+          <Route path="/recommendation" element={<Recommendation />} />
+          <Route path="/generate" element={<GenerateFiles />} />
+          <Route path="/deployment" element={<Deployment />} />
+          <Route path="/optimization" element={<Optimization />} />
+          <Route path="/about" element={<About />} />
+          <Route path="/contact" element={<Contact />} />
+          <Route path="/auth" element={<Auth />} />
+          <Route path="/monitoring" element={<Navigate to="/projects" replace />} />
+          <Route path="*" element={<Home />} />
+        </Routes>
+      </motion.div>
+    </AnimatePresence>
+  );
+};
+
 export const App: React.FC = () => {
   return (
     <CloudWiseProvider>
@@ -48,29 +81,11 @@ export const App: React.FC = () => {
         <div className="flex flex-col min-h-screen relative bg-slate-950 text-slate-100">
           
           {/* Main Top Header */}
-          <Header />
-
-          {/* Tubelight Floating Navbar */}
-          <NavBar items={navItems} />
+          <Header navItems={navItems} />
 
           {/* Main Viewport Content Container */}
-          <main className="flex-1 pt-6 pb-28 sm:pb-28">
-            <Routes>
-              <Route path="/" element={<Home />} />
-              <Route path="/projects" element={<Projects />} />
-              <Route path="/estimation" element={<Estimation />} />
-              <Route path="/recommendation" element={<Recommendation />} />
-              <Route path="/generate" element={<GenerateFiles />} />
-              <Route path="/deployment" element={<Deployment />} />
-              <Route path="/optimization" element={<Optimization />} />
-              <Route path="/about" element={<About />} />
-              <Route path="/contact" element={<Contact />} />
-              <Route path="/auth" element={<Auth />} />
-              {/* Module 8 is intentionally excluded. Redirect any old /monitoring links to /projects */}
-              <Route path="/monitoring" element={<Navigate to="/projects" replace />} />
-              {/* Fallback route back to Home */}
-              <Route path="*" element={<Home />} />
-            </Routes>
+          <main className="flex-1 pt-6 pb-12">
+            <AnimatedRoutes />
           </main>
 
           {/* Footer */}

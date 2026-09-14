@@ -116,6 +116,15 @@ SIMPLE_JWT = {
     'AUTH_HEADER_TYPES': ('Bearer', 'cw_token'),
 }
 
+# GitHub OAuth configuration. Keep the client secret server-side only.
+GITHUB_CLIENT_ID = os.getenv('GITHUB_CLIENT_ID', '')
+GITHUB_CLIENT_SECRET = os.getenv('GITHUB_CLIENT_SECRET', '')
+GITHUB_REDIRECT_URI = os.getenv(
+    'GITHUB_REDIRECT_URI',
+    'http://127.0.0.1:8000/api/github/oauth/callback'
+)
+FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:5173')
+
 # CORS Configuration
 CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOW_CREDENTIALS = True

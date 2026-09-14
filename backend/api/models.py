@@ -220,3 +220,15 @@ class WaitlistSubscriber(models.Model):
 
     def __str__(self):
         return self.email
+
+
+class GitHubConnection(models.Model):
+    user = models.OneToOneField(CustomUser, on_delete=models.CASCADE, related_name='github_connection')
+    access_token = models.TextField()
+    github_user_id = models.CharField(max_length=100)
+    github_login = models.CharField(max_length=255)
+    connected_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"GitHub connection for {self.user.email or self.user.username}"

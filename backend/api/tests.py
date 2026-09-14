@@ -100,7 +100,8 @@ class BackendApiTests(TestCase):
         data = {
             'environmentName': 'demo-prod',
             'provider': 'AWS',
-            'monthlyCost': 15000
+            'monthlyCost': 15000,
+            'specs': {'vcpu': 2, 'ram': 2, 'storage': '30 GB EBS'}
         }
         res = self.client.post('/api/deploy', data=data, content_type='application/json')
         self.assertEqual(res.status_code, 200)

@@ -1,6 +1,15 @@
 import random
 import math
+import re
+import secrets
+import urllib.error
+import urllib.parse
+import urllib.request
+import json
 from datetime import datetime
+from django.conf import settings
+from django.core import signing
+from django.shortcuts import redirect
 from django.utils import timezone
 from django.contrib.auth import get_user_model, authenticate
 from rest_framework import status, permissions
@@ -14,6 +23,7 @@ from .models import (
     EstimationRecord, 
     DeploymentRecord, 
     WaitlistSubscriber,
+        GitHubConnection,
     default_estimation,
     default_recommendation,
     default_deployment,
@@ -30,6 +40,10 @@ from .serializers import (
     WaitlistSubscriberSerializer
 )
 from .permissions import IsProjectRolePermission
+from .services.deployment_file_generator import generate_deployment_files
+from .services.github_service import GitHubApiError, push_files_to_repository
+from .services.aws_pricing_service import AwsPricingError, get_aws_price_snapshot
+from .services.free_tier_policy import FreeTierLimitError, validate_free_tier_deployment
 
 User = get_user_model()
 
@@ -315,6 +329,63 @@ def project_github_connect_view(request, pk):
     }, status=status.HTTP_200_OK)
 
 
+@api_view(['POST'])
+@permission_classes([permissions.IsAuthenticated])
+def project_github_push_view(request, pk):
+    try:
+        project = Project.objects.get(pk=pk, user=request.user)
+    except Project.DoesNotExist:
+        return Response({
+            'success': False,
+            'error': 'Project not found or access denied.'
+        }, status=status.HTTP_404_NOT_FOUND)
+
+    if project.user_role == 'viewer' or request.user.role == 'viewer':
+        return Response({
+            'success': False,
+            'error': 'Access Denied (RBAC): Viewer role cannot push files.'
+        }, status=status.HTTP_403_FORBIDDEN)
+
+    files = request.data.get('files')
+    commit_message = request.data.get('commit_message', 'Add CloudWise deployment configuration')
+    repository = project.github_repo or {}
+    if not isinstance(files, dict) or not files:
+        return Response({
+            'success': False,
+            'error': 'Generated files must be provided as a non-empty object.'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    if not repository.get('name'):
+        return Response({
+            'success': False,
+            'error': 'Select a GitHub repository before pushing files.'
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        connection = request.user.github_connection
+        result = push_files_to_repository(
+            connection.access_token,
+            repository,
+            files,
+            commit_message,
+        )
+    except GitHubConnection.DoesNotExist:
+        return Response({
+            'success': False,
+            'error': 'Connect a GitHub account before pushing files.'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    except (GitHubApiError, ValueError) as exc:
+        return Response({
+            'success': False,
+            'error': str(exc)
+        }, status=status.HTTP_502_BAD_GATEWAY)
+
+    return Response({
+        'success': True,
+        'message': 'CloudWise deployment files committed successfully.',
+        'data': result,
+    }, status=status.HTTP_200_OK)
+
+
 # -------------------------------------------------------------
 # Core Application Endpoints
 # -------------------------------------------------------------
@@ -400,6 +471,21 @@ def deploy_view(request):
     monthly_cost = data.get('monthlyCost', 12280)
     specs = data.get('specs', {'vcpu': 8, 'ram': 32, 'storage': '500 GB NVMe'})
     region = data.get('region', 'Asia Pacific (Mumbai)')
+
+    try:
+        storage_value = specs.get('storage', 0)
+        storage_match = re.search(r'\d+', str(storage_value))
+        validate_free_tier_deployment(
+            vcpu=int(specs.get('vcpu', 0)),
+            ram_gb=int(specs.get('ram', 0)),
+            storage_gb=int(storage_match.group()) if storage_match else 0,
+            instances=int(data.get('instances', 1)),
+        )
+    except (AttributeError, TypeError, ValueError, FreeTierLimitError) as exc:
+        return Response({
+            'success': False,
+            'error': str(exc),
+        }, status=status.HTTP_400_BAD_REQUEST)
 
     random_ip = f"35.{random.randint(10, 210)}.{random.randint(0, 255)}.{random.randint(0, 255)}"
     endpoint = f"https://{env_name.lower().replace(' ', '-')}.cloudwise.app"
@@ -487,6 +573,144 @@ def health_view(request):
     }, status=status.HTTP_200_OK)
 
 
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated])
+def github_oauth_start_view(request):
+    if not settings.GITHUB_CLIENT_ID:
+        return Response({
+            'success': False,
+            'error': 'GitHub OAuth is not configured on the server.'
+        }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+    state = signing.dumps({
+        'user_id': str(request.user.id),
+        'nonce': secrets.token_urlsafe(32),
+    })
+    query = urllib.parse.urlencode({
+        'client_id': settings.GITHUB_CLIENT_ID,
+        'redirect_uri': settings.GITHUB_REDIRECT_URI,
+        'scope': 'repo workflow',
+        'state': state,
+    })
+    return Response({
+        'success': True,
+        'authorizationUrl': f'https://github.com/login/oauth/authorize?{query}'
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+@permission_classes([permissions.AllowAny])
+def github_oauth_callback_view(request):
+    code = request.query_params.get('code')
+    state = request.query_params.get('state')
+    try:
+        state_data = signing.loads(state or '', max_age=600)
+    except (signing.BadSignature, signing.SignatureExpired):
+        state_data = None
+
+    if not code or not state_data or not state_data.get('user_id'):
+        return Response({
+            'success': False,
+            'error': 'Invalid GitHub OAuth callback state or authorization code.'
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    if not settings.GITHUB_CLIENT_ID or not settings.GITHUB_CLIENT_SECRET:
+        return Response({
+            'success': False,
+            'error': 'GitHub OAuth is not configured on the server.'
+        }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+    user_id = state_data['user_id']
+
+    try:
+        token_payload = urllib.parse.urlencode({
+            'client_id': settings.GITHUB_CLIENT_ID,
+            'client_secret': settings.GITHUB_CLIENT_SECRET,
+            'code': code,
+            'redirect_uri': settings.GITHUB_REDIRECT_URI,
+        }).encode()
+        token_request = urllib.request.Request(
+            'https://github.com/login/oauth/access_token',
+            data=token_payload,
+            headers={'Accept': 'application/json'},
+            method='POST',
+        )
+        with urllib.request.urlopen(token_request, timeout=15) as response:
+            token_data = json.loads(response.read().decode())
+
+        access_token = token_data.get('access_token')
+        if not access_token:
+            raise ValueError(token_data.get('error_description', 'GitHub did not return an access token.'))
+
+        profile_request = urllib.request.Request(
+            'https://api.github.com/user',
+            headers={
+                'Accept': 'application/vnd.github+json',
+                'Authorization': f'Bearer {access_token}',
+                'User-Agent': 'CloudWise',
+            },
+        )
+        with urllib.request.urlopen(profile_request, timeout=15) as response:
+            profile = json.loads(response.read().decode())
+
+        user = User.objects.get(pk=user_id)
+        GitHubConnection.objects.update_or_create(
+            user=user,
+            defaults={
+                'access_token': access_token,
+                'github_user_id': str(profile['id']),
+                'github_login': profile.get('login', ''),
+            },
+        )
+    except (urllib.error.HTTPError, urllib.error.URLError, KeyError, ValueError, json.JSONDecodeError) as exc:
+        return Response({
+            'success': False,
+            'error': f'GitHub OAuth exchange failed: {exc}'
+        }, status=status.HTTP_502_BAD_GATEWAY)
+
+    return redirect(f'{settings.FRONTEND_URL}/generate?github=connected')
+
+
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated])
+def github_repositories_view(request):
+    try:
+        connection = request.user.github_connection
+    except GitHubConnection.DoesNotExist:
+        return Response({
+            'success': False,
+            'error': 'Connect a GitHub account before retrieving repositories.'
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    github_request = urllib.request.Request(
+        'https://api.github.com/user/repos?sort=updated&per_page=100',
+        headers={
+            'Accept': 'application/vnd.github+json',
+            'Authorization': f'Bearer {connection.access_token}',
+            'User-Agent': 'CloudWise',
+        },
+    )
+    try:
+        with urllib.request.urlopen(github_request, timeout=15) as response:
+            repositories = json.loads(response.read().decode())
+    except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        return Response({
+            'success': False,
+            'error': f'Unable to retrieve GitHub repositories: {exc}'
+        }, status=status.HTTP_502_BAD_GATEWAY)
+
+    return Response({
+        'success': True,
+        'data': [{
+            'id': repo.get('id'),
+            'name': repo.get('name'),
+            'full_name': repo.get('full_name'),
+            'private': repo.get('private'),
+            'default_branch': repo.get('default_branch'),
+        } for repo in repositories]
+    }, status=status.HTTP_200_OK)
+
+
 @api_view(['POST'])
 @permission_classes([permissions.AllowAny])
 def ai_recommend_view(request):
@@ -514,3 +738,46 @@ def terraform_export_view(request):
         'filename': f'main_{provider.lower()}.tf',
         'hclSnippet': f'provider "{provider.lower()}" {{ region = "ap-south-1" }}'
     }, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+@permission_classes([permissions.AllowAny])
+def generate_deployment_files_view(request):
+    files = request.data.get('files')
+    provider = request.data.get('provider', 'AWS')
+
+    if not isinstance(files, dict) or not files:
+        return Response({
+            'success': False,
+            'error': 'Repository files must be provided as a non-empty object.'
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        generated = generate_deployment_files(files, provider=provider)
+    except (TypeError, ValueError) as exc:
+        return Response({
+            'success': False,
+            'error': str(exc)
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    return Response({
+        'success': True,
+        'data': generated
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+@permission_classes([permissions.AllowAny])
+def aws_pricing_view(request):
+    instance_type = request.query_params.get('instanceType', 'c6i.xlarge')
+    region = request.query_params.get('region', 'Asia Pacific (Mumbai)')
+    try:
+        snapshot = get_aws_price_snapshot(instance_type, region)
+    except AwsPricingError as exc:
+        return Response({
+            'success': False,
+            'error': str(exc),
+            'source': 'AWS Pricing API',
+        }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+    return Response({'success': True, 'data': snapshot}, status=status.HTTP_200_OK)
