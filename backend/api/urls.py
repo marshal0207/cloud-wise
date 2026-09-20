@@ -13,6 +13,7 @@ urlpatterns = [
     path('projects', views.projects_list_create_view, name='projects_list_create'),
     path('projects/<str:pk>', views.project_detail_view, name='project_detail'),
     path('projects/<str:pk>/github', views.project_github_connect_view, name='project_github_connect'),
+    path('projects/<str:pk>/github/inspect', views.project_github_inspect_view, name='project_github_inspect'),
     path('projects/<str:pk>/github/push', views.project_github_push_view, name='project_github_push'),
     
     # Core APIs
@@ -21,6 +22,13 @@ urlpatterns = [
     path('deploy', views.deploy_view, name='deploy'),
     path('waitlist', views.waitlist_view, name='waitlist'),
     path('monitoring', views.monitoring_view, name='monitoring'),
+    
+    # Deployment Management
+    path('deployments/<str:deployment_id>/status', views.deployment_status_view, name='deployment_status'),
+    path('deployments/<str:deployment_id>/logs', views.deployment_logs_view, name='deployment_logs'),
+    path('deployments/<str:deployment_id>/health', views.deployment_health_view, name='deployment_health'),
+    path('deployments/<str:deployment_id>/fail', views.deployment_fail_view, name='deployment_fail'),
+    path('deployments/<str:deployment_id>/rollback', views.deployment_rollback_view, name='deployment_rollback'),
     
     # Stubs
     path('ai/recommend-workload', views.ai_recommend_view, name='ai_recommend'),

@@ -20,7 +20,11 @@ import {
   Zap,
   Sliders,
   FileCode,
-  Rocket
+  Rocket,
+  Activity,
+  Github,
+  ExternalLink,
+  Globe
 } from 'lucide-react';
 import { useCloudWise, formatINR, Project } from '@/context/CloudWiseContext';
 
@@ -28,6 +32,9 @@ export const Projects: React.FC = () => {
   const navigate = useNavigate();
   const { 
     projects, 
+    projectsLoading,
+    projectsError,
+    refetchProjects,
     activeProject, 
     setActiveProjectById, 
     createProject, 
@@ -42,13 +49,6 @@ export const Projects: React.FC = () => {
   const [environment, setEnvironment] = useState('Production');
   const [role, setRole] = useState<'owner' | 'editor' | 'viewer' | 'admin'>('owner');
   const [loading, setLoading] = useState(false);
-
-  // First-time user auto route to Create Project modal
-  useEffect(() => {
-    if (projects.length === 0) {
-      setShowCreateModal(true);
-    }
-  }, [projects.length]);
 
   const handleCloseModal = (e?: React.MouseEvent) => {
     if (e) {
@@ -114,6 +114,8 @@ export const Projects: React.FC = () => {
         return { label: 'Step 3: Files Generated', icon: FileCode, color: 'text-violet-400 bg-violet-500/10 border-violet-500/30' };
       case 'deployment':
         return { label: 'Step 4: Provision & Deploy', icon: Rocket, color: 'text-amber-400 bg-amber-500/10 border-amber-500/30' };
+      case 'monitoring':
+        return { label: 'Step 4b: Live Monitoring', icon: Activity, color: 'text-cyan-400 bg-cyan-500/10 border-cyan-500/30' };
       case 'optimization':
         return { label: 'Step 5: Cost Tuning', icon: Zap, color: 'text-emerald-400 bg-emerald-500/10 border-emerald-500/30' };
       default:
@@ -148,13 +150,30 @@ export const Projects: React.FC = () => {
         </button>
       </div>
 
-      {/* Projects List Grid */}
-      {projects.length === 0 ? (
+      {/* Projects List Grid / States */}
+      {projectsLoading ? (
+        <div className="glass-panel p-12 rounded-3xl text-center space-y-4 max-w-lg mx-auto border border-slate-800">
+          <div className="w-10 h-10 border-2 border-cyan-400 border-t-transparent rounded-full animate-spin mx-auto" />
+          <p className="text-xs text-slate-400">Loading your cloud projects from database...</p>
+        </div>
+      ) : projectsError ? (
+        <div className="glass-panel p-8 rounded-3xl text-center space-y-4 max-w-lg mx-auto border border-rose-500/30 bg-rose-500/5">
+          <AlertCircle className="w-10 h-10 text-rose-400 mx-auto" />
+          <h3 className="text-base font-bold text-white">Failed to load projects</h3>
+          <p className="text-xs text-slate-400">{projectsError}</p>
+          <button
+            onClick={() => refetchProjects()}
+            className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-white inline-flex items-center gap-2 border border-slate-700"
+          >
+            <span>Retry</span>
+          </button>
+        </div>
+      ) : projects.length === 0 ? (
         <div className="glass-panel p-12 rounded-3xl text-center space-y-4 max-w-lg mx-auto border border-slate-800">
           <div className="w-16 h-16 rounded-2xl bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center mx-auto text-cyan-400">
             <FolderPlus size={32} />
           </div>
-          <h3 className="text-xl font-extrabold text-white">No Active Projects Found</h3>
+          <h3 className="text-xl font-extrabold text-white">No projects yet</h3>
           <p className="text-xs text-slate-400 leading-relaxed">
             Create your first cloud infrastructure project to start workload sizing, multi-cloud comparison, Dockerfile generation, and cost tuning.
           </p>
@@ -208,7 +227,28 @@ export const Projects: React.FC = () => {
                     <p className="text-xs text-slate-400 pt-1 line-clamp-2 leading-relaxed">
                       {proj.description || 'No description provided'}
                     </p>
+                    {proj.githubRepo?.name && (
+                      <div className="mt-2.5 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-xl bg-violet-500/10 border border-violet-500/30 text-violet-300 text-xs font-semibold">
+                        <Github size={13} className="shrink-0 text-violet-400" />
+                        <span className="truncate max-w-[200px]">{proj.githubRepo.name}</span>
+                      </div>
+                    )}
                   </div>
+
+                  {/* Live Deployment Link */}
+                  {proj.deployment?.status === 'deployed' && proj.deployment?.endpointUrl && (
+                    <a
+                      href={proj.deployment.endpointUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      onClick={(e) => e.stopPropagation()}
+                      className="flex items-center gap-2 px-3 py-2 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs font-semibold hover:bg-emerald-500/20 transition-colors"
+                    >
+                      <Globe size={13} className="shrink-0 text-emerald-400" />
+                      <span className="truncate">{proj.deployment.endpointUrl}</span>
+                      <ExternalLink size={11} className="shrink-0 ml-auto" />
+                    </a>
+                  )}
 
                   {/* Current Step Badge */}
                   <div className={`p-3 rounded-2xl border flex items-center justify-between text-xs ${stepInfo.color}`}>
@@ -226,7 +266,7 @@ export const Projects: React.FC = () => {
                     </div>
                     <div className="flex justify-between text-slate-400 pt-0.5">
                       <span>Monthly Spend</span>
-                      <span className="font-extrabold text-white">{formatINR(proj.selectedRecommendation?.monthlyCost || 12280)}/mo</span>
+                      <span className="font-extrabold text-white">{formatINR(proj.selectedRecommendation?.monthlyCost ?? proj.estimation?.calculatedResult?.minCost ?? 0)}/mo</span>
                     </div>
                   </div>
                 </div>

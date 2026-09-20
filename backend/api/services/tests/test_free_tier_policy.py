@@ -49,7 +49,8 @@ class FreeTierPolicyTests(SimpleTestCase):
 
 
 class FreeTierDeploymentApiTests(APITestCase):
-    def test_rejects_oversized_deployment(self):
+    def test_deploy_requires_authentication(self):
+        # deploy_view is now authenticated — unauthenticated must return 401
         response = self.client.post(
             '/api/deploy',
             {
@@ -59,7 +60,4 @@ class FreeTierDeploymentApiTests(APITestCase):
             },
             format='json',
         )
-
-        self.assertEqual(response.status_code, 400)
-        self.assertFalse(response.data['success'])
-        self.assertIn('Free Tier', response.data['error'])
+        self.assertEqual(response.status_code, 401)

@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -11,6 +12,9 @@ class FreeTierLimits:
 
 class FreeTierLimitError(ValueError):
     pass
+
+
+FREE_TIER_ELIGIBLE_INSTANCES = ("t2.micro", "t3.micro")
 
 
 def validate_free_tier_deployment(
@@ -52,4 +56,70 @@ def validate_free_tier_deployment(
         'ramGB': ram_gb,
         'storageGB': storage_gb,
         'instances': instances,
+    }
+
+
+def evaluate_free_tier_eligibility(
+    *,
+    vcpu: int,
+    ram_gb: int,
+    storage_gb: int,
+    instances: int = 1,
+    instance_type: str = "custom",
+) -> dict[str, Any]:
+    """
+    Evaluates workload specs against AWS Free Tier rules and provides
+    cost recommendations if user selected higher-tier or paid instances.
+    """
+    limits = FreeTierLimits()
+    violations = []
+
+    if vcpu > limits.max_vcpu:
+        violations.append(f"{vcpu} vCPUs requested (Free Tier covers up to 1-2 vCPU t3.micro)")
+    if ram_gb > limits.max_ram_gb:
+        violations.append(f"{ram_gb} GB RAM requested (Free Tier covers up to 1 GB RAM)")
+    if storage_gb > limits.max_storage_gb:
+        violations.append(f"{storage_gb} GB storage requested (Free Tier covers up to 30 GB EBS)")
+    if instances > limits.max_instances:
+        violations.append(f"{instances} instances requested (Free Tier covers 1 single instance, 750 hrs/mo)")
+
+    is_free_tier = len(violations) == 0
+
+    recommendation_needed = not is_free_tier
+
+    free_tier_rec = {
+        "instanceType": "t3.micro",
+        "vcpu": 1,
+        "ram": 1,
+        "storage": 30,
+        "monthlyCostUSD": 0,
+        "monthlyCostINR": 0,
+        "badge": "AWS Free Tier (100% Free)",
+        "description": "750 hours/month of t3.micro instance with 30GB EBS SSD storage. Perfect for development, staging, and lightweight APIs."
+    }
+
+    low_cost_rec = {
+        "instanceType": "t3.small",
+        "vcpu": 2,
+        "ram": 2,
+        "storage": 50,
+        "monthlyCostUSD": 15,
+        "monthlyCostINR": 1245,
+        "badge": "Low-Cost Budget Option",
+        "description": "Double compute capacity (2 vCPU, 2GB RAM) at ~$15/mo for small production web apps."
+    }
+
+    return {
+        "isFreeTier": is_free_tier,
+        "violations": violations,
+        "recommendationNeeded": recommendation_needed,
+        "freeTierRecommendation": free_tier_rec,
+        "lowCostRecommendation": low_cost_rec,
+        "selectedSpecs": {
+            "vcpu": vcpu,
+            "ram": ram_gb,
+            "storage": storage_gb,
+            "instances": instances,
+            "instanceType": instance_type,
+        }
     }

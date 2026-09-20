@@ -64,8 +64,11 @@ TEMPLATES = [
 WSGI_APPLICATION = 'backend.wsgi.application'
 
 # Database Setup (SQLite by default, PostgreSQL if DATABASE_URL is defined)
+# Tests always use local SQLite regardless of DATABASE_URL
 DATABASE_URL = os.getenv('DATABASE_URL')
-if DATABASE_URL:
+_TESTING = os.getenv('DJANGO_TESTING', '').lower() in ('1', 'true') or 'test' in os.sys.argv
+
+if DATABASE_URL and not _TESTING:
     DATABASES = {
         'default': dj_database_url.config(default=DATABASE_URL)
     }
@@ -124,6 +127,14 @@ GITHUB_REDIRECT_URI = os.getenv(
     'http://127.0.0.1:8000/api/github/oauth/callback'
 )
 FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:5173')
+
+# Vercel deployment credentials (server-side only — never expose to frontend)
+VERCEL_TOKEN = os.getenv('VERCEL_TOKEN', '')
+VERCEL_TEAM_ID = os.getenv('VERCEL_TEAM_ID', '')  # optional, for team-owned projects
+
+# Render deployment credentials (server-side only — never expose to frontend)
+RENDER_API_KEY = os.getenv('RENDER_API_KEY', '')
+RENDER_OWNER_ID = os.getenv('RENDER_OWNER_ID', '')  # user or team owner ID from Render dashboard
 
 # CORS Configuration
 CORS_ALLOW_ALL_ORIGINS = True

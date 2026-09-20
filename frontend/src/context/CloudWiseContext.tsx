@@ -71,6 +71,19 @@ export interface OptimizationItem {
   applied: boolean;
 }
 
+export interface MonitoringData {
+  cpuUsage: number;
+  memoryUsage: number;
+  storageUsage: number;
+  networkInMB: number;
+  networkOutMB: number;
+  healthStatus: string;
+  clusterUptime: string;
+  activeNodes: number;
+  ipAddress: string;
+  endpointUrl: string | null;
+}
+
 export interface Project {
   id: string;
   userId: string;
@@ -109,111 +122,126 @@ export const defaultEstimation: EstimationData = {
   },
 };
 
-export const defaultRecommendations: RecommendationOption[] = [
-  {
-    id: 'aws-free-tier-demo',
-    title: 'AWS Free Tier Demo (t3.micro)',
-    provider: 'AWS',
-    badge: 'Budget Option',
-    specs: { vcpu: 2, ram: 1, storage: '20 GB EBS', network: 'Up to 5 Gbps' },
-    monthlyCost: 0,
-    hourlyCost: 0,
-    reliability: 'Free Tier eligible (account dependent)',
-    features: ['Single-instance deployment', '20 GB EBS storage', 'Basic Docker workload', 'Free Tier usage limits enforced'],
-    reasoning: 'A small single-instance profile for CloudWise demo deployments. AWS Free Tier eligibility depends on the account and remaining usage allowance.'
-  },
-  {
-    id: 'aws-rec-1',
-    title: 'AWS Production Cluster (c6i.xlarge)',
-    provider: 'AWS',
-    badge: 'Recommended',
-    specs: { vcpu: 8, ram: 32, storage: '500 GB NVMe SSD', network: '10 Gbps' },
-    monthlyCost: 12280,
-    hourlyCost: 17.00,
-    reliability: '99.99% SLA',
-    features: ['Auto-scaling enabled', 'AWS Shield Standard DDoS Protection', 'Automated Daily EBS Snapshots', 'Multi-AZ Replication'],
-    reasoning: 'AWS c6i.xlarge provides the optimal balance of compute throughput and low-latency IOPS for Microservices workloads in GIFT City / Asia regions while remaining well within your target budget tier.'
-  },
-  {
-    id: 'gcp-rec-2',
-    title: 'GCP Compute Engine (n2-standard-8)',
-    provider: 'GCP',
-    badge: 'Performance Option',
-    specs: { vcpu: 8, ram: 32, storage: '500 GB Hyperdisk', network: '16 Gbps' },
-    monthlyCost: 14280,
-    hourlyCost: 19.80,
-    reliability: '99.99% SLA',
-    features: ['Custom machine types', 'Google Cloud Armor Integrated', 'Live Migration Support', 'Sustained Use Discount'],
-    reasoning: 'Google Cloud Engine n2-standard offers higher network bandwidth (16 Gbps) and sustained use discounts, ideal if your API experiences sustained high peak traffic.'
-  },
-  {
-    id: 'azure-rec-3',
-    title: 'Azure Compute (D8s v5)',
-    provider: 'Azure',
-    badge: 'Alternative',
-    specs: { vcpu: 8, ram: 32, storage: '500 GB Premium SSD', network: '12 Gbps' },
-    monthlyCost: 13600,
-    hourlyCost: 18.80,
-    reliability: '99.95% SLA',
-    features: ['Azure Defender Integration', 'Accelerated Networking', 'Azure Hybrid Benefit', 'Zone Redundant Storage'],
-    reasoning: 'Azure D8s v5 provides seamless Active Directory and enterprise compliance integration, suitable for hybrid enterprise cloud deployments.'
-  },
-  {
-    id: 'do-rec-4',
-    title: 'DigitalOcean CPU-Optimized Droplet',
-    provider: 'DigitalOcean',
-    badge: 'Budget Option',
-    specs: { vcpu: 8, ram: 16, storage: '400 GB NVMe SSD', network: '5 Gbps' },
-    monthlyCost: 9130,
-    hourlyCost: 12.60,
-    reliability: '99.99% SLA',
-    features: ['Free 5TB Bandwidth Transfer', 'Simple Cloud Firewalls', '1-Click Monitoring Alerts', 'Fixed Transparent Pricing'],
-    reasoning: 'DigitalOcean offers maximum financial savings with flat pricing and generous bundled bandwidth transfers, perfect for startup budget optimization.'
-  },
-];
+// Optimizations are generated dynamically from the selected recommendation cost
+export const buildOptimizations = (monthlyCost: number, vcpu: number, storage: number): OptimizationItem[] => {
+  const rightsizeSavings = Math.round(monthlyCost * 0.28);
+  const storageCost = Math.round(storage * 6);
+  const reservationBase = Math.round(monthlyCost * 0.72);
+  const reservationSavings = Math.round(reservationBase * 0.34);
+  const dbCost = Math.round(monthlyCost * 0.19);
+  const dbSavings = Math.round(dbCost * 0.64);
+  return [
+    {
+      id: 'opt-1',
+      title: 'Rightsize Underutilized Compute Instance',
+      category: 'Compute',
+      description: `Average CPU utilization over past 7 days was 14%. Downgrading from ${vcpu} vCPUs to ${Math.max(2, Math.floor(vcpu / 2))} vCPUs will maintain headroom while cutting cost.`,
+      currentCost: monthlyCost,
+      savings: rightsizeSavings,
+      impact: 'High',
+      applied: false,
+    },
+    {
+      id: 'opt-2',
+      title: 'Delete Unattached Storage Volume',
+      category: 'Storage',
+      description: `Found 1 unattached ${Math.round(storage * 0.24)}GB volume left over from a previous staging instance setup.`,
+      currentCost: storageCost,
+      savings: storageCost,
+      impact: 'Medium',
+      applied: false,
+    },
+    {
+      id: 'opt-3',
+      title: 'Purchase 1-Year Compute Savings Plan',
+      category: 'Reservation',
+      description: 'Commit to steady-state baseline usage for 12 months to receive automatic 34% discount off on-demand rates.',
+      currentCost: reservationBase,
+      savings: reservationSavings,
+      impact: 'High',
+      applied: false,
+    },
+    {
+      id: 'opt-4',
+      title: 'Automate Off-Peak Staging Database Shutdown',
+      category: 'Database',
+      description: 'Shut down non-production database clusters during weekend non-business hours (Friday 10 PM - Monday 6 AM).',
+      currentCost: dbCost,
+      savings: dbSavings,
+      impact: 'Low',
+      applied: false,
+    },
+  ];
+};
 
-export const defaultOptimizations: OptimizationItem[] = [
-  {
-    id: 'opt-1',
-    title: 'Rightsize Underutilized Compute Instance',
-    category: 'Compute',
-    description: 'Average CPU utilization over past 7 days was 14%. Downgrading from 8 vCPUs to 4 vCPUs will maintain headroom while cutting cost.',
-    currentCost: 12280,
-    savings: 3480,
-    impact: 'High',
-    applied: false,
-  },
-  {
-    id: 'opt-2',
-    title: 'Delete Unattached EBS Storage Volume',
-    category: 'Storage',
-    description: 'Found 1 unattached 120GB gp3 volume left over from a previous staging instance setup.',
-    currentCost: 1240,
-    savings: 1240,
-    impact: 'Medium',
-    applied: false,
-  },
-  {
-    id: 'opt-3',
-    title: 'Purchase 1-Year Compute Savings Plan',
-    category: 'Reservation',
-    description: 'Commit to steady-state baseline usage for 12 months to receive automatic 34% discount off on-demand rates.',
-    currentCost: 8800,
-    savings: 2980,
-    impact: 'High',
-    applied: false,
-  },
-  {
-    id: 'opt-4',
-    title: 'Automate Off-Peak Staging Database Shutdown',
-    category: 'Database',
-    description: 'Shut down non-production database clusters during weekend non-business hours (Friday 10 PM - Monday 6 AM).',
-    currentCost: 2320,
-    savings: 1490,
-    impact: 'Low',
-    applied: false,
-  },
-];
+export const defaultOptimizations: OptimizationItem[] = buildOptimizations(12280, 8, 500);
+
+export const buildRecommendations = (est: EstimationData): RecommendationOption[] => {
+  const vcpu = est.vcpu;
+  const ram = est.ram;
+  const storage = est.storage;
+  const region = est.region;
+  const regionMult = region.toLowerCase().includes('gujarat') ? 0.92
+    : region.toLowerCase().includes('bengaluru') ? 1.05
+    : region.toLowerCase().includes('kolkata') ? 0.96 : 1.0;
+  const base = Math.round((vcpu * 1000 + ram * 200 + storage * 6) * regionMult);
+  const awsCost  = Math.round(base * 1.00);
+  const gcpCost  = Math.round(base * 1.16);
+  const azureCost = Math.round(base * 1.11);
+  const doCost   = Math.round(base * 0.74);
+  return [
+    {
+      id: 'aws-rec-1',
+      title: `AWS (c6i — ${vcpu}vCPU/${ram}GB)`,
+      provider: 'AWS',
+      badge: 'Recommended',
+      specs: { vcpu, ram, storage: `${storage} GB NVMe SSD`, network: '10 Gbps' },
+      monthlyCost: awsCost,
+      hourlyCost: Math.round((awsCost / 720) * 100) / 100,
+      reliability: '99.99% SLA',
+      features: ['Auto-scaling enabled', 'AWS Shield DDoS Protection', 'Daily EBS Snapshots', 'Multi-AZ Replication'],
+      reasoning: `AWS c6i provides optimal compute throughput for ${est.appType} with ${vcpu} vCPUs and ${ram}GB RAM in ${region}.`,
+    },
+    {
+      id: 'gcp-rec-2',
+      title: `GCP (n2-standard — ${vcpu}vCPU/${ram}GB)`,
+      provider: 'GCP',
+      badge: 'Performance Option',
+      specs: { vcpu, ram, storage: `${storage} GB Hyperdisk`, network: '16 Gbps' },
+      monthlyCost: gcpCost,
+      hourlyCost: Math.round((gcpCost / 720) * 100) / 100,
+      reliability: '99.99% SLA',
+      features: ['Custom machine types', 'Google Cloud Armor', 'Live Migration', 'Sustained Use Discount'],
+      reasoning: `GCP n2-standard offers 16 Gbps network bandwidth ideal for high-traffic ${est.appType} workloads.`,
+    },
+    {
+      id: 'azure-rec-3',
+      title: `Azure (Dsv5 — ${vcpu}vCPU/${ram}GB)`,
+      provider: 'Azure',
+      badge: 'Alternative',
+      specs: { vcpu, ram, storage: `${storage} GB Premium SSD`, network: '12 Gbps' },
+      monthlyCost: azureCost,
+      hourlyCost: Math.round((azureCost / 720) * 100) / 100,
+      reliability: '99.95% SLA',
+      features: ['Azure Defender', 'Accelerated Networking', 'Hybrid Benefit', 'Zone Redundant Storage'],
+      reasoning: `Azure Dsv5 suits enterprise compliance and hybrid deployments for ${est.appType} in ${region}.`,
+    },
+    {
+      id: 'do-rec-4',
+      title: `DigitalOcean (CPU-Opt — ${vcpu}vCPU/${Math.round(ram * 0.5)}GB)`,
+      provider: 'DigitalOcean',
+      badge: 'Budget Option',
+      specs: { vcpu, ram: Math.round(ram * 0.5), storage: `${Math.round(storage * 0.8)} GB NVMe SSD`, network: '5 Gbps' },
+      monthlyCost: doCost,
+      hourlyCost: Math.round((doCost / 720) * 100) / 100,
+      reliability: '99.99% SLA',
+      features: ['Free 5TB Bandwidth', 'Simple Firewalls', '1-Click Monitoring', 'Fixed Pricing'],
+      reasoning: `DigitalOcean offers maximum savings with flat pricing for budget-conscious ${est.appType} deployments.`,
+    },
+  ];
+};
+
+export const defaultRecommendations: RecommendationOption[] = buildRecommendations(defaultEstimation);
 
 interface CloudWiseContextType {
   user: UserProfile | null;
@@ -221,6 +249,9 @@ interface CloudWiseContextType {
   logoutUser: () => void;
 
   projects: Project[];
+  projectsLoading: boolean;
+  projectsError: string | null;
+  refetchProjects: () => Promise<void>;
   activeProject: Project | null;
   setActiveProjectById: (id: string) => void;
   createProject: (data: { name: string; description: string; environment?: string; role?: 'owner' | 'editor' | 'viewer' | 'admin' }) => Promise<Project | null>;
@@ -239,7 +270,6 @@ interface CloudWiseContextType {
   connectGitHub: (repoName: string) => Promise<boolean>;
 
   deployment: DeploymentDetails;
-  startSimulatedDeployment: (envName?: string, simulateError?: boolean) => Promise<void>;
   rollbackDeployment: () => void;
   resetDeployment: () => void;
 
@@ -247,6 +277,8 @@ interface CloudWiseContextType {
   applyOptimization: (id: string) => void;
   totalMonthlySavings: number;
   effectiveMonthlyCost: number;
+
+  monitoringData: MonitoringData;
 
   toasts: ToastMessage[];
   showToast: (message: string, type?: 'success' | 'error' | 'info') => void;
@@ -293,9 +325,13 @@ export const CloudWiseProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const logoutUser = () => {
     setUser(null);
+    setProjects([]);
+    setActiveProjectId(null);
     try {
       localStorage.removeItem('cloudwise_user');
       localStorage.removeItem('cloudwise_token');
+      localStorage.removeItem('cloudwise_projects');
+      localStorage.removeItem('cloudwise_active_project_id');
     } catch (err) {
       console.warn('Failed to clear user from localStorage', err);
     }
@@ -320,6 +356,11 @@ export const CloudWiseProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     }
   });
 
+  const [projectsLoading, setProjectsLoading] = useState<boolean>(() => {
+    return !!localStorage.getItem('cloudwise_token');
+  });
+  const [projectsError, setProjectsError] = useState<string | null>(null);
+
   // Sync projects with localStorage
   useEffect(() => {
     try {
@@ -337,30 +378,51 @@ export const CloudWiseProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     }
   }, [activeProjectId]);
 
-  // Load backend projects on startup
-  useEffect(() => {
-    const fetchBackendProjects = async () => {
-      try {
-        const token = localStorage.getItem('cloudwise_token');
-        const res = await fetch('/api/projects', {
-          headers: {
-            'Authorization': token ? `Bearer ${token}` : '',
-            'x-user-role': user?.role || 'owner',
-            'x-user-id': user?.id || 'default_user'
-          }
-        });
-        const data = await res.json();
-        if (res.ok && data.success && Array.isArray(data.data)) {
-          setProjects(data.data);
-          if (data.data.length > 0 && !activeProjectId) {
-            setActiveProjectId(data.data[0].id);
-          }
-        }
-      } catch (err) {
-        console.warn('Offline mode: using local project state.', err);
-      }
-    };
+  const fetchBackendProjects = async () => {
+    const token = localStorage.getItem('cloudwise_token');
+    if (!token) {
+      setProjects([]);
+      setActiveProjectId(null);
+      setProjectsLoading(false);
+      return;
+    }
 
+    setProjectsLoading(true);
+    setProjectsError(null);
+    try {
+      const res = await fetch('/api/projects', {
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      });
+      const data = await res.json();
+      if (res.ok && data.success && Array.isArray(data.data)) {
+        setProjects(data.data);
+        if (data.data.length > 0) {
+          setActiveProjectId((prev) => {
+            if (prev && data.data.some((p: Project) => p.id === prev)) {
+              return prev;
+            }
+            return data.data[0].id;
+          });
+        } else {
+          setActiveProjectId(null);
+        }
+      } else if (res.status === 401) {
+        setProjects([]);
+        setActiveProjectId(null);
+      } else {
+        setProjectsError(data.error || 'Failed to load projects from server.');
+      }
+    } catch (err: any) {
+      console.warn('Backend fetch error:', err);
+      setProjectsError('Could not reach the server to fetch projects.');
+    } finally {
+      setProjectsLoading(false);
+    }
+  };
+
+  useEffect(() => {
     fetchBackendProjects();
   }, [user]);
 
@@ -382,54 +444,64 @@ export const CloudWiseProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return null;
     }
 
-    const newProject: Project = {
-      id: `proj_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
-      userId: user?.id || 'default_user',
-      name: data.name,
-      description: data.description || 'Cloud infrastructure workload project',
-      environment: data.environment || 'Production',
-      userRole,
-      currentStep: 'estimation',
-      estimation: defaultEstimation,
-      selectedRecommendation: defaultRecommendations[0],
-      deployment: {
-        status: 'idle',
-        progress: 0,
-        logs: [],
-        deployedAt: null,
-        endpointUrl: null,
-        ipAddress: null,
-        environmentName: `${data.name.toLowerCase().replace(/\s+/g, '-')}-cluster`
-      },
-      optimizations: defaultOptimizations,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    };
+    const token = localStorage.getItem('cloudwise_token');
+    if (!token) {
+      showToast('Please sign in to create a project.', 'error');
+      return null;
+    }
 
     try {
-      const token = localStorage.getItem('cloudwise_token');
       const res = await fetch('/api/projects', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': token ? `Bearer ${token}` : '',
-          'x-user-role': userRole,
-          'x-user-id': user?.id || 'default_user'
+          'Authorization': `Bearer ${token}`
         },
-        body: JSON.stringify(data)
+        body: JSON.stringify({
+          name: data.name,
+          description: data.description || 'Cloud infrastructure workload project',
+          environment: data.environment || 'Production',
+          role: userRole
+        })
       });
-      const resData = await res.json();
-      if (res.ok && resData.success && resData.data) {
-        newProject.id = resData.data.id;
-      }
-    } catch (err) {
-      console.warn('Backend create project skipped, using local creation', err);
-    }
 
-    setProjects((prev) => [newProject, ...prev]);
-    setActiveProjectId(newProject.id);
-    showToast(`Project "${newProject.name}" created successfully!`, 'success');
-    return newProject;
+      const resData = await res.json();
+      if (!res.ok || !resData.success || !resData.data) {
+        throw new Error(resData.error || 'Failed to create project on server.');
+      }
+
+      const createdProject: Project = {
+        id: resData.data.id,
+        userId: resData.data.userId || user?.id || 'default_user',
+        name: resData.data.name,
+        description: resData.data.description || 'Cloud infrastructure workload project',
+        environment: resData.data.environment || 'Production',
+        userRole: resData.data.userRole || userRole,
+        currentStep: resData.data.currentStep || 'estimation',
+        estimation: resData.data.estimation && Object.keys(resData.data.estimation).length > 0 ? resData.data.estimation : defaultEstimation,
+        selectedRecommendation: resData.data.selectedRecommendation || defaultRecommendations[0],
+        deployment: resData.data.deployment || {
+          status: 'idle',
+          progress: 0,
+          logs: [],
+          deployedAt: null,
+          endpointUrl: null,
+          ipAddress: null,
+          environmentName: `${data.name.toLowerCase().replace(/\s+/g, '-')}-cluster`
+        },
+        optimizations: resData.data.optimizations || defaultOptimizations,
+        createdAt: resData.data.createdAt || new Date().toISOString(),
+        updatedAt: resData.data.updatedAt || new Date().toISOString()
+      };
+
+      setProjects((prev) => [createdProject, ...prev.filter(p => p.id !== createdProject.id)]);
+      setActiveProjectId(createdProject.id);
+      showToast(`Project "${createdProject.name}" created successfully!`, 'success');
+      return createdProject;
+    } catch (err: any) {
+      showToast(err.message || 'Failed to create project.', 'error');
+      throw err;
+    }
   };
 
   const updateActiveProject = async (updates: Partial<Project>) => {
@@ -455,16 +527,16 @@ export const CloudWiseProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
     try {
       const token = localStorage.getItem('cloudwise_token');
-      await fetch(`/api/projects/${activeProject.id}`, {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': token ? `Bearer ${token}` : '',
-          'x-user-role': activeProject.userRole,
-          'x-user-id': user?.id || 'default_user'
-        },
-        body: JSON.stringify(updates)
-      });
+      if (token) {
+        await fetch(`/api/projects/${activeProject.id}`, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
+          body: JSON.stringify(updates)
+        });
+      }
     } catch (err) {
       console.warn('Backend update project skipped', err);
     }
@@ -480,24 +552,29 @@ export const CloudWiseProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return false;
     }
 
+    const token = localStorage.getItem('cloudwise_token');
+    try {
+      if (token) {
+        const res = await fetch(`/api/projects/${id}`, {
+          method: 'DELETE',
+          headers: {
+            'Authorization': `Bearer ${token}`
+          }
+        });
+        const resData = await res.json();
+        if (!res.ok || !resData.success) {
+          throw new Error(resData.error || 'Failed to delete project on server.');
+        }
+      }
+    } catch (err: any) {
+      showToast(err.message || 'Failed to delete project on server.', 'error');
+      return false;
+    }
+
     setProjects((prev) => prev.filter((p) => p.id !== id));
     if (activeProjectId === id) {
       const remaining = projects.filter((p) => p.id !== id);
       setActiveProjectId(remaining.length > 0 ? remaining[0].id : null);
-    }
-
-    try {
-      const token = localStorage.getItem('cloudwise_token');
-      await fetch(`/api/projects/${id}`, {
-        method: 'DELETE',
-        headers: {
-          'Authorization': token ? `Bearer ${token}` : '',
-          'x-user-role': role,
-          'x-user-id': user?.id || 'default_user'
-        }
-      });
-    } catch (err) {
-      console.warn('Backend delete project skipped', err);
     }
 
     showToast(`Project "${proj.name}" deleted.`, 'info');
@@ -542,8 +619,14 @@ export const CloudWiseProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     updateActiveProject({ estimation: updatedEst, currentStep: 'estimation' });
   };
 
-  const availableRecommendations = defaultRecommendations;
-  const selectedRecommendation = activeProject?.selectedRecommendation || defaultRecommendations[0];
+  const availableRecommendations = buildRecommendations(estimation);
+  const selectedRecommendation = (() => {
+    const saved = activeProject?.selectedRecommendation;
+    if (!saved) return availableRecommendations[0];
+    // Re-sync specs from current estimation so saved selection stays current
+    const live = availableRecommendations.find(r => r.id === saved.id);
+    return live ?? availableRecommendations[0];
+  })();
 
   const setSelectedRecommendation = (rec: RecommendationOption) => {
     updateActiveProject({ selectedRecommendation: rec });
@@ -551,37 +634,83 @@ export const CloudWiseProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   };
 
   const connectGitHub = async (repoName: string): Promise<boolean> => {
-    if (!activeProject) return false;
-    if (activeProject.userRole === 'viewer') {
-      showToast('Access Denied (RBAC): Viewer role cannot link GitHub repository.', 'error');
-      return false;
-    }
-
     const githubRepo = {
       name: repoName,
       connectedAt: new Date().toLocaleTimeString() + ' ' + new Date().toLocaleDateString(),
       synced: true
     };
 
-    updateActiveProject({
-      githubRepo,
-      currentStep: 'generate'
-    });
+    let targetProjectId: string;
 
-    try {
+    if (activeProject) {
+      // Active project exists — update it directly in state
+      if (activeProject.userRole === 'viewer') {
+        showToast('Access Denied (RBAC): Viewer role cannot link GitHub repository.', 'error');
+        return false;
+      }
+      targetProjectId = activeProject.id;
+      setProjects((prev) =>
+        prev.map((p) =>
+          p.id === targetProjectId
+            ? { ...p, githubRepo, currentStep: 'generate' as const, updatedAt: new Date().toISOString() }
+            : p
+        )
+      );
+    } else {
+      // No active project — create one locally (no backend wait)
+      const projName = repoName.includes('/') ? repoName.split('/')[1] : repoName;
+      const newProject: Project = {
+        id: `proj_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
+        userId: user?.id || 'default_user',
+        name: projName,
+        description: `Deployment project for GitHub repository ${repoName}`,
+        environment: 'Production',
+        userRole: user?.role || 'owner',
+        currentStep: 'generate',
+        estimation: defaultEstimation,
+        selectedRecommendation: availableRecommendations[0],
+        githubRepo,
+        deployment: {
+          status: 'idle',
+          progress: 0,
+          logs: [],
+          deployedAt: null,
+          endpointUrl: null,
+          ipAddress: null,
+          environmentName: `${projName.toLowerCase().replace(/\s+/g, '-')}-prod`
+        },
+        optimizations: defaultOptimizations,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+      targetProjectId = newProject.id;
+      setProjects((prev) => [newProject, ...prev]);
+      setActiveProjectId(newProject.id);
+
+      // Attempt to persist to backend (fire-and-forget, don't block UI)
       const token = localStorage.getItem('cloudwise_token');
-      await fetch(`/api/projects/${activeProject.id}/github`, {
+      fetch('/api/projects', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': token ? `Bearer ${token}` : '',
-          'x-user-role': activeProject.userRole
+          'x-user-role': newProject.userRole,
+          'x-user-id': user?.id || 'default_user'
         },
-        body: JSON.stringify({ repoName })
-      });
-    } catch (err) {
-      console.warn('Backend GitHub connect skipped', err);
+        body: JSON.stringify({ name: projName, description: newProject.description, environment: 'Production' })
+      }).catch((err) => console.warn('Backend project create skipped', err));
     }
+
+    // Sync github_repo to backend (fire-and-forget, don't block UI)
+    const token = localStorage.getItem('cloudwise_token');
+    fetch(`/api/projects/${targetProjectId}/github`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': token ? `Bearer ${token}` : '',
+      },
+      body: JSON.stringify({ repoName })
+    }).catch((err) => console.warn('Backend GitHub connect skipped', err));
 
     showToast(`GitHub repository "${repoName}" connected & synced!`, 'success');
     return true;
@@ -597,110 +726,12 @@ export const CloudWiseProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     environmentName: 'cloudwise-prod-app',
   };
 
-  const startSimulatedDeployment = async (envName?: string, simulateError = false) => {
-    if (!activeProject) return;
-    const environmentName = envName || deployment.environmentName || `${activeProject.name.toLowerCase().replace(/\s+/g, '-')}-prod`;
-    
-    updateActiveProject({
-      deployment: {
-        status: 'preparing',
-        progress: 15,
-        logs: [`[${new Date().toLocaleTimeString()}] Initializing automated deployment pipeline for ${environmentName}...`],
-        deployedAt: null,
-        endpointUrl: null,
-        ipAddress: null,
-        environmentName,
-      },
-      currentStep: 'deployment'
-    });
-
-    await new Promise((resolve) => setTimeout(resolve, 800));
-
-    if (simulateError) {
-      updateActiveProject({
-        deployment: {
-          status: 'failed',
-          progress: 45,
-          logs: [
-            ...deployment.logs,
-            `[${new Date().toLocaleTimeString()}] Validating ${selectedRecommendation.provider} API credentials...`,
-            `[${new Date().toLocaleTimeString()}] ERROR: Quota Limit Exceeded in target region (${estimation.region}). Cannot allocate ${selectedRecommendation.specs.vcpu} vCPUs.`,
-            `[${new Date().toLocaleTimeString()}] Deployment halted. Rollback option available.`
-          ],
-          deployedAt: null,
-          endpointUrl: null,
-          ipAddress: null,
-          environmentName,
-          failureReason: `Resource Quota Exceeded in ${estimation.region}. Please select a different region or downsize vCPU allocation.`
-        }
-      });
-      showToast('Deployment failed due to simulated cloud quota limit.', 'error');
-      return;
-    }
-
-    updateActiveProject({
-      deployment: {
-        status: 'provisioning',
-        progress: 50,
-        logs: [
-          ...deployment.logs,
-          `[${new Date().toLocaleTimeString()}] Validating ${selectedRecommendation.provider} API credentials & region quotas...`,
-          `[${new Date().toLocaleTimeString()}] Provisioning ${selectedRecommendation.specs.vcpu} vCPU / ${selectedRecommendation.specs.ram}GB RAM node cluster in ${estimation.region}...`,
-        ],
-        deployedAt: null,
-        endpointUrl: null,
-        ipAddress: null,
-        environmentName,
-      }
-    });
-
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-    updateActiveProject({
-      deployment: {
-        status: 'configuring',
-        progress: 80,
-        logs: [
-          ...deployment.logs,
-          `[${new Date().toLocaleTimeString()}] Allocating elastic IP address and configuring VPC subnet routes...`,
-          `[${new Date().toLocaleTimeString()}] Mounting ${selectedRecommendation.specs.storage} storage volumes...`,
-          `[${new Date().toLocaleTimeString()}] Injecting Docker container & CI/CD probe configurations...`,
-        ],
-        deployedAt: null,
-        endpointUrl: null,
-        ipAddress: null,
-        environmentName,
-      }
-    });
-
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-    const randomIP = `35.${Math.floor(Math.random() * 200 + 10)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`;
-    const endpoint = `https://${environmentName.toLowerCase().replace(/\s+/g, '-')}.cloudwise.app`;
-
-    updateActiveProject({
-      deployment: {
-        status: 'deployed',
-        progress: 100,
-        logs: [
-          ...deployment.logs,
-          `[${new Date().toLocaleTimeString()}] Health check probes passed (3/3 nodes reporting OK).`,
-          `[${new Date().toLocaleTimeString()}] Deployment live at ${endpoint}`,
-        ],
-        deployedAt: new Date().toLocaleTimeString() + ' ' + new Date().toLocaleDateString(),
-        endpointUrl: endpoint,
-        ipAddress: randomIP,
-        environmentName,
-      },
-      currentStep: 'deployment'
-    });
-    showToast('Infrastructure deployment live & healthy!', 'success');
-  };
-
   const rollbackDeployment = () => {
     updateActiveProject({
       deployment: {
         status: 'idle',
         progress: 0,
-        logs: [`[${new Date().toLocaleTimeString()}] Deployment rolled back successfully. Environment reset to clean state.`],
+        logs: [`[${new Date().toLocaleTimeString()}] Deployment rolled back. Environment reset.`],
         deployedAt: null,
         endpointUrl: null,
         ipAddress: null,
@@ -715,7 +746,15 @@ export const CloudWiseProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     rollbackDeployment();
   };
 
-  const optimizations = activeProject?.optimizations || defaultOptimizations;
+  const optimizations = (() => {
+    const saved = activeProject?.optimizations;
+    const rec = selectedRecommendation;
+    const storageNum = parseInt(String(rec.specs.storage)) || estimation.storage;
+    if (saved && saved.length > 0 && saved[0].currentCost === rec.monthlyCost) {
+      return saved;
+    }
+    return buildOptimizations(rec.monthlyCost, rec.specs.vcpu, storageNum);
+  })();
 
   const applyOptimization = (id: string) => {
     if (!activeProject) return;
@@ -741,10 +780,47 @@ export const CloudWiseProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     .filter((o) => o.applied)
     .reduce((sum, o) => sum + o.savings, 0);
 
-  const effectiveMonthlyCost = Math.max(
-    0,
-    selectedRecommendation.monthlyCost - totalMonthlySavings
-  );
+  const effectiveMonthlyCost = Math.max(0, selectedRecommendation.monthlyCost - totalMonthlySavings);
+
+  // Monitoring data — fetched from backend, derived from estimation as fallback
+  const [monitoringData, setMonitoringData] = useState<MonitoringData>({
+    cpuUsage: 38,
+    memoryUsage: 62,
+    storageUsage: 41,
+    networkInMB: 12.4,
+    networkOutMB: 48.7,
+    healthStatus: 'Healthy',
+    clusterUptime: '0d 00h 00m',
+    activeNodes: 1,
+    ipAddress: 'Not yet deployed',
+    endpointUrl: null,
+  });
+
+  useEffect(() => {
+    const fetchMonitoring = async () => {
+      try {
+        const res = await fetch('/api/monitoring');
+        const data = await res.json();
+        if (res.ok && data.success) {
+          setMonitoringData({
+            cpuUsage: data.data.cpuUsage,
+            memoryUsage: data.data.memoryUsage,
+            storageUsage: data.data.storageUsage,
+            networkInMB: data.data.networkInMB,
+            networkOutMB: data.data.networkOutMB,
+            healthStatus: data.data.healthStatus,
+            clusterUptime: data.data.clusterUptime,
+            activeNodes: data.data.activeNodes,
+            ipAddress: data.data.ipAddress ?? 'Not yet deployed',
+            endpointUrl: data.data.endpointUrl ?? null,
+          });
+        }
+      } catch {
+        // keep fallback
+      }
+    };
+    fetchMonitoring();
+  }, []);
 
   return (
     <CloudWiseContext.Provider
@@ -753,6 +829,9 @@ export const CloudWiseProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         loginUser,
         logoutUser,
         projects,
+        projectsLoading,
+        projectsError,
+        refetchProjects: fetchBackendProjects,
         activeProject,
         setActiveProjectById,
         createProject,
@@ -767,13 +846,13 @@ export const CloudWiseProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         githubRepo: activeProject?.githubRepo,
         connectGitHub,
         deployment,
-        startSimulatedDeployment,
         rollbackDeployment,
         resetDeployment,
         optimizations,
         applyOptimization,
         totalMonthlySavings,
         effectiveMonthlyCost,
+        monitoringData,
         toasts,
         showToast,
         dismissToast

@@ -1,19 +1,34 @@
 from rest_framework import permissions
 
+class IsProjectOwner(permissions.BasePermission):
+    """
+    Permission to ensure only authenticated users can access projects,
+    and object-level access is strictly confined to the project owner.
+    """
+    def has_permission(self, request, view):
+        return bool(request.user and request.user.is_authenticated)
+
+    def has_object_permission(self, request, view, obj):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        return getattr(obj, 'user_id', None) == request.user.id
+
+
 class IsProjectRolePermission(permissions.BasePermission):
     """
     Custom permission for Role-Based Access Control (RBAC):
+    - Must be authenticated
     - Owner & Admin: Full access (create, view, edit, delete)
     - Editor: Create, view, edit (cannot delete)
     - Viewer: View only (cannot create, edit, delete)
     """
 
     def has_permission(self, request, view):
-        role = request.headers.get('x-user-role', 'owner')
-        if request.user.is_authenticated and hasattr(request.user, 'role'):
-            role = request.user.role or role
+        if not request.user or not request.user.is_authenticated:
+            return False
 
-        # Safe read-only methods are allowed for all
+        role = getattr(request.user, 'role', 'owner') or 'owner'
+
         if request.method in permissions.SAFE_METHODS:
             return True
 
@@ -26,9 +41,14 @@ class IsProjectRolePermission(permissions.BasePermission):
         return True
 
     def has_object_permission(self, request, view, obj):
-        role = request.headers.get('x-user-role', getattr(obj, 'user_role', 'owner'))
-        if request.user.is_authenticated and hasattr(request.user, 'role'):
-            role = request.user.role or role
+        if not request.user or not request.user.is_authenticated:
+            return False
+
+        # Must be the project owner
+        if getattr(obj, 'user_id', None) != request.user.id:
+            return False
+
+        role = getattr(request.user, 'role', getattr(obj, 'user_role', 'owner')) or 'owner'
 
         if request.method in permissions.SAFE_METHODS:
             return True
@@ -40,3 +60,4 @@ class IsProjectRolePermission(permissions.BasePermission):
             return False
 
         return True
+

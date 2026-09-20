@@ -1,0 +1,11 @@
+{
+  "include": ["api", "backend"],
+  "extraPaths": ["."],
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.13",
+  "typeCheckingMode": "basic",
+  "reportMissingImports": true,
+  "reportMissingModuleSource": false,
+  "useLibraryCodeForTypes": true
+}

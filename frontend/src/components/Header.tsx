@@ -27,6 +27,8 @@ export const Header: React.FC<HeaderProps> = ({ navItems }) => {
         return { label: 'Step 3 of 5', step: 'Files & GitHub Sync' };
       case '/deployment':
         return { label: 'Step 4 of 5', step: 'Provision & Deploy' };
+      case '/monitoring':
+        return { label: 'Step 4b', step: 'Live Monitoring' };
       case '/optimization':
         return { label: 'Step 5 of 5', step: 'Cost Tuning' };
       case '/auth':

@@ -89,3 +89,10 @@ The frontend will start at `http://localhost:5173` and automatically proxy `/api
 - Infrastructure Deployment Simulator & Logging
 - Dynamic Cost Optimization Tuning
 - Django Admin Control Panel for Data Management
+
+# Django setup
+```
+    .\.venv\Scripts\Activate.ps1 
+    python manage.py runserver
+```
+

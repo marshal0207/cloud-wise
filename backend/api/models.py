@@ -5,6 +5,18 @@ from django.contrib.auth.models import AbstractUser
 def generate_custom_id(prefix):
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
+def default_estimation():
+    return {}
+
+def default_recommendation():
+    return None
+
+def default_deployment():
+    return None
+
+def default_optimizations():
+    return None
+
 class CustomUser(AbstractUser):
     company = models.CharField(max_length=255, default='CloudWise Enterprise')
     role = models.CharField(
@@ -26,97 +38,7 @@ class CustomUser(AbstractUser):
         return f"{self.email} ({self.company})"
 
 
-def default_estimation():
-    return {
-        "appType": "Microservices & Web APIs",
-        "vcpu": 8,
-        "ram": 32,
-        "storage": 500,
-        "traffic": "1,000,000 req/day",
-        "region": "Gujarat (GIFT City / Gandhinagar)",
-        "performanceTier": "High Performance",
-        "budgetTier": "Balanced",
-        "calculatedResult": {
-            "minCost": 14800,
-            "maxCost": 21700,
-            "suggestedInstances": 3,
-            "bandwidthGB": 450
-        }
-    }
 
-def default_recommendation():
-    return {
-        "id": "aws-rec-1",
-        "title": "AWS Production Cluster (c6i.xlarge)",
-        "provider": "AWS",
-        "badge": "Recommended",
-        "specs": {"vcpu": 8, "ram": 32, "storage": "500 GB NVMe SSD", "network": "10 Gbps"},
-        "monthlyCost": 12280,
-        "hourlyCost": 17.00,
-        "reliability": "99.99% SLA",
-        "features": [
-            "Auto-scaling enabled",
-            "AWS Shield Standard DDoS Protection",
-            "Automated Daily EBS Snapshots",
-            "Multi-AZ Replication"
-        ],
-        "reasoning": "AWS c6i.xlarge provides the optimal balance of compute throughput and low-latency IOPS."
-    }
-
-def default_deployment():
-    return {
-        "status": "idle",
-        "progress": 0,
-        "logs": [],
-        "deployedAt": None,
-        "endpointUrl": None,
-        "ipAddress": None,
-        "environmentName": "cloudwise-prod-cluster"
-    }
-
-def default_optimizations():
-    return [
-        {
-            "id": "opt-1",
-            "title": "Rightsize Underutilized Compute Instance",
-            "category": "Compute",
-            "description": "Average CPU utilization over past 7 days was 14%. Downgrading from 8 vCPUs to 4 vCPUs will maintain headroom while cutting cost.",
-            "currentCost": 12280,
-            "savings": 3480,
-            "impact": "High",
-            "applied": False
-        },
-        {
-            "id": "opt-2",
-            "title": "Delete Unattached EBS Storage Volume",
-            "category": "Storage",
-            "description": "Found 1 unattached 120GB gp3 volume left over from a previous staging instance setup.",
-            "currentCost": 1240,
-            "savings": 1240,
-            "impact": "Medium",
-            "applied": False
-        },
-        {
-            "id": "opt-3",
-            "title": "Purchase 1-Year Compute Savings Plan",
-            "category": "Reservation",
-            "description": "Commit to steady-state baseline usage for 12 months to receive automatic 34% discount off on-demand rates.",
-            "currentCost": 8800,
-            "savings": 2980,
-            "impact": "High",
-            "applied": False
-        },
-        {
-            "id": "opt-4",
-            "title": "Automate Off-Peak Staging Database Shutdown",
-            "category": "Database",
-            "description": "Shut down non-production database clusters during weekend non-business hours.",
-            "currentCost": 2320,
-            "savings": 1490,
-            "impact": "Low",
-            "applied": False
-        }
-    ]
 
 class Project(models.Model):
     id = models.CharField(max_length=100, primary_key=True, editable=False)
@@ -129,10 +51,10 @@ class Project(models.Model):
     current_step = models.CharField(max_length=50, default='estimation')
     
     estimation = models.JSONField(default=default_estimation)
-    selected_recommendation = models.JSONField(default=default_recommendation)
+    selected_recommendation = models.JSONField(null=True, blank=True, default=default_recommendation)
     github_repo = models.JSONField(null=True, blank=True)
-    deployment = models.JSONField(default=default_deployment)
-    optimizations = models.JSONField(default=default_optimizations)
+    deployment = models.JSONField(null=True, blank=True, default=default_deployment)
+    optimizations = models.JSONField(null=True, blank=True, default=default_optimizations)
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -189,6 +111,8 @@ class DeploymentRecord(models.Model):
     id = models.CharField(max_length=100, primary_key=True, editable=False)
     environment_name = models.CharField(max_length=255)
     provider = models.CharField(max_length=100, default='AWS')
+    provider_deployment_id = models.CharField(max_length=255, blank=True, null=True)
+    provider_project_id = models.CharField(max_length=255, blank=True, null=True)
     monthly_cost = models.DecimalField(max_digits=12, decimal_places=2, default=12280.00)
     specs = models.JSONField(default=dict)
     region = models.CharField(max_length=100, default='Asia Pacific (Mumbai)')

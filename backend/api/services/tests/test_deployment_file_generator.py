@@ -35,7 +35,7 @@ class DeploymentFileGeneratorTests(SimpleTestCase):
         self.assertIn("python:3.13-slim", result["files"]["Dockerfile"])
         self.assertIn("8000:8000", result["files"]["docker-compose.yml"])
 
-    def test_generates_react_files_and_provider_label(self):
+    def test_generates_react_files_and_build_only_workflow(self):
         result = generate_deployment_files(
             {"package.json": '{"dependencies":{"react":"18.3.1"}}'},
             provider="GCP",
@@ -43,4 +43,10 @@ class DeploymentFileGeneratorTests(SimpleTestCase):
 
         self.assertEqual(result["technology"]["technology"], "REACT")
         self.assertIn("nginx:alpine", result["files"]["Dockerfile"])
-        self.assertIn("Target provider: GCP", result["files"][".github/workflows/deploy.yml"])
+        workflow = result["files"][".github/workflows/deploy.yml"]
+        self.assertIn("Build Docker image", workflow)
+        self.assertIn("Validate Docker image", workflow)
+        self.assertNotIn("aws-actions", workflow)
+        self.assertNotIn("gcloud", workflow)
+        self.assertNotIn("azure/login", workflow)
+        self.assertNotIn("digitalocean", workflow.lower())

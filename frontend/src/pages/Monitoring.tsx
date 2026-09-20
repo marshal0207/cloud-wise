@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { 
@@ -17,7 +17,7 @@ import { useCloudWise, formatINR } from '@/context/CloudWiseContext';
 
 export const Monitoring: React.FC = () => {
   const navigate = useNavigate();
-  const { selectedRecommendation, monitoringData, deployment, effectiveMonthlyCost } = useCloudWise();
+  const { selectedRecommendation, monitoringData, effectiveMonthlyCost, estimation } = useCloudWise();
 
   const [metrics, setMetrics] = useState({
     cpu: monitoringData.cpuUsage,
@@ -28,6 +28,16 @@ export const Monitoring: React.FC = () => {
   });
 
   const [simulating, setSimulating] = useState(false);
+
+  useEffect(() => {
+    setMetrics({
+      cpu: monitoringData.cpuUsage,
+      memory: monitoringData.memoryUsage,
+      storage: monitoringData.storageUsage,
+      netIn: monitoringData.networkInMB,
+      netOut: monitoringData.networkOutMB,
+    });
+  }, [monitoringData]);
 
   const simulateTrafficSpike = () => {
     setSimulating(true);
@@ -55,7 +65,7 @@ export const Monitoring: React.FC = () => {
             Resource Performance Dashboard
           </h1>
           <p className="text-xs sm:text-sm text-slate-400">
-            Monitoring active cluster: <strong className="text-cyan-300">{selectedRecommendation.title}</strong> ({deployment.ipAddress || '35.120.45.19'})
+            Monitoring active cluster: <strong className="text-cyan-300">{selectedRecommendation.title}</strong> ({monitoringData.ipAddress})
           </p>
         </div>
 
@@ -117,8 +127,8 @@ export const Monitoring: React.FC = () => {
             <span>Cluster Uptime</span>
             <Clock className="w-4 h-4 text-purple-400" />
           </div>
-          <p className="text-xl font-bold text-purple-300">14d 08h 32m</p>
-          <p className="text-[11px] text-slate-400">Zero unhandled downtime</p>
+          <p className="text-xl font-bold text-purple-300">{monitoringData.clusterUptime}</p>
+          <p className="text-[11px] text-slate-400">{monitoringData.activeNodes} active node{monitoringData.activeNodes !== 1 ? 's' : ''}</p>
         </div>
 
       </div>
@@ -216,7 +226,7 @@ export const Monitoring: React.FC = () => {
             </div>
             <div className="flex justify-between text-[11px] text-slate-400">
               <span>Volume: {selectedRecommendation.specs.storage}</span>
-              <span>IOPS: 3,000 Provisioned</span>
+              <span>IOPS: {Math.round(estimation.storage * 6)} Provisioned</span>
             </div>
           </div>
 
@@ -244,17 +254,17 @@ export const Monitoring: React.FC = () => {
               <span className="text-[10px] px-2 py-0.5 rounded bg-amber-500/20">High Savings Opportunity</span>
             </div>
             <p className="text-slate-300 leading-relaxed">
-              vCPU average load over past 24 hours was under 20%. Downsizing to 4 vCPUs will save up to ₹3,480/month without impairing SLA.
+              vCPU average load over past 24 hours was under 20%. Downsizing to {Math.max(2, Math.floor(selectedRecommendation.specs.vcpu / 2))} vCPUs will save up to {new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(Math.round(selectedRecommendation.monthlyCost * 0.28))}/month without impairing SLA.
             </p>
           </div>
 
           <div className="bg-slate-900/60 border border-slate-800 p-4 rounded-2xl space-y-2">
             <div className="flex items-center justify-between font-bold text-cyan-300">
               <span>Unattached Storage Snapshot</span>
-              <span className="text-[10px] px-2 py-0.5 rounded bg-cyan-500/20">₹1,240/mo Potential Savings</span>
+              <span className="text-[10px] px-2 py-0.5 rounded bg-cyan-500/20">{formatINR(Math.round(estimation.storage * 6 * 0.24))}/mo Potential Savings</span>
             </div>
             <p className="text-slate-300 leading-relaxed">
-              Found 1 unattached 120GB gp3 volume left over from a previous staging instance setup.
+              Found 1 unattached {Math.round(estimation.storage * 0.24)}GB volume left over from a previous staging instance setup.
             </p>
           </div>
         </div>

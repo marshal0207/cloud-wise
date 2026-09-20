@@ -1,0 +1,4 @@
+  File "<string>", line 1
+    import ast, collections; tree=ast.parse(open('api/views.py').read()); funcs=[n.name for n in ast.walk(tree) if isinstance(n,ast.FunctionDef)]; dups=[k for k,v in collections.Counter(funcs).items() if v; print('duplicates:', dups)
+                                                                                                                                                                                                             ^
+SyntaxError: invalid syntax

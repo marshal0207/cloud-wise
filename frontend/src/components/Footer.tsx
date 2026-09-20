@@ -34,6 +34,7 @@ export const Footer: React.FC = () => {
               <li><Link to="/recommendation" className="hover:text-cyan-400 transition-colors flex items-center gap-1">2. Cloud Recommendation <ArrowUpRight size={12} /></Link></li>
               <li><Link to="/generate" className="hover:text-cyan-400 transition-colors flex items-center gap-1">3. Files & GitHub Sync <ArrowUpRight size={12} /></Link></li>
               <li><Link to="/deployment" className="hover:text-cyan-400 transition-colors flex items-center gap-1">4. Cloud Provisioning <ArrowUpRight size={12} /></Link></li>
+              <li><Link to="/monitoring" className="hover:text-cyan-400 transition-colors flex items-center gap-1">4b. Live Monitoring <ArrowUpRight size={12} /></Link></li>
               <li><Link to="/optimization" className="hover:text-cyan-400 transition-colors flex items-center gap-1">5. Cost Tuning <ArrowUpRight size={12} /></Link></li>
             </ul>
           </div>

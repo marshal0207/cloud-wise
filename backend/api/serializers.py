@@ -68,11 +68,14 @@ class UserLoginSerializer(serializers.Serializer):
 
 
 class ProjectSerializer(serializers.ModelSerializer):
-    userId = serializers.CharField(source='user_id_str', read_only=True)
-    userRole = serializers.CharField(source='user_role')
-    currentStep = serializers.CharField(source='current_step')
-    selectedRecommendation = serializers.JSONField(source='selected_recommendation')
+    userId = serializers.SerializerMethodField()
+    userRole = serializers.CharField(source='user_role', required=False)
+    currentStep = serializers.CharField(source='current_step', required=False)
+    selectedRecommendation = serializers.JSONField(source='selected_recommendation', required=False, allow_null=True)
     githubRepo = serializers.JSONField(source='github_repo', required=False, allow_null=True)
+    deployment = serializers.JSONField(required=False, allow_null=True)
+    optimizations = serializers.JSONField(required=False, allow_null=True)
+    estimation = serializers.JSONField(required=False)
     createdAt = serializers.DateTimeField(source='created_at', read_only=True)
     updatedAt = serializers.DateTimeField(source='updated_at', read_only=True)
 
@@ -94,6 +97,11 @@ class ProjectSerializer(serializers.ModelSerializer):
             'createdAt',
             'updatedAt'
         ]
+
+    def get_userId(self, obj):
+        if obj.user:
+            return str(obj.user.id)
+        return obj.user_id_str
 
     def create(self, validated_data):
         return super().create(validated_data)
