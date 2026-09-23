@@ -25,6 +25,8 @@ export const Header: React.FC<HeaderProps> = ({ navItems }) => {
         return { label: 'Step 2 of 5', step: 'Cloud Comparison' };
       case '/generate':
         return { label: 'Step 3 of 5', step: 'Files & GitHub Sync' };
+      case '/connect-aws':
+        return { label: 'AWS Setup', step: 'Connect AWS Account' };
       case '/deployment':
         return { label: 'Step 4 of 5', step: 'Provision & Deploy' };
       case '/monitoring':

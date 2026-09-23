@@ -1,18 +1,19 @@
 import React from 'react';
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { AnimatePresence, motion } from 'framer-motion';
-import { 
-  Home as HomeIcon, 
+import {
+  Home as HomeIcon,
   Folder,
-  Calculator, 
-  Sparkles, 
+  Calculator,
+  Sparkles,
   FileCode,
-  Rocket, 
-  Zap, 
+  Rocket,
+  Zap,
   Activity,
-  Info, 
+  Info,
   Mail,
-  User
+  User,
+  KeyRound
 } from 'lucide-react';
 
 import { CloudWiseProvider } from '@/context/CloudWiseContext';
@@ -25,6 +26,7 @@ import { Projects } from '@/pages/Projects';
 import { Estimation } from '@/pages/Estimation';
 import { Recommendation } from '@/pages/Recommendation';
 import { GenerateFiles } from '@/pages/GenerateFiles';
+import { ConnectAws } from '@/pages/ConnectAws';
 import { Deployment } from '@/pages/Deployment';
 import { Optimization } from '@/pages/Optimization';
 import { Monitoring } from '@/pages/Monitoring';
@@ -38,6 +40,7 @@ const navItems: SlideTabItem[] = [
   { name: 'Estimation', url: '/estimation', icon: Calculator },
   { name: 'Recommend', url: '/recommendation', icon: Sparkles },
   { name: 'Files & GitHub', url: '/generate', icon: FileCode },
+  { name: 'Connect AWS', url: '/connect-aws', icon: KeyRound },
   { name: 'Deploy', url: '/deployment', icon: Rocket },
   { name: 'Monitoring', url: '/monitoring', icon: Activity },
   { name: 'Cost Tuning', url: '/optimization', icon: Zap },
@@ -64,6 +67,7 @@ const AnimatedRoutes: React.FC = () => {
           <Route path="/estimation" element={<Estimation />} />
           <Route path="/recommendation" element={<Recommendation />} />
           <Route path="/generate" element={<GenerateFiles />} />
+          <Route path="/connect-aws" element={<ConnectAws />} />
           <Route path="/deployment" element={<Deployment />} />
           <Route path="/optimization" element={<Optimization />} />
           <Route path="/monitoring" element={<Monitoring />} />

@@ -3,7 +3,7 @@ Tests for real deployment management endpoints.
 
 These tests verify that the deployment status, logs, health, and
 rollback endpoints use real provider APIs (or return stored data)
-instead of mock/simulated responses.
+instead of mock/simulated responses, and that ownership is enforced.
 
 Covers:
   - deployment_status_view returns stored status when no record found
@@ -15,12 +15,21 @@ Covers:
   - deployment_fail_view marks record as FAILED
   - deployment_rollback_view requires provider credentials
   - No SIMULATED/mock responses in production endpoints
+  - Endpoints require authentication + record ownership
 """
 
 import json
 from unittest.mock import patch, MagicMock
 from django.test import TestCase, RequestFactory
+from rest_framework.test import force_authenticate
 from api.models import DeploymentRecord, CustomUser
+
+
+def _authed_request(factory, method, path, user, **kwargs):
+    """Build an authenticated DRF request via RequestFactory + force_authenticate."""
+    request = getattr(factory, method)(path, **kwargs)
+    force_authenticate(request, user=user)
+    return request
 
 
 class DeploymentStatusViewTest(TestCase):
@@ -31,7 +40,11 @@ class DeploymentStatusViewTest(TestCase):
         self.user = CustomUser.objects.create_user(
             username='teststatus', email='status@test.com', password='Test1234'
         )
+        self.other_user = CustomUser.objects.create_user(
+            username='otherstatus', email='other@test.com', password='Test1234'
+        )
         self.record = DeploymentRecord.objects.create(
+            user=self.user,
             environment_name='test-prod',
             provider='VERCEL',
             provider_deployment_id='dpl_abc123',
@@ -46,16 +59,40 @@ class DeploymentStatusViewTest(TestCase):
             }],
         )
 
+    def test_requires_authentication(self):
+        from api.views import deployment_status_view
+        request = self.factory.get('/api/deployments/dpl_abc123/status')
+        response = deployment_status_view(request, 'dpl_abc123')
+        self.assertIn(response.status_code, (401, 403))
+
+    def test_rejects_non_owner(self):
+        from api.views import deployment_status_view
+        request = _authed_request(
+            self.factory, 'get',
+            '/api/deployments/dpl_abc123/status',
+            self.other_user,
+        )
+        response = deployment_status_view(request, 'dpl_abc123')
+        self.assertEqual(response.status_code, 404)
+
     def test_missing_deployment_returns_404(self):
         from api.views import deployment_status_view
-        request = self.factory.get('/api/deployments/nonexistent/status')
+        request = _authed_request(
+            self.factory, 'get',
+            '/api/deployments/nonexistent/status',
+            self.user,
+        )
         response = deployment_status_view(request, 'nonexistent')
         self.assertEqual(response.status_code, 404)
         self.assertFalse(response.data['success'])
 
     def test_vercel_deployment_returns_stored_status_without_credentials(self):
         from api.views import deployment_status_view
-        request = self.factory.get('/api/deployments/dpl_abc123/status')
+        request = _authed_request(
+            self.factory, 'get',
+            '/api/deployments/dpl_abc123/status',
+            self.user,
+        )
         with patch('api.views.settings') as mock_settings:
             mock_settings.VERCEL_TOKEN = ''
             mock_settings.VERCEL_TEAM_ID = ''
@@ -68,7 +105,11 @@ class DeploymentStatusViewTest(TestCase):
 
     def test_vercel_deployment_queries_real_api(self):
         from api.views import deployment_status_view
-        request = self.factory.get('/api/deployments/dpl_abc123/status')
+        request = _authed_request(
+            self.factory, 'get',
+            '/api/deployments/dpl_abc123/status',
+            self.user,
+        )
         mock_vercel_response = {
             'readyState': 'READY',
             'url': 'my-app-abc123.vercel.app',
@@ -89,7 +130,11 @@ class DeploymentStatusViewTest(TestCase):
     def test_vercel_error_returns_stored_status(self):
         from api.views import deployment_status_view
         from api.services.deployment.vercel_provider import VercelApiError
-        request = self.factory.get('/api/deployments/dpl_abc123/status')
+        request = _authed_request(
+            self.factory, 'get',
+            '/api/deployments/dpl_abc123/status',
+            self.user,
+        )
         with patch('api.views.settings') as mock_settings:
             mock_settings.VERCEL_TOKEN = 'fake-token'
             mock_settings.VERCEL_TEAM_ID = ''
@@ -104,6 +149,7 @@ class DeploymentStatusViewTest(TestCase):
 
     def test_render_deployment_returns_stored_status_without_credentials(self):
         render_record = DeploymentRecord.objects.create(
+            user=self.user,
             environment_name='render-test',
             provider='RENDER',
             provider_deployment_id='rdp_456',
@@ -112,7 +158,11 @@ class DeploymentStatusViewTest(TestCase):
             endpoint_url='https://my-app.onrender.com',
         )
         from api.views import deployment_status_view
-        request = self.factory.get('/api/deployments/rdp_456/status')
+        request = _authed_request(
+            self.factory, 'get',
+            '/api/deployments/rdp_456/status',
+            self.user,
+        )
         with patch('api.views.settings') as mock_settings:
             mock_settings.RENDER_API_KEY = ''
             mock_settings.RENDER_OWNER_ID = ''
@@ -124,7 +174,11 @@ class DeploymentStatusViewTest(TestCase):
 
     def test_no_simulated_field_in_response(self):
         from api.views import deployment_status_view
-        request = self.factory.get('/api/deployments/dpl_abc123/status')
+        request = _authed_request(
+            self.factory, 'get',
+            '/api/deployments/dpl_abc123/status',
+            self.user,
+        )
         with patch('api.views.settings') as mock_settings:
             mock_settings.VERCEL_TOKEN = ''
             mock_settings.VERCEL_TEAM_ID = ''
@@ -140,7 +194,11 @@ class DeploymentLogsViewTest(TestCase):
 
     def setUp(self):
         self.factory = RequestFactory()
+        self.user = CustomUser.objects.create_user(
+            username='testlogs', email='logs@test.com', password='Test1234'
+        )
         self.record = DeploymentRecord.objects.create(
+            user=self.user,
             environment_name='logs-test',
             provider='VERCEL',
             provider_deployment_id='dpl_logs1',
@@ -154,15 +212,29 @@ class DeploymentLogsViewTest(TestCase):
             }],
         )
 
+    def test_requires_authentication(self):
+        from api.views import deployment_logs_view
+        request = self.factory.get('/api/deployments/dpl_logs1/logs')
+        response = deployment_logs_view(request, 'dpl_logs1')
+        self.assertIn(response.status_code, (401, 403))
+
     def test_missing_deployment_returns_404(self):
         from api.views import deployment_logs_view
-        request = self.factory.get('/api/deployments/nonexistent/logs')
+        request = _authed_request(
+            self.factory, 'get',
+            '/api/deployments/nonexistent/logs',
+            self.user,
+        )
         response = deployment_logs_view(request, 'nonexistent')
         self.assertEqual(response.status_code, 404)
 
     def test_returns_stored_logs(self):
         from api.views import deployment_logs_view
-        request = self.factory.get('/api/deployments/dpl_logs1/logs')
+        request = _authed_request(
+            self.factory, 'get',
+            '/api/deployments/dpl_logs1/logs',
+            self.user,
+        )
         response = deployment_logs_view(request, 'dpl_logs1')
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.data['success'])
@@ -171,7 +243,11 @@ class DeploymentLogsViewTest(TestCase):
 
     def test_no_simulated_logs(self):
         from api.views import deployment_logs_view
-        request = self.factory.get('/api/deployments/dpl_logs1/logs')
+        request = _authed_request(
+            self.factory, 'get',
+            '/api/deployments/dpl_logs1/logs',
+            self.user,
+        )
         response = deployment_logs_view(request, 'dpl_logs1')
         for log_entry in response.data['data']:
             self.assertNotIn('SIMULATED', log_entry.get('message', ''))
@@ -182,7 +258,11 @@ class DeploymentHealthViewTest(TestCase):
 
     def setUp(self):
         self.factory = RequestFactory()
+        self.user = CustomUser.objects.create_user(
+            username='testhealth', email='health@test.com', password='Test1234'
+        )
         self.record = DeploymentRecord.objects.create(
+            user=self.user,
             environment_name='health-test',
             provider='VERCEL',
             provider_deployment_id='dpl_health1',
@@ -190,14 +270,25 @@ class DeploymentHealthViewTest(TestCase):
             endpoint_url='https://httpbin.org/get',
         )
 
+    def test_requires_authentication(self):
+        from api.views import deployment_health_view
+        request = self.factory.post('/api/deployments/dpl_health1/health')
+        response = deployment_health_view(request, 'dpl_health1')
+        self.assertIn(response.status_code, (401, 403))
+
     def test_missing_deployment_returns_404(self):
         from api.views import deployment_health_view
-        request = self.factory.post('/api/deployments/nonexistent/health')
+        request = _authed_request(
+            self.factory, 'post',
+            '/api/deployments/nonexistent/health',
+            self.user,
+        )
         response = deployment_health_view(request, 'nonexistent')
         self.assertEqual(response.status_code, 404)
 
     def test_no_endpoint_url_returns_unhealthy(self):
         record = DeploymentRecord.objects.create(
+            user=self.user,
             environment_name='no-url',
             provider='VERCEL',
             provider_deployment_id='dpl_nourl',
@@ -205,14 +296,22 @@ class DeploymentHealthViewTest(TestCase):
             endpoint_url=None,
         )
         from api.views import deployment_health_view
-        request = self.factory.post('/api/deployments/dpl_nourl/health')
+        request = _authed_request(
+            self.factory, 'post',
+            '/api/deployments/dpl_nourl/health',
+            self.user,
+        )
         response = deployment_health_view(request, 'dpl_nourl')
         self.assertEqual(response.status_code, 200)
         self.assertFalse(response.data['data']['healthy'])
 
     def test_health_check_does_real_http_request(self):
         from api.views import deployment_health_view
-        request = self.factory.post('/api/deployments/dpl_health1/health')
+        request = _authed_request(
+            self.factory, 'post',
+            '/api/deployments/dpl_health1/health',
+            self.user,
+        )
         mock_response = MagicMock()
         mock_response.status = 200
         with patch('api.views.urllib.request.urlopen') as mock_urlopen:
@@ -226,6 +325,7 @@ class DeploymentHealthViewTest(TestCase):
 
     def test_health_check_handles_connection_failure(self):
         record = DeploymentRecord.objects.create(
+            user=self.user,
             environment_name='fail-url',
             provider='VERCEL',
             provider_deployment_id='dpl_fail',
@@ -233,7 +333,11 @@ class DeploymentHealthViewTest(TestCase):
             endpoint_url='https://nonexistent-domain-12345.example.com',
         )
         from api.views import deployment_health_view
-        request = self.factory.post('/api/deployments/dpl_fail/health')
+        request = _authed_request(
+            self.factory, 'post',
+            '/api/deployments/dpl_fail/health',
+            self.user,
+        )
         response = deployment_health_view(request, 'dpl_fail')
         self.assertEqual(response.status_code, 200)
         self.assertFalse(response.data['data']['healthy'])
@@ -245,7 +349,11 @@ class DeploymentFailViewTest(TestCase):
 
     def setUp(self):
         self.factory = RequestFactory()
+        self.user = CustomUser.objects.create_user(
+            username='testfail', email='fail@test.com', password='Test1234'
+        )
         self.record = DeploymentRecord.objects.create(
+            user=self.user,
             environment_name='fail-test',
             provider='VERCEL',
             provider_deployment_id='dpl_fail1',
@@ -253,10 +361,18 @@ class DeploymentFailViewTest(TestCase):
             endpoint_url='https://app.vercel.app',
         )
 
+    def test_requires_authentication(self):
+        from api.views import deployment_fail_view
+        request = self.factory.post('/api/deployments/dpl_fail1/fail')
+        response = deployment_fail_view(request, 'dpl_fail1')
+        self.assertIn(response.status_code, (401, 403))
+
     def test_marks_record_as_failed(self):
         from api.views import deployment_fail_view
-        request = self.factory.post(
+        request = _authed_request(
+            self.factory, 'post',
             '/api/deployments/dpl_fail1/fail',
+            self.user,
             data=json.dumps({'reason': 'Quota exceeded'}),
             content_type='application/json',
         )
@@ -272,7 +388,11 @@ class DeploymentRollbackViewTest(TestCase):
 
     def setUp(self):
         self.factory = RequestFactory()
+        self.user = CustomUser.objects.create_user(
+            username='testrb', email='rb@test.com', password='Test1234'
+        )
         self.record = DeploymentRecord.objects.create(
+            user=self.user,
             environment_name='rb-test',
             provider='VERCEL',
             provider_deployment_id='dpl_rb1',
@@ -281,15 +401,29 @@ class DeploymentRollbackViewTest(TestCase):
             endpoint_url='https://app.vercel.app',
         )
 
+    def test_requires_authentication(self):
+        from api.views import deployment_rollback_view
+        request = self.factory.post('/api/deployments/dpl_rb1/rollback')
+        response = deployment_rollback_view(request, 'dpl_rb1')
+        self.assertIn(response.status_code, (401, 403))
+
     def test_missing_deployment_returns_404(self):
         from api.views import deployment_rollback_view
-        request = self.factory.post('/api/deployments/nonexistent/rollback')
+        request = _authed_request(
+            self.factory, 'post',
+            '/api/deployments/nonexistent/rollback',
+            self.user,
+        )
         response = deployment_rollback_view(request, 'nonexistent')
         self.assertEqual(response.status_code, 404)
 
     def test_vercel_rollback_requires_credentials(self):
         from api.views import deployment_rollback_view
-        request = self.factory.post('/api/deployments/dpl_rb1/rollback')
+        request = _authed_request(
+            self.factory, 'post',
+            '/api/deployments/dpl_rb1/rollback',
+            self.user,
+        )
         with patch('api.views.settings') as mock_settings:
             mock_settings.VERCEL_TOKEN = ''
             mock_settings.VERCEL_TEAM_ID = ''
@@ -298,7 +432,11 @@ class DeploymentRollbackViewTest(TestCase):
 
     def test_vercel_rollback_triggers_new_deployment(self):
         from api.views import deployment_rollback_view
-        request = self.factory.post('/api/deployments/dpl_rb1/rollback')
+        request = _authed_request(
+            self.factory, 'post',
+            '/api/deployments/dpl_rb1/rollback',
+            self.user,
+        )
         mock_response = {'id': 'dpl_rb_new_123'}
         with patch('api.views.settings') as mock_settings:
             mock_settings.VERCEL_TOKEN = 'fake-token'

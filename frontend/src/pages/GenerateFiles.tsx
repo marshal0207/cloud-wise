@@ -36,7 +36,7 @@ export const GenerateFiles: React.FC = () => {
     activeProject
   } = useCloudWise();
 
-  const [activeTab, setActiveTab] = useState<'dockerfile' | 'cicd' | 'compose' | 'vercel' | 'render'>('dockerfile');
+  const [activeTab, setActiveTab] = useState<'dockerfile' | 'cicd' | 'compose' | 'nginx'>('dockerfile');
   const [copied, setCopied] = useState(false);
   const [showGithubModal, setShowGithubModal] = useState(false);
   const [repoInput, setRepoInput] = useState(githubRepo?.name || activeProject?.githubRepo?.name || '');
@@ -67,6 +67,21 @@ export const GenerateFiles: React.FC = () => {
     composePreserved?: boolean;
     cicdPreserved?: boolean;
     port?: number;
+    detection?: {
+      frontend?: string;
+      backend?: string;
+      database?: string;
+      applicationType?: string;
+    };
+    deploymentPlan?: {
+      target?: string;
+      containers?: string[];
+      generatedFiles?: string[];
+      database?: { type?: string | null; detected?: boolean };
+      requiredEnvVars?: string[];
+      ports?: number[];
+      requiresNginx?: boolean;
+    };
   }>({});
 
   const [generatedFiles, setGeneratedFiles] = useState<Record<string, string> | null>(null);
@@ -151,15 +166,13 @@ export const GenerateFiles: React.FC = () => {
     if (generatedFiles) {
       switch (activeTab) {
         case 'dockerfile':
-          return generatedFiles['Dockerfile'] || '# Dockerfile not generated';
+          return generatedFiles['Dockerfile'] || generatedFiles['frontend/Dockerfile'] || '# Dockerfile not generated';
         case 'compose':
           return generatedFiles['docker-compose.yml'] || '# docker-compose.yml not generated';
         case 'cicd':
           return generatedFiles['.github/workflows/aws-deploy.yml'] || generatedFiles['.github/workflows/deploy.yml'] || '# CI/CD pipeline not generated';
-        case 'vercel':
-          return generatedFiles['vercel.json'] || '# vercel.json configuration';
-        case 'render':
-          return generatedFiles['render.yaml'] || '# render.yaml configuration';
+        case 'nginx':
+          return generatedFiles['nginx.conf'] || '# nginx.conf not generated';
       }
     }
 
@@ -194,10 +207,16 @@ jobs:
       - uses: actions/checkout@v4
       - run: docker build -t cloudwise-app .`;
     }
-    if (activeTab === 'vercel') {
-      return `{\n  "version": 2,\n  "builds": [{ "src": "package.json", "use": "@vercel/node" }]\n}`;
+    return `# nginx.conf routes / to the frontend and /api to the backend
+server {
+    listen 80;
+    location /api/ {
+        proxy_pass http://backend:8080;
     }
-    return `services:\n  - type: web\n    name: cloudwise-app\n    env: docker\n    dockerfilePath: ./Dockerfile`;
+    location / {
+        proxy_pass http://frontend:80;
+    }
+}`;
   };
 
   const handleCopy = () => {
@@ -212,8 +231,7 @@ jobs:
       dockerfile: 'Dockerfile',
       cicd: 'aws-deploy.yml',
       compose: 'docker-compose.yml',
-      vercel: 'vercel.json',
-      render: 'render.yaml'
+      nginx: 'nginx.conf'
     };
     const content = getActiveCode();
     const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
@@ -323,8 +341,15 @@ jobs:
       if (hasFileContents) {
         const generateResponse = await fetch('/api/deployment/generate-files', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ provider: providerName, files: fileContents }),
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: token ? `Bearer ${token}` : '',
+          },
+          body: JSON.stringify({
+            provider: providerName,
+            files: fileContents,
+            tree: inspectData.data.tree || [],
+          }),
         });
         const generateData = await generateResponse.json();
         if (!generateResponse.ok || !generateData.success) {
@@ -337,6 +362,8 @@ jobs:
           composePreserved: generateData.data.compose_preserved,
           cicdPreserved: generateData.data.cicd_preserved,
           port: generateData.data.port,
+          detection: generateData.data.detection,
+          deploymentPlan: generateData.data.deploymentPlan,
         });
         setGeneratedFiles(generateData.data.files);
       }
@@ -413,7 +440,7 @@ jobs:
           Repository File Inspection & Infrastructure Code
         </h1>
         <p className="text-slate-400 text-sm sm:text-base leading-relaxed">
-          CloudWise inspects every file in your GitHub repository. If a Dockerfile exists, CloudWise preserves it and generates matching docker-compose & AWS/Vercel/Render pipeline files.
+          CloudWise inspects every file in your GitHub repository, detects your stack, and generates Docker deployment files (Dockerfile, docker-compose, nginx routing) ready for AWS EC2. Existing Dockerfiles are preserved.
         </p>
       </div>
 
@@ -474,7 +501,7 @@ jobs:
           <div>
             <span className="font-extrabold text-sm block text-emerald-300">Existing Dockerfile Preserved!</span>
             <span className="text-emerald-200/90 text-xs">
-              CloudWise detected your existing Dockerfile (Port {detectedInfo.port || 3000}). Preserved original Dockerfile instructions and generated matching <code className="text-white">docker-compose.yml</code> and AWS/Vercel/Render CI/CD files.
+              CloudWise detected your existing Dockerfile (Port {detectedInfo.port || 3000}). Preserved original Dockerfile instructions and generated matching <code className="text-white">docker-compose.yml</code> and AWS CI/CD pipeline files.
             </span>
           </div>
         </div>
@@ -510,6 +537,61 @@ jobs:
             <span className="text-blue-200/80 text-xs">
               GitHub's unauthenticated API limit (60 req/hr) has been reached. Displaying the last cached scan. Connect a GitHub account or wait a few minutes before retrying.
             </span>
+          </div>
+        </div>
+      )}
+
+
+      {/* Deployment Preview: Detected + Generated */}
+      {generatedFiles && (detectedInfo.detection || detectedInfo.deploymentPlan) && (
+        <div className="glass-panel p-6 rounded-3xl border border-slate-800 grid grid-cols-1 md:grid-cols-2 gap-6">
+          <div className="space-y-3">
+            <h3 className="text-sm font-bold text-white flex items-center gap-2">
+              <Sparkles className="w-4 h-4 text-violet-400" />
+              <span>Detected</span>
+            </h3>
+            <div className="space-y-1.5 text-xs">
+              <div className="flex gap-2">
+                <span className="text-slate-500 w-20 shrink-0 font-semibold">Frontend:</span>
+                <span className="text-cyan-300 font-bold">{detectedInfo.detection?.frontend || 'Not detected'}</span>
+              </div>
+              <div className="flex gap-2">
+                <span className="text-slate-500 w-20 shrink-0 font-semibold">Backend:</span>
+                <span className="text-cyan-300 font-bold">{detectedInfo.detection?.backend || 'Not detected'}</span>
+              </div>
+              <div className="flex gap-2">
+                <span className="text-slate-500 w-20 shrink-0 font-semibold">Database:</span>
+                <span className="text-cyan-300 font-bold">
+                  {detectedInfo.detection?.database || 'Not detected'}
+                  {detectedInfo.detection?.database && (
+                    <span className="ml-2 text-[10px] text-slate-400 font-normal">(external — you provide it)</span>
+                  )}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div className="space-y-3">
+            <h3 className="text-sm font-bold text-white flex items-center gap-2">
+              <FileCode className="w-4 h-4 text-emerald-400" />
+              <span>Generated</span>
+            </h3>
+            <ul className="space-y-1.5 text-xs font-mono">
+              {(detectedInfo.deploymentPlan?.generatedFiles || Object.keys(generatedFiles)).map((filePath) => (
+                <li key={filePath} className="flex items-center gap-2 text-emerald-300">
+                  <CheckCircle2 size={14} className="text-emerald-400 shrink-0" />
+                  <span>{filePath}</span>
+                </li>
+              ))}
+            </ul>
+            {detectedInfo.deploymentPlan?.target && (
+              <p className="text-[11px] text-slate-500">
+                Target: <span className="text-slate-300 font-bold">{detectedInfo.deploymentPlan.target}</span>
+                {detectedInfo.deploymentPlan.requiresNginx && (
+                  <> · Nginx routes <code className="text-slate-300">/</code> → frontend, <code className="text-slate-300">/api</code> → backend</>
+                )}
+              </p>
+            )}
           </div>
         </div>
       )}
@@ -676,23 +758,16 @@ jobs:
                 <span>AWS CI/CD</span>
               </button>
 
-              <button
-                onClick={() => setActiveTab('vercel')}
-                className={`px-3.5 py-2 rounded-xl transition-all flex items-center gap-1.5 ${
-                  activeTab === 'vercel' ? 'bg-cyan-500 text-slate-950 font-bold shadow' : 'text-slate-400 hover:text-white'
-                }`}
-              >
-                <span>vercel.json</span>
-              </button>
-
-              <button
-                onClick={() => setActiveTab('render')}
-                className={`px-3.5 py-2 rounded-xl transition-all flex items-center gap-1.5 ${
-                  activeTab === 'render' ? 'bg-cyan-500 text-slate-950 font-bold shadow' : 'text-slate-400 hover:text-white'
-                }`}
-              >
-                <span>render.yaml</span>
-              </button>
+              {generatedFiles?.['nginx.conf'] && (
+                <button
+                  onClick={() => setActiveTab('nginx')}
+                  className={`px-3.5 py-2 rounded-xl transition-all flex items-center gap-1.5 ${
+                    activeTab === 'nginx' ? 'bg-cyan-500 text-slate-950 font-bold shadow' : 'text-slate-400 hover:text-white'
+                  }`}
+                >
+                  <span>nginx.conf</span>
+                </button>
+              )}
             </div>
 
             <div className="flex items-center gap-2">
@@ -726,9 +801,9 @@ jobs:
 
       {/* Action Bar */}
       <div className="glass-panel p-6 rounded-3xl text-center space-y-4 max-w-xl mx-auto border border-cyan-500/20">
-        <h4 className="text-base font-bold text-white">Ready for Multi-Cloud Deployment?</h4>
+        <h4 className="text-base font-bold text-white">Ready for AWS EC2 Deployment?</h4>
         <p className="text-xs text-slate-400">
-          Generated artifacts ready. Proceed to launch live deployment pipeline targeting <strong className="text-cyan-300">Vercel</strong>, <strong className="text-cyan-300">Render</strong>, or <strong className="text-cyan-300">AWS Free Tier</strong>.
+          Docker deployment artifacts are ready. Proceed to the deployment pipeline targeting <strong className="text-cyan-300">AWS EC2</strong> with your external database.
         </p>
         <div className="flex flex-col sm:flex-row items-center gap-3">
           <button
