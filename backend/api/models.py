@@ -109,6 +109,7 @@ class EstimationRecord(models.Model):
 
 class DeploymentRecord(models.Model):
     id = models.CharField(max_length=100, primary_key=True, editable=False)
+    user = models.ForeignKey(CustomUser, on_delete=models.CASCADE, null=True, blank=True, related_name='deployment_records')
     environment_name = models.CharField(max_length=255)
     provider = models.CharField(max_length=100, default='AWS')
     provider_deployment_id = models.CharField(max_length=255, blank=True, null=True)
@@ -156,3 +157,59 @@ class GitHubConnection(models.Model):
 
     def __str__(self):
         return f"GitHub connection for {self.user.email or self.user.username}"
+
+
+class AWSConnection(models.Model):
+    """
+    User's AWS account connection via IAM Role + STS AssumeRole.
+
+    Stores ONLY the minimum required connection information:
+    the target role ARN, a per-user external ID, and the resolved
+    AWS account ID. No long-lived AWS secret keys are ever stored.
+    Temporary credentials are assumed on demand and kept in memory only.
+    """
+    user = models.OneToOneField(CustomUser, on_delete=models.CASCADE, related_name='aws_connection')
+    role_arn = models.CharField(max_length=255)
+    external_id = models.CharField(max_length=128)
+    account_id = models.CharField(max_length=64, blank=True, default='')
+    region = models.CharField(max_length=50, default='ap-south-1')
+    status = models.CharField(max_length=30, default='active')  # pending | active
+    connected_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"AWS connection for {self.user.email or self.user.username} ({self.account_id or 'unverified'})"
+
+
+class EC2Instance(models.Model):
+    """
+    CloudWise-managed EC2 instance in the user's AWS account.
+
+    Used to reuse existing instances across deployments instead of
+    creating a new EC2 instance for every deployment.
+    """
+    id = models.CharField(max_length=100, primary_key=True, editable=False)
+    user = models.ForeignKey(CustomUser, on_delete=models.CASCADE, null=True, blank=True, related_name='ec2_instances')
+    instance_id = models.CharField(max_length=64, unique=True)
+    region = models.CharField(max_length=50, default='ap-south-1')
+    instance_type = models.CharField(max_length=50, default='t3.micro')
+    ami_id = models.CharField(max_length=64, blank=True, default='')
+    public_ip = models.CharField(max_length=64, blank=True, default='')
+    private_ip = models.CharField(max_length=64, blank=True, default='')
+    security_group_id = models.CharField(max_length=64, blank=True, default='')
+    security_group_name = models.CharField(max_length=100, blank=True, default='')
+    status = models.CharField(max_length=30, default='pending')
+    environment_name = models.CharField(max_length=255, blank=True, default='')
+    docker_installed = models.BooleanField(default=False)
+    deployment_count = models.IntegerField(default=1)
+    metadata = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def save(self, *args, **kwargs):
+        if not self.id:
+            self.id = generate_custom_id('eci')
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.instance_id} ({self.status})"

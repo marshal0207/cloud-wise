@@ -11,6 +11,8 @@ from .status import DeploymentStatus, DeploymentStage, is_valid_transition
 from .log_service import DeploymentLogService, make_log_entry
 from .health_check import DeploymentHealthCheckService
 from .rollback import DeploymentRollbackService
+from .aws_connection_service import AwsConnectionError
+from .aws_ec2_provider import AwsEc2Provider, AwsEc2Error
 
 __all__ = [
     "DeploymentProvider",
@@ -22,4 +24,7 @@ __all__ = [
     "make_log_entry",
     "DeploymentHealthCheckService",
     "DeploymentRollbackService",
+    "AwsConnectionError",
+    "AwsEc2Provider",
+    "AwsEc2Error",
 ]

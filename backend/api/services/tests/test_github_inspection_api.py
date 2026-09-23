@@ -106,3 +106,95 @@ class GitHubInspectionApiTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.data['success'])
         self.assertIsNone(response.data['data']['technology'])
+
+    @patch('api.views.detect_tech_stack')
+    @patch('api.views.inspect_repository')
+    def test_returns_extended_analysis_fields_without_breaking_existing(self, inspect, detect):
+        self.client.force_authenticate(user=self.user)
+        GitHubConnection.objects.create(
+            user=self.user,
+            access_token='server-token',
+            github_user_id='123',
+            github_login='owner',
+        )
+        inspect.return_value = {
+            'repository': {'owner': 'owner', 'name': 'repository', 'full_name': 'owner/repository', 'defaultBranch': 'main'},
+            'branch': 'main',
+            'commitSha': 'abc1234',
+            'tree': [{'path': 'package.json', 'type': 'file', 'size': 100, 'sha': 'a'}],
+            'files': {
+                'package.json': (
+                    '{"dependencies":{"react":"18.3.1"},'
+                    '"devDependencies":{"vite":"5.4.0","@vitejs/plugin-react":"4.3.0"}}'
+                ),
+                'pom.xml': '<project><dependency><groupId>org.springframework.boot</groupId>'
+                           '<artifactId>spring-boot-starter-web</artifactId></dependency>'
+                           '<dependency><groupId>org.postgresql</groupId><artifactId>postgresql</artifactId></dependency></project>',
+                '.env.example': 'DATABASE_URL=\nJWT_SECRET=\nAPI_KEY=\nPORT=\n',
+            },
+            'totalFiles': 3,
+            'totalDirectories': 1,
+            'truncated': False,
+            'scannedAt': '2026-09-23T00:00:00',
+            'repositorySize': {'totalBytes': 2048, 'totalMegabytes': 0.0, 'fileCount': 3, 'largestFileBytes': 1024},
+            'has_dockerfile': False,
+            'has_compose': False,
+            'has_cicd': False,
+        }
+        detect.return_value = TechStack('REACT', 'NPM', 3000)
+
+        response = self.client.post(self.url, {}, format='json')
+
+        self.assertEqual(response.status_code, 200)
+        data = response.data['data']
+
+        # Existing consumers keep working — all previous fields preserved
+        for key in (
+            'repository', 'branch', 'commitSha', 'tree', 'files', 'totalFiles',
+            'totalDirectories', 'truncated', 'scannedAt', 'technology',
+            'has_dockerfile', 'has_compose', 'has_cicd',
+        ):
+            self.assertIn(key, data)
+        self.assertEqual(data['technology']['technology'], 'REACT')
+
+        # New structured analysis fields
+        for key in (
+            'frontend', 'backend', 'database', 'packageManagers',
+            'environmentVariables', 'applicationType', 'repositorySize',
+            'deploymentRequirements',
+        ):
+            self.assertIn(key, data)
+
+        self.assertEqual(data['frontend'], {'technology': 'React', 'framework': 'Vite'})
+        self.assertEqual(data['backend'], {'technology': 'Java', 'framework': 'Spring Boot'})
+        self.assertEqual(data['database'], {'type': 'PostgreSQL', 'detected': True})
+        self.assertEqual(data['packageManagers'], ['npm', 'maven'])
+        self.assertEqual(data['environmentVariables'], ['DATABASE_URL', 'JWT_SECRET', 'API_KEY', 'PORT'])
+        self.assertEqual(data['applicationType'], 'full-stack')
+        self.assertEqual(data['repositorySize']['totalBytes'], 2048)
+        self.assertEqual(data['deploymentRequirements']['port'], 8080)
+
+    @patch('api.views.inspect_repository')
+    def test_repository_limit_error_returns_platform_error(self, inspect):
+        from api.services.github_repository_service import RepositoryLimitError
+
+        self.client.force_authenticate(user=self.user)
+        GitHubConnection.objects.create(
+            user=self.user,
+            access_token='server-token',
+            github_user_id='123',
+            github_login='owner',
+        )
+        inspect.side_effect = RepositoryLimitError(
+            'Repository analysis limit reached.\n\n'
+            'Repository size: 1.2 GB\n'
+            'Maximum supported size: 500 MB'
+        )
+
+        response = self.client.post(self.url, {}, format='json')
+
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(response.data['code'], 'REPOSITORY_LIMIT_EXCEEDED')
+        self.assertFalse(response.data['success'])
+        self.assertIn('Repository analysis limit reached.', response.data['error'])
+        self.assertNotIn('GitHub limit', response.data['error'])

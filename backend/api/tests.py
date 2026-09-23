@@ -224,7 +224,7 @@ class BackendApiTests(TestCase):
         self.assertEqual(res.status_code, 401)
 
     def test_deployment_blocked_without_credentials(self):
-        # Authenticated deploy with no GitHub repo linked returns 400.
+        # Authenticated deploy: retired provider OR no project → 400/503.
         user, token = self._create_user_and_token('deployer@cloudwise.io', 'Pass1234', 'Deployer')
         headers = {'HTTP_AUTHORIZATION': f'Bearer {token}'}
         data = {
@@ -234,7 +234,7 @@ class BackendApiTests(TestCase):
             'specs': {'vcpu': 2, 'ram': 2, 'storage': '30 GB EBS'}
         }
         res = self.client.post('/api/deploy', data=data, content_type='application/json', **headers)
-        # No project exists for this user — expect 400
+        # Vercel is retired (400) or no project exists (400/503)
         self.assertIn(res.status_code, [400, 503])
 
     def test_waitlist(self):

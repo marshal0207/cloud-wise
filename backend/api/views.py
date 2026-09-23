@@ -25,6 +25,8 @@ from .models import (
     DeploymentRecord, 
     WaitlistSubscriber,
         GitHubConnection,
+    AWSConnection,
+    EC2Instance,
     default_estimation,
     default_recommendation,
     default_deployment,
@@ -43,8 +45,12 @@ from .serializers import (
 from .permissions import IsProjectRolePermission
 from .services.deployment_file_generator import generate_deployment_files
 from .services.github_service import GitHubApiError, push_files_to_repository
-from .services.github_repository_service import inspect_repository
-from .services.tech_stack_detector import UnsupportedTechStackError, detect_tech_stack
+from .services.github_repository_service import inspect_repository, RepositoryLimitError
+from .services.tech_stack_detector import (
+    UnsupportedTechStackError,
+    analyze_repository,
+    detect_tech_stack,
+)
 from .services.aws_pricing_service import AwsPricingError, get_aws_price_snapshot
 from .services.free_tier_policy import FreeTierLimitError, validate_free_tier_deployment, evaluate_free_tier_eligibility
 from .services.deployment.mock_provider import MockDeploymentProvider, UnsupportedProviderError
@@ -52,6 +58,16 @@ from .services.deployment.vercel_provider import VercelDeploymentService, Vercel
 from .services.deployment.render_provider import RenderDeploymentService, RenderApiError
 from .services.deployment.health_check import DeploymentHealthCheckService
 from .services.deployment.rollback import DeploymentRollbackService
+from .services.deployment.aws_connection_service import (
+    AwsConnectionError,
+    build_policies,
+    connect as aws_connect,
+    connection_public_dict,
+    disconnect as aws_disconnect,
+    ensure_pending_connection,
+    platform_credentials_configured,
+)
+from .services.deployment.aws_ec2_provider import AwsEc2Error, AwsEc2Provider
 
 User = get_user_model()
 
@@ -449,6 +465,13 @@ def project_github_inspect_view(request, pk):
         except UnsupportedTechStackError:
             stack_data = None
 
+        # Structured CloudWise analysis: frontend/backend/database/env/type
+        analysis = analyze_repository(
+            inspection.get('files') or {},
+            tree=inspection.get('tree') or [],
+            repository_size=inspection.get('repositorySize') or {},
+        )
+
         # Update and persist scanned repository metadata on the project
         repo_info = inspection.get('repository', {})
         repo_full_name = repo_info.get('full_name') if isinstance(repo_info, dict) else str(repo_info)
@@ -484,8 +507,17 @@ def project_github_inspect_view(request, pk):
                 'has_dockerfile': inspection.get('has_dockerfile', False),
                 'has_compose': inspection.get('has_compose', False),
                 'has_cicd': inspection.get('has_cicd', False),
+                **analysis,
             }
         }, status=status.HTTP_200_OK)
+    except RepositoryLimitError as exc:
+        return Response({
+            'status': 'ERROR',
+            'code': 'REPOSITORY_LIMIT_EXCEEDED',
+            'success': False,
+            'error': str(exc),
+            'message': str(exc),
+        }, status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
     except ValueError as exc:
         return Response({
             'status': 'ERROR',
@@ -513,6 +545,16 @@ def project_github_inspect_view(request, pk):
             cached_files_list = repository.get('files', [])
             token_expired = st_code == 401
             rate_limited = st_code == 403
+            cached_files_map = {f: '' for f in cached_files_list}
+            cached_analysis = analyze_repository(
+                cached_files_map,
+                tree=cached_tree,
+            )
+            if not cached_analysis.get('repositorySize'):
+                cached_analysis['repositorySize'] = {
+                    'totalBytes': sum(int(n.get('size') or 0) for n in cached_tree if isinstance(n, dict) and n.get('type') == 'file'),
+                    'fileCount': len([n for n in cached_tree if isinstance(n, dict) and n.get('type') == 'file']),
+                }
             return Response({
                 'status': 'SUCCESS',
                 'success': True,
@@ -529,7 +571,7 @@ def project_github_inspect_view(request, pk):
                     'branch': repository.get('defaultBranch', 'main'),
                     'commitSha': repository.get('commitSha', ''),
                     'tree': cached_tree,
-                    'files': {f: '' for f in cached_files_list},
+                    'files': cached_files_map,
                     'totalFiles': repository.get('totalFiles', len([n for n in cached_tree if n.get('type') == 'file'])),
                     'totalDirectories': repository.get('totalDirectories', 0),
                     'truncated': False,
@@ -538,6 +580,7 @@ def project_github_inspect_view(request, pk):
                     'has_dockerfile': False,
                     'has_compose': False,
                     'has_cicd': False,
+                    **cached_analysis,
                 }
             }, status=status.HTTP_200_OK)
 
@@ -644,19 +687,44 @@ def estimate_view(request):
 @permission_classes([permissions.IsAuthenticated])
 def deploy_view(request):
     """
-    Real deployment endpoint.
+    Real deployment endpoint — AWS EC2 only (active target).
 
-    Deploys the GitHub repository stored on the active project to
-    Vercel (frontend/Node) or Render (backend/Docker).
+    Vercel and Render are isolated/deprecated: their provider modules are
+    retained for existing records but new deploys are rejected.
 
-    Returns BLOCKED if provider credentials are not configured.
+    AWS flow:
+      1. Inspect the linked GitHub repository.
+      2. Generate Docker/compose files (preserve existing Dockerfiles).
+      3. Validate required environment variables + DATABASE_URL scheme.
+      4. Provision (or reuse) EC2 in the user's AWS account (Part 3).
+      5. Upload files + run docker compose via SSM (Part 4).
+      6. Health-check and return the live URL (Part 5).
+
+    Returns BLOCKED if the AWS account is not connected.
     Returns FAILED with the real provider error on build/deploy failure.
-    Returns DEPLOYED with the real provider URL on success.
+    Returns RUNNING with the real provider URL on success.
     """
     data = request.data or {}
-    provider_name = str(data.get('provider', 'Vercel')).strip()
+    provider_name = str(data.get('provider', 'AWS')).strip()
     project_id = data.get('projectId', '').strip()
     simulate_error = bool(data.get('simulateError', False))
+
+    # ----------------------------------------------------------------
+    # Isolate deprecated providers — code retained, new deploys rejected
+    # ----------------------------------------------------------------
+    if provider_name.upper() in ('VERCEL', 'RENDER'):
+        return Response({
+            'success': False,
+            'status': 'RETIRED',
+            'error': (
+                f'{provider_name} deployments are retired. '
+                'CloudWise deploys to AWS EC2 only. '
+                'Connect your AWS account and redeploy there.'
+            ),
+            'required': ['AWS_ROLE_ARN'],
+            'connectUrl': '/connect-aws',
+            'supported': ['AWS'],
+        }, status=status.HTTP_400_BAD_REQUEST)
 
     # ----------------------------------------------------------------
     # Resolve active project and its GitHub repository
@@ -684,8 +752,6 @@ def deploy_view(request):
             'error': 'No GitHub repository linked to this project. Connect a repository first.',
         }, status=status.HTTP_400_BAD_REQUEST)
 
-    branch = github_repo.get('default_branch') or github_repo.get('branch') or 'main'
-
     # ----------------------------------------------------------------
     # Resolve GitHub access token
     # ----------------------------------------------------------------
@@ -699,91 +765,95 @@ def deploy_view(request):
         }, status=status.HTTP_400_BAD_REQUEST)
 
     # ----------------------------------------------------------------
-    # Inspect repository to determine stack
+    # Inspect repository + generate Docker deployment files
     # ----------------------------------------------------------------
     from .services.github_repository_service import inspect_repository
-    from .services.tech_stack_detector import (
-        detect_tech_stack, detect_frontend_stack, UnsupportedTechStackError,
-    )
     from .services.deployment_file_generator import generate_deployment_files
 
     try:
         inspection = inspect_repository(github_token, github_repo)
+    except RepositoryLimitError as exc:
+        return Response({
+            'success': False,
+            'code': 'REPOSITORY_LIMIT_EXCEEDED',
+            'error': str(exc),
+        }, status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
     except Exception as exc:
         return Response({
             'success': False,
             'error': f'Cannot access GitHub repository "{repo_name}": {exc}',
         }, status=status.HTTP_400_BAD_REQUEST)
 
-    repo_files = inspection.get('files', {})
-    has_dockerfile = inspection.get('has_dockerfile', False)
-    has_cicd = inspection.get('has_cicd', False)
+    repo_files = inspection.get('files') or {}
+    tree = inspection.get('tree') or []
+
+    try:
+        generated = generate_deployment_files(
+            repo_files, provider='AWS', tree=tree,
+        )
+    except (TypeError, ValueError) as exc:
+        return Response({
+            'success': False,
+            'error': str(exc),
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    # Merge generated Docker/compose/nginx over the inspected tree
+    # (generator already preserves existing Dockerfiles/compose).
+    deploy_files = {**repo_files, **(generated.get('files') or {})}
+    # Do not upload GitHub Actions workflows to the instance.
+    deploy_files = {
+        k: v for k, v in deploy_files.items()
+        if not str(k).replace('\\', '/').startswith('.github/')
+    }
+    deployment_plan = generated.get('deploymentPlan') or {}
+    app_port = int(generated.get('port') or 80)
 
     # ----------------------------------------------------------------
-    # For Vercel: detect the FRONTEND specifically.
-    # For other providers: detect the overall stack.
+    # Environment variables (user-supplied) + validation
     # ----------------------------------------------------------------
-    is_vercel = provider_name.upper() == 'VERCEL'
+    env_vars = dict(data.get('envVars') or {})
+    env_vars = {str(k): str(v) for k, v in env_vars.items() if k}
 
-    if is_vercel:
-        frontend = detect_frontend_stack(repo_files, tree=inspection.get('tree'))
-        technology = frontend['technology']
-        vercel_framework = frontend['framework']
-        build_command = frontend['build_command']
-        install_command = frontend['install_command']
-        output_directory = frontend['output_directory']
-        root_directory = frontend['root_directory']
-        start_command = frontend['start_command']
-        port = frontend['port']
-    else:
-        try:
-            stack = detect_tech_stack(repo_files)
-            technology = stack.technology
-            port = stack.port
-        except UnsupportedTechStackError:
-            technology = 'DOCKER' if has_dockerfile else 'UNKNOWN'
-            port = 3000
+    required_env = list(deployment_plan.get('requiredEnvVars') or [])
+    missing_env = [
+        key for key in required_env
+        if not str(env_vars.get(key, '')).strip()
+    ]
+    if missing_env:
+        return Response({
+            'success': False,
+            'code': 'MISSING_ENV_VARS',
+            'error': (
+                'Missing required environment variable(s): '
+                + ', '.join(missing_env)
+                + '. Provide them before deploying (see .env.example in '
+                'your repository).'
+            ),
+            'missing': missing_env,
+            'required': required_env,
+        }, status=status.HTTP_400_BAD_REQUEST)
 
-        # Determine build/start commands from actual repo files
-        build_command = None
-        start_command = None
-        install_command = None
-        output_directory = None
-        root_directory = None
-        vercel_framework = None
-
-        if technology in ('NODE_JS', 'REACT'):
-            pkg = next((v for k, v in repo_files.items() if k.split('/')[-1] == 'package.json'), '{}')
-            try:
-                pkg_json = json.loads(pkg)
-                scripts = pkg_json.get('scripts', {})
-                build_command = scripts.get('build') or ('npm run build' if technology == 'REACT' else None)
-                start_command = scripts.get('start') or 'npm start'
-                install_command = 'npm install'
-                output_directory = 'dist' if technology == 'REACT' else None
-            except (json.JSONDecodeError, AttributeError):
-                build_command = 'npm run build' if technology == 'REACT' else None
-                start_command = 'npm start'
-                install_command = 'npm install'
-        elif technology == 'PYTHON':
-            req_key = next((k for k in repo_files if k.split('/')[-1] == 'requirements.txt'), None)
-            build_command = f'pip install -r {req_key}' if req_key else 'pip install -r requirements.txt'
-            manage_key = next((k for k in inspection.get('tree', []) if k.get('path', '').endswith('manage.py')), None)
-            if manage_key:
-                start_command = f'python {manage_key["path"]} runserver 0.0.0.0:{port}'
-            else:
-                start_command = f'python -m uvicorn main:app --host 0.0.0.0 --port {port}'
-        elif technology == 'SPRING_BOOT':
-            if 'pom.xml' in ' '.join(repo_files.keys()):
-                build_command = 'mvn clean package -DskipTests'
-            else:
-                build_command = './gradlew bootJar'
-            start_command = 'java -jar target/*.jar'
-
-    # ----------------------------------------------------------------
-    # Environment variables from request (user-supplied)
-    # ----------------------------------------------------------------
-    env_vars: dict[str, str] = data.get('envVars') or {}
+    # Validate DATABASE_URL / MONGO_URI style schemes when present
+    allowed_schemes = getattr(
+        settings, 'AWS_ALLOWED_DB_URL_SCHEMES',
+        ('postgres://', 'postgresql://', 'mysql://', 'mongodb://'),
+    )
+    for url_key in ('DATABASE_URL', 'MONGO_URI', 'MONGODB_URI', 'REDIS_URL'):
+        raw_url = env_vars.get(url_key, '')
+        if not raw_url:
+            continue
+        lowered = raw_url.strip().lower()
+        if not any(lowered.startswith(s) for s in allowed_schemes):
+            return Response({
+                'success': False,
+                'code': 'INVALID_DATABASE_URL',
+                'error': (
+                    f'{url_key} has an invalid scheme. Expected one of: '
+                    + ', '.join(allowed_schemes)
+                    + f' (got "{raw_url.split(":", 1)[0]}:...").'
+                ),
+                'field': url_key,
+            }, status=status.HTTP_400_BAD_REQUEST)
 
     # ----------------------------------------------------------------
     # Simulate error path (test button) — uses mock, clearly labelled
@@ -793,7 +863,7 @@ def deploy_view(request):
         env_name = data.get('environmentName', f'{project.name.lower().replace(" ", "-")}-prod')
         start_result = mock_provider.start({
             'environment_name': env_name,
-            'provider': provider_name.upper(),
+            'provider': 'AWS',
             'region': data.get('region', 'us-east-1'),
             'specs': data.get('specs', {}),
         })
@@ -802,8 +872,9 @@ def deploy_view(request):
             reason=f'Simulated quota exceeded. Cannot allocate resources for {repo_name}.',
         )
         record = DeploymentRecord.objects.create(
+            user=request.user,
             environment_name=env_name,
-            provider=provider_name.upper(),
+            provider='AWS',
             monthly_cost=data.get('monthlyCost', 0),
             specs=data.get('specs', {}),
             region=data.get('region', 'us-east-1'),
@@ -818,324 +889,193 @@ def deploy_view(request):
         return Response({'success': True, 'data': response_data}, status=status.HTTP_200_OK)
 
     # ----------------------------------------------------------------
-    # REAL DEPLOYMENT — Vercel
-    # ----------------------------------------------------------------
-    if provider_name.upper() == 'VERCEL':
-        vercel_token = settings.VERCEL_TOKEN
-        vercel_team_id = settings.VERCEL_TEAM_ID
-
-        if not vercel_token:
-            return Response({
-                'success': False,
-                'status': 'BLOCKED',
-                'error': (
-                    'BLOCKED — Vercel credentials not configured. '
-                    'Set VERCEL_TOKEN in backend/.env to enable real Vercel deployments.'
-                ),
-                'required': ['VERCEL_TOKEN'],
-            }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
-
-        env_name = data.get('environmentName') or f"{project.name.lower().replace(' ', '-')}-prod"
-        # Sanitise to valid Vercel project name (alphanumeric + hyphens, max 52 chars)
-        import re as _re
-        safe_name = _re.sub(r'[^a-z0-9-]', '-', env_name.lower())[:52].strip('-')
-
-        existing_project_id = (project.deployment or {}).get('provider_project_id') if project.deployment else None
-
-        try:
-            svc = VercelDeploymentService(vercel_token, vercel_team_id or None)
-            result = svc.deploy(
-                repo_full_name=repo_name,
-                branch=branch,
-                project_name=safe_name,
-                framework=vercel_framework,
-                root_directory=root_directory,
-                build_command=build_command,
-                output_directory=output_directory,
-                install_command=install_command,
-                env_vars=env_vars or None,
-                existing_project_id=existing_project_id,
-            )
-        except VercelApiError as exc:
-            record = DeploymentRecord.objects.create(
-                environment_name=env_name,
-                provider='VERCEL',
-                monthly_cost=0,
-                specs=data.get('specs', {}),
-                region='vercel-global',
-                status='FAILED',
-                ip_address=None,
-                endpoint_url=None,
-                logs=[{'timestamp': datetime.now().isoformat(), 'level': 'ERROR',
-                        'stage': 'DEPLOYING', 'message': str(exc)}],
-            )
-            return Response({
-                'success': False,
-                'error': str(exc),
-                'data': DeploymentRecordSerializer(record).data,
-            }, status=status.HTTP_502_BAD_GATEWAY)
-
-        vercel_state = result.get('status', '').upper()
-        raw_data = result.get('raw', {})
-        error_code = raw_data.get('errorCode')
-        error_message = raw_data.get('errorMessage')
-        error_step = raw_data.get('errorStep')
-        deploy_status = 'RUNNING' if vercel_state == 'READY' else 'FAILED'
-        real_url = result.get('url')
-
-        # Fetch Vercel build events (logs) when deployment failed
-        vercel_build_logs = []
-        if vercel_state == 'ERROR':
-            try:
-                events = svc.get_deployment_events(result.get('deployment_id'))
-                for ev in events:
-                    payload = ev.get('payload', {}) or {}
-                    text = payload.get('text', '') or payload.get('message', '') or ''
-                    ev_type = ev.get('type', '')
-                    if text:
-                        vercel_build_logs.append(f"[{ev_type}] {text[:500]}")
-            except Exception:
-                pass  # non-fatal
-
-        # Extract real Vercel error details when deployment failed
-        vercel_error_detail = None
-        if vercel_state == 'ERROR':
-            vercel_error_detail = {
-                'provider': 'vercel',
-                'deploymentId': result.get('deployment_id'),
-                'projectId': result.get('provider_project_id'),
-                'status': 'ERROR',
-                'url': real_url,
-                'errorCode': error_code,
-                'errorMessage': error_message,
-                'errorStep': error_step,
-                'gitSource': {
-                    'sha': raw_data.get('gitSource', {}).get('sha'),
-                    'ref': raw_data.get('gitSource', {}).get('ref'),
-                },
-                'projectSettings': raw_data.get('projectSettings'),
-                'buildLogs': vercel_build_logs,
-            }
-
-        # Health-check the real URL (only if deployment succeeded)
-        if real_url and deploy_status == 'RUNNING':
-            try:
-                hc_req = urllib.request.Request(real_url, method='GET')
-                hc_req.add_header('User-Agent', 'CloudWise-HealthCheck/1.0')
-                with urllib.request.urlopen(hc_req, timeout=15) as hc_resp:
-                    if hc_resp.status >= 500:
-                        deploy_status = 'FAILED'
-            except Exception:
-                pass  # URL may redirect or require auth -- not fatal
-
-        # Build log entries including real error when available
-        log_entries = []
-        if vercel_state == 'ERROR':
-            log_entries.append({
-                'timestamp': datetime.now().isoformat(),
-                'level': 'ERROR',
-                'stage': 'BUILDING',
-                'message': f'Vercel build failed: {error_code} -- {error_message}',
-            })
-            if error_step:
-                log_entries.append({
-                    'timestamp': datetime.now().isoformat(),
-                    'level': 'ERROR',
-                    'stage': 'BUILDING',
-                    'message': f'Failed at step: {error_step}',
-                })
-            # Add project settings used for the failed build
-            ps = raw_data.get('projectSettings', {})
-            if ps:
-                log_entries.append({
-                    'timestamp': datetime.now().isoformat(),
-                    'level': 'INFO',
-                    'stage': 'BUILDING',
-                    'message': f'Framework: {ps.get("framework") or "None"} | '
-                               f'Build: {ps.get("buildCommand") or "None"} | '
-                               f'Root: {ps.get("rootDirectory") or "None"}',
-                })
-            # Add build log lines from Vercel events
-            for log_line in vercel_build_logs[:10]:
-                log_entries.append({
-                    'timestamp': datetime.now().isoformat(),
-                    'level': 'ERROR',
-                    'stage': 'BUILDING',
-                    'message': log_line,
-                })
-        else:
-            log_entries.append({
-                'timestamp': datetime.now().isoformat(),
-                'level': 'INFO',
-                'stage': 'COMPLETED',
-                'message': f'Vercel deployment {result["deployment_id"]} -- state: {vercel_state}',
-            })
-
-        record = DeploymentRecord.objects.create(
-            environment_name=env_name,
-            provider='VERCEL',
-            provider_deployment_id=result.get('deployment_id'),
-            provider_project_id=result.get('provider_project_id'),
-            monthly_cost=0,
-            specs=data.get('specs', {}),
-            region='vercel-global',
-            status=deploy_status,
-            ip_address=None,
-            endpoint_url=real_url,
-            logs=log_entries,
-        )
-
-        # Persist provider IDs back to project so future deploys reuse the project
-        project.deployment = {
-            **(project.deployment or {}),
-            'provider_project_id': result.get('provider_project_id'),
-            'provider_deployment_id': result.get('deployment_id'),
-            'status': deploy_status,
-            'endpointUrl': real_url,
-        }
-        project.save(update_fields=['deployment'])
-
-        response_data = DeploymentRecordSerializer(record).data
-        response_data['deployment_id'] = result.get('deployment_id')
-        response_data['provider_project_id'] = result.get('provider_project_id')
-        response_data['simulated'] = False
-        if vercel_error_detail:
-            response_data['provider_error'] = vercel_error_detail
-        return Response({
-            'success': deploy_status == 'RUNNING',
-            'message': f'Vercel deployment {deploy_status.lower()}.',
-            'data': response_data,
-        }, status=status.HTTP_200_OK)
-
-    # ----------------------------------------------------------------
-    # REAL DEPLOYMENT — Render
-    # ----------------------------------------------------------------
-    if provider_name.upper() == 'RENDER':
-        render_api_key = settings.RENDER_API_KEY
-        render_owner_id = settings.RENDER_OWNER_ID
-
-        if not render_api_key or not render_owner_id:
-            missing = [v for v, val in [
-                ('RENDER_API_KEY', render_api_key),
-                ('RENDER_OWNER_ID', render_owner_id),
-            ] if not val]
-            return Response({
-                'success': False,
-                'status': 'BLOCKED',
-                'error': (
-                    f'BLOCKED — Render credentials not configured. '
-                    f'Set {", ".join(missing)} in backend/.env to enable real Render deployments.'
-                ),
-                'required': missing,
-            }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
-
-        env_name = data.get('environmentName') or f"{project.name.lower().replace(' ', '-')}-prod"
-        import re as _re
-        safe_name = _re.sub(r'[^a-z0-9-]', '-', env_name.lower())[:63].strip('-')
-
-        existing_service_id = (project.deployment or {}).get('provider_service_id') if project.deployment else None
-
-        try:
-            svc = RenderDeploymentService(render_api_key, render_owner_id)
-            result = svc.deploy(
-                repo_full_name=repo_name,
-                branch=branch,
-                service_name=safe_name,
-                technology=technology,
-                build_command=build_command,
-                start_command=start_command,
-                root_directory=root_directory,
-                port=port,
-                env_vars=env_vars or None,
-                existing_service_id=existing_service_id,
-                has_dockerfile=has_dockerfile,
-            )
-        except RenderApiError as exc:
-            record = DeploymentRecord.objects.create(
-                environment_name=env_name,
-                provider='RENDER',
-                monthly_cost=0,
-                specs=data.get('specs', {}),
-                region='render-oregon',
-                status='FAILED',
-                ip_address=None,
-                endpoint_url=None,
-                logs=[{'timestamp': datetime.now().isoformat(), 'level': 'ERROR',
-                        'stage': 'DEPLOYING', 'message': str(exc)}],
-            )
-            return Response({
-                'success': False,
-                'error': str(exc),
-                'data': DeploymentRecordSerializer(record).data,
-            }, status=status.HTTP_502_BAD_GATEWAY)
-
-        render_status = result.get('status', '').lower()
-        deploy_status = 'RUNNING' if render_status == 'live' else 'FAILED'
-        real_url = result.get('url')
-
-        # Health-check the real URL
-        if real_url and deploy_status == 'RUNNING':
-            try:
-                hc_req = urllib.request.Request(real_url, method='GET')
-                hc_req.add_header('User-Agent', 'CloudWise-HealthCheck/1.0')
-                with urllib.request.urlopen(hc_req, timeout=20) as hc_resp:
-                    if hc_resp.status >= 500:
-                        deploy_status = 'FAILED'
-            except Exception:
-                pass
-
-        record = DeploymentRecord.objects.create(
-            environment_name=env_name,
-            provider='RENDER',
-            provider_deployment_id=result.get('deploy_id'),
-            provider_project_id=result.get('provider_service_id'),
-            monthly_cost=0,
-            specs=data.get('specs', {}),
-            region='render-oregon',
-            status=deploy_status,
-            ip_address=None,
-            endpoint_url=real_url,
-            logs=[{'timestamp': datetime.now().isoformat(), 'level': 'INFO',
-                    'stage': 'COMPLETED',
-                    'message': f'Render deploy {result["deploy_id"]} — status: {render_status}'}],
-        )
-
-        # Persist provider IDs back to project
-        project.deployment = {
-            **(project.deployment or {}),
-            'provider_service_id': result.get('provider_service_id'),
-            'provider_deployment_id': result.get('deploy_id'),
-            'status': deploy_status,
-            'endpointUrl': real_url,
-        }
-        project.save(update_fields=['deployment'])
-
-        response_data = DeploymentRecordSerializer(record).data
-        response_data['deployment_id'] = result.get('deploy_id')
-        response_data['provider_service_id'] = result.get('provider_service_id')
-        response_data['simulated'] = False
-        return Response({
-            'success': True,
-            'message': f'Render deployment {deploy_status.lower()}.',
-            'data': response_data,
-        }, status=status.HTTP_200_OK)
-
-    # ----------------------------------------------------------------
-    # AWS — not yet implemented
+    # REAL DEPLOYMENT — AWS EC2 (inside the USER's AWS account)
     # ----------------------------------------------------------------
     if provider_name.upper() == 'AWS':
+        aws_connection = AWSConnection.objects.filter(
+            user=request.user, status='active'
+        ).first()
+        if aws_connection is None:
+            return Response({
+                'success': False,
+                'status': 'BLOCKED',
+                'error': (
+                    'BLOCKED — AWS account not connected. '
+                    'Connect your AWS account (IAM role) to deploy to AWS EC2.'
+                ),
+                'required': ['AWS_ROLE_ARN'],
+                'connectUrl': '/connect-aws',
+            }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        env_name = data.get('environmentName') or f"{project.name.lower().replace(' ', '-')}-prod"
+
+        # ---- Step A: provision / reuse EC2 (Part 3) ----
+        try:
+            aws_provider = AwsEc2Provider(user=request.user, connection=aws_connection)
+            result = aws_provider.start({
+                'environment_name': env_name,
+                'provider': 'AWS',
+                'region': data.get('region') or aws_connection.region,
+                'instance_type': data.get('instanceType') or None,
+                'force_new_instance': bool(data.get('forceNewInstance', False)),
+                'specs': data.get('specs', {}),
+            })
+        except AwsEc2Error as exc:
+            record = DeploymentRecord.objects.create(
+                user=request.user,
+                environment_name=env_name,
+                provider='AWS',
+                monthly_cost=data.get('monthlyCost', 0),
+                specs=data.get('specs', {}),
+                region=data.get('region') or aws_connection.region,
+                status='FAILED',
+                ip_address=None,
+                endpoint_url=None,
+                logs=[{'timestamp': datetime.now().isoformat(), 'level': 'ERROR',
+                        'stage': 'DEPLOYING', 'message': str(exc)}],
+            )
+            return Response({
+                'success': False,
+                'error': str(exc),
+                'data': DeploymentRecordSerializer(record).data,
+            }, status=status.HTTP_502_BAD_GATEWAY)
+
+        instance_id = result.get('instance_id')
+        public_ip = result.get('public_ip') or ''
+        provision_logs = list(result.get('logs') or [])
+
+        # ---- Step B: upload files + docker compose (Part 4) ----
+        deploy_logs = []
+        endpoint_url = None
+        deploy_status = result.get('status', 'RUNNING')
+        try:
+            deploy_result = aws_provider.deploy({
+                'instance_id': instance_id,
+                'deployment_id': instance_id,
+                'files': deploy_files,
+                'env_vars': env_vars,
+                'project_id': str(project.pk),
+                'environment_name': env_name,
+                'port': app_port,
+                'region': data.get('region') or aws_connection.region,
+            })
+            deploy_logs = list(deploy_result.get('logs') or [])
+            endpoint_url = deploy_result.get('endpoint_url') or None
+            deploy_status = deploy_result.get('status') or 'RUNNING'
+        except AwsEc2Error as exc:
+            failed_logs = provision_logs + [{
+                'timestamp': datetime.now().isoformat(),
+                'level': 'ERROR',
+                'stage': 'FAILED',
+                'message': str(exc),
+            }]
+            record = DeploymentRecord.objects.create(
+                user=request.user,
+                environment_name=env_name,
+                provider='AWS',
+                provider_deployment_id=instance_id,
+                provider_project_id=result.get('security_group_id'),
+                monthly_cost=data.get('monthlyCost', 0),
+                specs={
+                    **(data.get('specs') or {}),
+                    'instanceId': instance_id,
+                    'instanceType': result.get('instance_type'),
+                    'reused': result.get('reused', False),
+                    'securityGroupId': result.get('security_group_id'),
+                    'amiId': result.get('ami_id'),
+                },
+                region=result.get('region', aws_connection.region),
+                status='FAILED',
+                ip_address=public_ip or None,
+                endpoint_url=None,
+                logs=failed_logs,
+            )
+            project.deployment = {
+                **(project.deployment or {}),
+                'provider': 'AWS',
+                'awsInstanceId': instance_id,
+                'provider_deployment_id': instance_id,
+                'status': 'FAILED',
+                'ipAddress': public_ip,
+            }
+            project.save(update_fields=['deployment'])
+            return Response({
+                'success': False,
+                'error': str(exc),
+                'data': DeploymentRecordSerializer(record).data,
+            }, status=status.HTTP_502_BAD_GATEWAY)
+
+        all_logs = provision_logs + deploy_logs
+        valid_statuses = (
+            'RUNNING', 'FAILED', 'BUILDING', 'DEPLOYING',
+            'HEALTH_CHECK', 'PREPARING', 'QUEUED',
+        )
+        record = DeploymentRecord.objects.create(
+            user=request.user,
+            environment_name=env_name,
+            provider='AWS',
+            provider_deployment_id=instance_id,
+            provider_project_id=result.get('security_group_id'),
+            monthly_cost=data.get('monthlyCost', 0),
+            specs={
+                **(data.get('specs') or {}),
+                'instanceId': instance_id,
+                'instanceType': result.get('instance_type'),
+                'reused': result.get('reused', False),
+                'securityGroupId': result.get('security_group_id'),
+                'amiId': result.get('ami_id'),
+                'appPort': app_port,
+            },
+            region=result.get('region', aws_connection.region),
+            status=deploy_status if deploy_status in valid_statuses else 'RUNNING',
+            ip_address=public_ip or None,
+            endpoint_url=endpoint_url,
+            logs=all_logs,
+        )
+
+        # Persist instance + live URL back to the project for reuse
+        project.deployment = {
+            **(project.deployment or {}),
+            'provider': 'AWS',
+            'awsInstanceId': instance_id,
+            'provider_deployment_id': instance_id,
+            'status': record.status,
+            'ipAddress': public_ip,
+            'endpointUrl': endpoint_url,
+            'appPort': app_port,
+        }
+        project.save(update_fields=['deployment'])
+
+        response_data = DeploymentRecordSerializer(record).data
+        response_data['deployment_id'] = instance_id
+        response_data['instanceId'] = instance_id
+        response_data['reused'] = result.get('reused', False)
+        response_data['securityGroupId'] = result.get('security_group_id')
+        response_data['endpoint_url'] = endpoint_url
+        response_data['appPort'] = app_port
+        response_data['detection'] = generated.get('detection')
+        response_data['deploymentPlan'] = deployment_plan
+        response_data['simulated'] = False
+        action = 'Reused existing' if result.get('reused') else 'Provisioned'
         return Response({
-            'success': False,
-            'status': 'BLOCKED',
-            'error': (
-                'BLOCKED — AWS deployment is not yet implemented. '
-                'Select Vercel or Render as your deployment provider.'
+            'success': record.status != 'FAILED',
+            'message': (
+                f'{action} EC2 instance {instance_id} in '
+                f'{result.get("region", "")} (AWS account '
+                f'{aws_connection.account_id or "connected"}). '
+                + (
+                    f'Application live at {endpoint_url}.'
+                    if endpoint_url and record.status != 'FAILED'
+                    else 'Container deployment did not complete successfully.'
+                )
             ),
-        }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+            'data': response_data,
+        }, status=status.HTTP_200_OK)
 
     return Response({
         'success': False,
-        'error': f'Unknown provider "{provider_name}". Supported: Vercel, Render.',
+        'error': f'Unknown provider "{provider_name}". Supported: AWS.',
+        'supported': ['AWS'],
     }, status=status.HTTP_400_BAD_REQUEST)
 
 
@@ -1427,10 +1367,13 @@ def terraform_export_view(request):
 
 
 @api_view(['POST'])
-@permission_classes([permissions.AllowAny])
+@permission_classes([permissions.IsAuthenticated])
 def generate_deployment_files_view(request):
     files = request.data.get('files')
     provider = request.data.get('provider', 'AWS')
+    tree = request.data.get('tree')
+    if not isinstance(tree, list):
+        tree = None
 
     if not isinstance(files, dict) or not files:
         return Response({
@@ -1439,7 +1382,7 @@ def generate_deployment_files_view(request):
         }, status=status.HTTP_400_BAD_REQUEST)
 
     try:
-        generated = generate_deployment_files(files, provider=provider)
+        generated = generate_deployment_files(files, provider=provider, tree=tree)
     except (TypeError, ValueError) as exc:
         return Response({
             'success': False,
@@ -1470,24 +1413,117 @@ def aws_pricing_view(request):
 
 
 # -------------------------------------------------------------
-# Deployment Management Endpoints (REAL provider status polling)
+# AWS account connection (Part 3 — IAM role + temporary credentials)
 # -------------------------------------------------------------
 
-def _find_deployment_record(deployment_id):
-    """Look up a DeploymentRecord by its provider deployment ID."""
-    return DeploymentRecord.objects.filter(provider_deployment_id=deployment_id).first()
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated])
+def aws_connect_info_view(request):
+    """
+    Everything the user needs to create the IAM role in their own AWS
+    account: a unique External ID, trust policy, least-privilege
+    permissions policy and step-by-step instructions. Contains no secrets.
+    """
+    connection = ensure_pending_connection(request.user)
+    policies = build_policies(connection.external_id)
+    return Response({
+        'success': True,
+        'data': {
+            'externalId': policies['externalId'],
+            'trustedAccountId': policies['trustedAccountId'],
+            'trustPolicy': policies['trustPolicy'],
+            'permissionsPolicy': policies['permissionsPolicy'],
+            'instructions': policies['instructions'],
+            'defaultRegion': connection.region or settings.AWS_DEFAULT_REGION,
+            'platformCredentialsConfigured': platform_credentials_configured(),
+            'connection': connection_public_dict(connection),
+        },
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+@permission_classes([permissions.IsAuthenticated])
+def aws_connect_view(request):
+    """
+    Validate and activate the user's AWS connection.
+
+    Validates by assuming the IAM role with SHORT-LIVED STS credentials
+    and calling sts:GetCallerIdentity. Stores only the role ARN,
+    external id and account id — never AWS access keys.
+    """
+    role_arn = request.data.get('roleArn', '')
+    region = request.data.get('region', '')
+    try:
+        connection = aws_connect(
+            request.user, role_arn, region=region or None
+        )
+    except AwsConnectionError as exc:
+        return Response({
+            'success': False,
+            'error': str(exc),
+        }, status=status.HTTP_400_BAD_REQUEST)
+    return Response({
+        'success': True,
+        'message': (
+            f'AWS account {connection.account_id} connected via IAM role. '
+            'CloudWise uses temporary credentials only.'
+        ),
+        'data': connection_public_dict(connection),
+    }, status=status.HTTP_200_OK)
 
 
 @api_view(['GET'])
-@permission_classes([permissions.AllowAny])
+@permission_classes([permissions.IsAuthenticated])
+def aws_connection_view(request):
+    """Return the caller's AWS connection status (no secrets)."""
+    connection = AWSConnection.objects.filter(user=request.user).first()
+    return Response({
+        'success': True,
+        'data': connection_public_dict(connection),
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+@permission_classes([permissions.IsAuthenticated])
+def aws_disconnect_view(request):
+    """Remove the stored AWS connection (role ARN + external id only)."""
+    aws_disconnect(request.user)
+    return Response({
+        'success': True,
+        'message': 'AWS account disconnected. No cloud resources were changed.',
+        'data': {'connected': False},
+    }, status=status.HTTP_200_OK)
+
+
+# -------------------------------------------------------------
+# Deployment Management Endpoints (REAL provider status polling)
+# -------------------------------------------------------------
+
+def _find_deployment_record(deployment_id, user=None):
+    """
+    Look up a DeploymentRecord by its provider deployment ID.
+
+    When ``user`` is provided, ownership is enforced: a record owned by
+    another user is treated as not found (no existence leak).
+    """
+    queryset = DeploymentRecord.objects.filter(provider_deployment_id=deployment_id)
+    record = queryset.first()
+    if record is None:
+        return None
+    if user is not None and record.user_id is not None and record.user_id != user.id:
+        return None
+    return record
+
+
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated])
 def deployment_status_view(request, deployment_id):
     """
-    Return real deployment status from Vercel or Render.
+    Return real deployment status from AWS (or stored Vercel/Render records).
 
-    Looks up the DeploymentRecord by provider_deployment_id, determines
-    the provider, and queries the real provider API.
+    Ownership: only the owning user may read a deployment record.
     """
-    record = _find_deployment_record(deployment_id)
+    record = _find_deployment_record(deployment_id, user=request.user)
     if record is None:
         return Response({
             'success': False,
@@ -1658,6 +1694,66 @@ def deployment_status_view(request, deployment_id):
                 }
             }, status=status.HTTP_200_OK)
 
+    elif provider == 'AWS':
+        aws_connection = None
+        if record.user_id:
+            aws_connection = AWSConnection.objects.filter(
+                user_id=record.user_id, status='active'
+            ).first()
+        if aws_connection is None:
+            return Response({
+                'success': True,
+                'data': {
+                    'deployment_id': deployment_id,
+                    'status': record.status,
+                    'progress': 100 if record.status == 'RUNNING' else 45,
+                    'provider_type': 'AWS',
+                    'endpoint_url': record.endpoint_url,
+                    'ip_address': record.ip_address,
+                    'message': 'AWS account connection not found; returning stored status.',
+                }
+            }, status=status.HTTP_200_OK)
+        try:
+            aws_provider = AwsEc2Provider(user=record.user, connection=aws_connection)
+            live = aws_provider.get_status(deployment_id)
+            update_fields = []
+            mapped = live.get('status')
+            if mapped in ('RUNNING', 'FAILED') and record.status != mapped:
+                record.status = mapped
+                update_fields.append('status')
+            if live.get('ip_address') and live.get('ip_address') != record.ip_address:
+                record.ip_address = live.get('ip_address')
+                update_fields.append('ip_address')
+            if update_fields:
+                record.save(update_fields=update_fields)
+            return Response({
+                'success': True,
+                'data': {
+                    'deployment_id': deployment_id,
+                    'status': mapped,
+                    'progress': live.get('progress', 0),
+                    'provider_type': 'AWS',
+                    'endpoint_url': record.endpoint_url,
+                    'ip_address': live.get('ip_address') or record.ip_address,
+                    'instance_state': live.get('instance_state'),
+                    'region': live.get('region'),
+                    'message': live.get('message', ''),
+                }
+            }, status=status.HTTP_200_OK)
+        except AwsEc2Error as exc:
+            return Response({
+                'success': True,
+                'data': {
+                    'deployment_id': deployment_id,
+                    'status': record.status,
+                    'progress': 100 if record.status == 'RUNNING' else 45,
+                    'provider_type': 'AWS',
+                    'endpoint_url': record.endpoint_url,
+                    'ip_address': record.ip_address,
+                    'message': f'AWS EC2 error: {exc}',
+                }
+            }, status=status.HTTP_200_OK)
+
     return Response({
         'success': True,
         'data': {
@@ -1673,15 +1769,14 @@ def deployment_status_view(request, deployment_id):
 
 
 @api_view(['GET'])
-@permission_classes([permissions.AllowAny])
+@permission_classes([permissions.IsAuthenticated])
 def deployment_logs_view(request, deployment_id):
     """
     Return real deployment logs.
 
-    For Vercel deployments still building, fetches live build events from
-    the Vercel API. Falls back to stored logs for completed deployments.
+    Ownership: only the owning user may read deployment logs.
     """
-    record = _find_deployment_record(deployment_id)
+    record = _find_deployment_record(deployment_id, user=request.user)
     if record is None:
         return Response({
             'success': False,
@@ -1736,15 +1831,16 @@ def deployment_logs_view(request, deployment_id):
 
 
 @api_view(['POST'])
-@permission_classes([permissions.AllowAny])
+@permission_classes([permissions.IsAuthenticated])
 def deployment_health_view(request, deployment_id):
     """
     Perform a real HTTP health check against the deployed service URL.
 
     Uses the endpoint_url stored in the DeploymentRecord. Makes a real
     HTTP GET request and returns the actual HTTP status.
+    Ownership: only the owning user may trigger a health check.
     """
-    record = _find_deployment_record(deployment_id)
+    record = _find_deployment_record(deployment_id, user=request.user)
     if record is None:
         return Response({
             'success': False,
@@ -1807,13 +1903,14 @@ def deployment_health_view(request, deployment_id):
 
 
 @api_view(['POST'])
-@permission_classes([permissions.AllowAny])
+@permission_classes([permissions.IsAuthenticated])
 def deployment_fail_view(request, deployment_id):
     """
     Test endpoint: force a deployment record into FAILED state.
     Used only for testing the failure UI path.
+    Ownership: only the owning user may mutate a deployment record.
     """
-    record = _find_deployment_record(deployment_id)
+    record = _find_deployment_record(deployment_id, user=request.user)
     if record is None:
         return Response({
             'success': False,
@@ -1842,13 +1939,14 @@ def deployment_fail_view(request, deployment_id):
 
 
 @api_view(['POST'])
-@permission_classes([permissions.AllowAny])
+@permission_classes([permissions.IsAuthenticated])
 def deployment_rollback_view(request, deployment_id):
     """
     Trigger a redeploy of the last successful deployment via the provider API.
     For real providers, this creates a new deployment from the same source.
+    Ownership: only the owning user may trigger a rollback.
     """
-    record = _find_deployment_record(deployment_id)
+    record = _find_deployment_record(deployment_id, user=request.user)
     if record is None:
         return Response({
             'success': False,
@@ -1942,6 +2040,38 @@ def deployment_rollback_view(request, deployment_id):
                 'success': False,
                 'error': f'Render rollback failed: {exc}'
             }, status=status.HTTP_502_BAD_GATEWAY)
+
+    elif provider == 'AWS':
+        aws_connection = None
+        if record.user_id:
+            aws_connection = AWSConnection.objects.filter(
+                user_id=record.user_id, status='active'
+            ).first()
+        if aws_connection is None:
+            return Response({
+                'success': False,
+                'error': 'AWS account connection not found. Cannot trigger rollback.',
+            }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        try:
+            aws_provider = AwsEc2Provider(user=record.user, connection=aws_connection)
+            result = aws_provider.rollback(deployment_id)
+        except AwsEc2Error as exc:
+            return Response({
+                'success': False,
+                'error': f'AWS rollback failed: {exc}',
+            }, status=status.HTTP_502_BAD_GATEWAY)
+        record.status = result['status']
+        record.logs = (record.logs or []) + result.get('logs', [])
+        record.save(update_fields=['status', 'logs'])
+        return Response({
+            'success': True,
+            'data': {
+                'deployment_id': deployment_id,
+                'status': result['status'],
+                'provider_type': 'AWS',
+                'message': result['message'],
+            }
+        }, status=status.HTTP_200_OK)
 
     return Response({
         'success': False,

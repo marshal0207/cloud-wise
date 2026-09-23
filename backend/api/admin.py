@@ -1,6 +1,9 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin
-from .models import CustomUser, Project, ContactInquiry, EstimationRecord, DeploymentRecord, WaitlistSubscriber
+from .models import (
+    CustomUser, Project, ContactInquiry, EstimationRecord, DeploymentRecord,
+    WaitlistSubscriber, AWSConnection, EC2Instance,
+)
 
 @admin.register(CustomUser)
 class CustomUserAdmin(UserAdmin):
@@ -43,3 +46,18 @@ class DeploymentRecordAdmin(admin.ModelAdmin):
 class WaitlistSubscriberAdmin(admin.ModelAdmin):
     list_display = ['email', 'source', 'created_at']
     search_fields = ['email', 'source']
+
+
+@admin.register(AWSConnection)
+class AWSConnectionAdmin(admin.ModelAdmin):
+    list_display = ['user', 'account_id', 'role_arn', 'region', 'status', 'connected_at', 'updated_at']
+    list_filter = ['status', 'region']
+    search_fields = ['user__email', 'user__username', 'account_id', 'role_arn']
+    # Never expose secrets: the model stores no access keys by design.
+
+
+@admin.register(EC2Instance)
+class EC2InstanceAdmin(admin.ModelAdmin):
+    list_display = ['instance_id', 'user', 'region', 'instance_type', 'status', 'public_ip', 'docker_installed', 'deployment_count', 'created_at']
+    list_filter = ['status', 'region', 'instance_type', 'docker_installed']
+    search_fields = ['instance_id', 'public_ip', 'user__email']

@@ -38,4 +38,10 @@ urlpatterns = [
     path('github/oauth/callback', views.github_oauth_callback_view, name='github_oauth_callback'),
     path('github/repos', views.github_repositories_view, name='github_repositories'),
     path('pricing/aws', views.aws_pricing_view, name='aws_pricing'),
+
+    # AWS account connection (Part 3 — IAM role, temporary credentials)
+    path('aws/connect-info', views.aws_connect_info_view, name='aws_connect_info'),
+    path('aws/connect', views.aws_connect_view, name='aws_connect'),
+    path('aws/connection', views.aws_connection_view, name='aws_connection'),
+    path('aws/disconnect', views.aws_disconnect_view, name='aws_disconnect'),
 ]
