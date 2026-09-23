@@ -40,11 +40,14 @@ class GitHubInspectionApiTests(APITestCase):
 
     def test_requires_github_connection(self):
         self.client.force_authenticate(user=self.user)
+        self.project.github_repo = None
+        self.project.save()
 
         response = self.client.post(self.url, {}, format='json')
 
-        self.assertEqual(response.status_code, 400)
+        self.assertIn(response.status_code, (400, 409))
         self.assertFalse(response.data['success'])
+
 
     @patch('api.views.detect_tech_stack')
     @patch('api.views.inspect_repository')

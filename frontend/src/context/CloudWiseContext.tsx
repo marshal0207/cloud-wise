@@ -58,6 +58,19 @@ export interface DeploymentDetails {
   ipAddress: string | null;
   environmentName: string;
   failureReason?: string | null;
+  providerError?: {
+    provider?: string;
+    deploymentId?: string;
+    projectId?: string;
+    status?: string;
+    url?: string | null;
+    errorCode?: string;
+    errorMessage?: string;
+    errorStep?: string;
+    gitSource?: { sha?: string; ref?: string };
+    projectSettings?: Record<string, any>;
+    buildLogs?: string[];
+  } | null;
 }
 
 export interface OptimizationItem {

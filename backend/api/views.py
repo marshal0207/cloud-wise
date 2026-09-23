@@ -406,24 +406,40 @@ def project_github_inspect_view(request, pk):
     try:
         project = Project.objects.get(pk=pk)
     except Project.DoesNotExist:
-        return Response({'success': False, 'error': 'Project not found or access denied.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response({
+            'status': 'ERROR',
+            'code': 'PROJECT_NOT_FOUND',
+            'success': False,
+            'error': 'Project not found or access denied.'
+        }, status=status.HTTP_404_NOT_FOUND)
 
     if project.user_id != request.user.id:
-        return Response({'success': False, 'error': 'Project not found or access denied.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response({
+            'status': 'ERROR',
+            'code': 'PROJECT_ACCESS_DENIED',
+            'success': False,
+            'error': 'Project not found or access denied.'
+        }, status=status.HTTP_404_NOT_FOUND)
 
     repository = project.github_repo or {}
     body_repo_name = request.data.get('repoName', '').strip()
     if not repository.get('name') and body_repo_name:
-        repository = {'name': body_repo_name, 'default_branch': 'main'}
+        repository = {'name': body_repo_name}
 
-    if not repository.get('name'):
-        return Response({'success': False, 'error': 'Select a GitHub repository before inspecting it.'}, status=status.HTTP_400_BAD_REQUEST)
+    if not repository or (isinstance(repository, dict) and not repository.get('name')):
+        return Response({
+            'status': 'ERROR',
+            'code': 'GITHUB_REPOSITORY_NOT_CONFIGURED',
+            'success': False,
+            'error': 'Select and connect a GitHub repository before inspecting it.'
+        }, status=status.HTTP_409_CONFLICT)
 
+    access_token = None
     try:
         connection = request.user.github_connection
         access_token = connection.access_token
     except GitHubConnection.DoesNotExist:
-        return Response({'success': False, 'error': 'Connect a GitHub account before inspecting repositories.'}, status=status.HTTP_400_BAD_REQUEST)
+        pass
 
     try:
         inspection = inspect_repository(access_token, repository)
@@ -432,21 +448,119 @@ def project_github_inspect_view(request, pk):
             stack_data = asdict(stack)
         except UnsupportedTechStackError:
             stack_data = None
+
+        # Update and persist scanned repository metadata on the project
+        repo_info = inspection.get('repository', {})
+        repo_full_name = repo_info.get('full_name') if isinstance(repo_info, dict) else str(repo_info)
+        updated_github_repo = {
+            'name': repo_full_name,
+            'owner': repo_info.get('owner') if isinstance(repo_info, dict) else '',
+            'defaultBranch': inspection.get('branch', 'main'),
+            'commitSha': inspection.get('commitSha', ''),
+            'synced': True,
+            'scannedAt': inspection.get('scannedAt'),
+            'totalFiles': inspection.get('totalFiles', 0),
+            'totalDirectories': inspection.get('totalDirectories', 0),
+            'tree': inspection.get('tree', []),
+            'files': list(inspection.get('files', {}).keys()),
+        }
+        project.github_repo = updated_github_repo
+        project.save(update_fields=['github_repo', 'updated_at'])
+
         return Response({
+            'status': 'SUCCESS',
             'success': True,
             'data': {
                 'repository': inspection.get('repository'),
                 'branch': inspection.get('branch'),
+                'commitSha': inspection.get('commitSha'),
                 'tree': inspection.get('tree', []),
                 'files': inspection.get('files', {}),
+                'totalFiles': inspection.get('totalFiles', 0),
+                'totalDirectories': inspection.get('totalDirectories', 0),
+                'truncated': inspection.get('truncated', False),
+                'scannedAt': inspection.get('scannedAt'),
                 'technology': stack_data,
                 'has_dockerfile': inspection.get('has_dockerfile', False),
                 'has_compose': inspection.get('has_compose', False),
                 'has_cicd': inspection.get('has_cicd', False),
             }
         }, status=status.HTTP_200_OK)
-    except (GitHubApiError, ValueError) as exc:
-        return Response({'success': False, 'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+    except ValueError as exc:
+        return Response({
+            'status': 'ERROR',
+            'code': 'INVALID_REPOSITORY_DATA',
+            'success': False,
+            'error': str(exc),
+            'message': str(exc)
+        }, status=status.HTTP_400_BAD_REQUEST)
+    except GitHubApiError as exc:
+        st_code = getattr(exc, 'status_code', 502)
+        code_map = {
+            400: 'BAD_REQUEST',
+            401: 'GITHUB_AUTH_FAILED',
+            403: 'GITHUB_PERMISSION_DENIED',
+            404: 'GITHUB_REPO_NOT_FOUND',
+            409: 'GITHUB_REPOSITORY_NOT_CONFIGURED',
+            429: 'GITHUB_RATE_LIMITED',
+            502: 'GITHUB_UPSTREAM_ERROR',
+        }
+        err_code = code_map.get(st_code, 'GITHUB_API_ERROR')
+
+        # For auth failures (401) or rate limits (403), try serving the cached tree
+        if st_code in (401, 403) and isinstance(repository, dict) and repository.get('tree'):
+            cached_tree = repository.get('tree', [])
+            cached_files_list = repository.get('files', [])
+            token_expired = st_code == 401
+            rate_limited = st_code == 403
+            return Response({
+                'status': 'SUCCESS',
+                'success': True,
+                'cached': True,
+                'token_expired': token_expired,
+                'rate_limited': rate_limited,
+                'data': {
+                    'repository': {
+                        'owner': repository.get('owner', ''),
+                        'name': repository.get('name', ''),
+                        'full_name': repository.get('name', ''),
+                        'defaultBranch': repository.get('defaultBranch', 'main'),
+                    },
+                    'branch': repository.get('defaultBranch', 'main'),
+                    'commitSha': repository.get('commitSha', ''),
+                    'tree': cached_tree,
+                    'files': {f: '' for f in cached_files_list},
+                    'totalFiles': repository.get('totalFiles', len([n for n in cached_tree if n.get('type') == 'file'])),
+                    'totalDirectories': repository.get('totalDirectories', 0),
+                    'truncated': False,
+                    'scannedAt': repository.get('scannedAt'),
+                    'technology': None,
+                    'has_dockerfile': False,
+                    'has_compose': False,
+                    'has_cicd': False,
+                }
+            }, status=status.HTTP_200_OK)
+
+        res_status = st_code if st_code in (400, 401, 403, 404, 409, 429, 500, 502) else status.HTTP_500_INTERNAL_SERVER_ERROR
+        return Response({
+            'status': 'ERROR',
+            'code': err_code,
+            'success': False,
+            'error': str(exc),
+            'message': str(exc),
+            'details': getattr(exc, 'details', str(exc)),
+            'token_expired': st_code == 401,
+            'rate_limited': st_code == 403,
+        }, status=res_status)
+    except Exception as exc:
+        return Response({
+            'status': 'ERROR',
+            'code': 'INTERNAL_SERVER_ERROR',
+            'success': False,
+            'error': 'An unexpected error occurred while scanning the repository.',
+            'details': str(exc)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 
 
 
@@ -765,12 +879,27 @@ def deploy_view(request):
         raw_data = result.get('raw', {})
         error_code = raw_data.get('errorCode')
         error_message = raw_data.get('errorMessage')
+        error_step = raw_data.get('errorStep')
         deploy_status = 'RUNNING' if vercel_state == 'READY' else 'FAILED'
         real_url = result.get('url')
 
+        # Fetch Vercel build events (logs) when deployment failed
+        vercel_build_logs = []
+        if vercel_state == 'ERROR':
+            try:
+                events = svc.get_deployment_events(result.get('deployment_id'))
+                for ev in events:
+                    payload = ev.get('payload', {}) or {}
+                    text = payload.get('text', '') or payload.get('message', '') or ''
+                    ev_type = ev.get('type', '')
+                    if text:
+                        vercel_build_logs.append(f"[{ev_type}] {text[:500]}")
+            except Exception:
+                pass  # non-fatal
+
         # Extract real Vercel error details when deployment failed
         vercel_error_detail = None
-        if vercel_state == 'ERROR' and error_message:
+        if vercel_state == 'ERROR':
             vercel_error_detail = {
                 'provider': 'vercel',
                 'deploymentId': result.get('deployment_id'),
@@ -779,12 +908,13 @@ def deploy_view(request):
                 'url': real_url,
                 'errorCode': error_code,
                 'errorMessage': error_message,
+                'errorStep': error_step,
                 'gitSource': {
                     'sha': raw_data.get('gitSource', {}).get('sha'),
                     'ref': raw_data.get('gitSource', {}).get('ref'),
                 },
                 'projectSettings': raw_data.get('projectSettings'),
-                'errorStep': raw_data.get('errorStep'),
+                'buildLogs': vercel_build_logs,
             }
 
         # Health-check the real URL (only if deployment succeeded)
@@ -807,14 +937,14 @@ def deploy_view(request):
                 'stage': 'BUILDING',
                 'message': f'Vercel build failed: {error_code} -- {error_message}',
             })
-            if raw_data.get('errorStep'):
+            if error_step:
                 log_entries.append({
                     'timestamp': datetime.now().isoformat(),
                     'level': 'ERROR',
                     'stage': 'BUILDING',
-                    'message': f'Failed at step: {raw_data["errorStep"]}',
+                    'message': f'Failed at step: {error_step}',
                 })
-            # Add stdout/stderr from events if available
+            # Add project settings used for the failed build
             ps = raw_data.get('projectSettings', {})
             if ps:
                 log_entries.append({
@@ -824,6 +954,14 @@ def deploy_view(request):
                     'message': f'Framework: {ps.get("framework") or "None"} | '
                                f'Build: {ps.get("buildCommand") or "None"} | '
                                f'Root: {ps.get("rootDirectory") or "None"}',
+                })
+            # Add build log lines from Vercel events
+            for log_line in vercel_build_logs[:10]:
+                log_entries.append({
+                    'timestamp': datetime.now().isoformat(),
+                    'level': 'ERROR',
+                    'stage': 'BUILDING',
+                    'message': log_line,
                 })
         else:
             log_entries.append({
@@ -1391,17 +1529,52 @@ def deployment_status_view(request, deployment_id):
             }
             mapped = status_map.get(ready_state, 'BUILDING')
             progress = 100 if mapped == 'RUNNING' else 45 if mapped == 'FAILED' else 50
+
+            # Include error details when Vercel deployment failed
+            error_detail = None
+            if ready_state == 'ERROR':
+                error_detail = {
+                    'errorCode': raw.get('errorCode'),
+                    'errorMessage': raw.get('errorMessage'),
+                    'errorStep': raw.get('errorStep'),
+                }
+
+            # Persist terminal status to DB so page refresh shows correct state
+            update_fields = []
+            if mapped in ('RUNNING', 'FAILED') and record.status != mapped:
+                record.status = mapped
+                update_fields.append('status')
+            if url and url != record.endpoint_url:
+                record.endpoint_url = url
+                update_fields.append('endpoint_url')
+            if mapped == 'FAILED' and error_detail:
+                existing_logs = record.logs or []
+                error_log = {
+                    'timestamp': datetime.now().isoformat(),
+                    'level': 'ERROR',
+                    'stage': 'BUILDING',
+                    'message': f"{error_detail.get('errorCode', 'UNKNOWN')} -- {error_detail.get('errorMessage', '')}",
+                }
+                record.logs = existing_logs + [error_log]
+                update_fields.append('logs')
+            if update_fields:
+                record.save(update_fields=update_fields)
+
+            response_payload = {
+                'deployment_id': deployment_id,
+                'status': mapped,
+                'progress': progress,
+                'provider_type': 'VERCEL',
+                'endpoint_url': url or record.endpoint_url,
+                'ip_address': None,
+                'message': f'Vercel readyState: {ready_state}',
+            }
+            if error_detail:
+                response_payload['error'] = error_detail
+
             return Response({
                 'success': True,
-                'data': {
-                    'deployment_id': deployment_id,
-                    'status': mapped,
-                    'progress': progress,
-                    'provider_type': 'VERCEL',
-                    'endpoint_url': url or record.endpoint_url,
-                    'ip_address': None,
-                    'message': f'Vercel readyState: {ready_state}',
-                }
+                'data': response_payload,
             }, status=status.HTTP_200_OK)
         except VercelApiError as exc:
             return Response({
@@ -1505,9 +1678,8 @@ def deployment_logs_view(request, deployment_id):
     """
     Return real deployment logs.
 
-    For real provider deployments, returns the stored logs from the
-    DeploymentRecord. Provider build logs are available in the
-    provider dashboard (Vercel/Render).
+    For Vercel deployments still building, fetches live build events from
+    the Vercel API. Falls back to stored logs for completed deployments.
     """
     record = _find_deployment_record(deployment_id)
     if record is None:
@@ -1518,6 +1690,35 @@ def deployment_logs_view(request, deployment_id):
 
     logs = record.logs or []
     provider = (record.provider or '').upper()
+
+    # Fetch live build logs from Vercel if deployment is still building
+    if provider == 'VERCEL' and record.status not in ('RUNNING', 'FAILED'):
+        vercel_token = settings.VERCEL_TOKEN
+        if vercel_token:
+            try:
+                svc = VercelDeploymentService(vercel_token, settings.VERCEL_TEAM_ID or None)
+                events = svc.get_deployment_events(deployment_id)
+                live_logs = []
+                for ev in events:
+                    payload = ev.get('payload', {}) or {}
+                    text = payload.get('text', '') or payload.get('message', '') or ''
+                    ev_type = ev.get('type', '')
+                    ts = ev.get('createdAt', '')
+                    if text:
+                        level = 'ERROR' if 'error' in ev_type.lower() or 'error' in text.lower() else 'INFO'
+                        live_logs.append({
+                            'timestamp': ts,
+                            'level': level,
+                            'stage': ev_type,
+                            'message': text[:500],
+                        })
+                if live_logs:
+                    logs = live_logs
+                    # Persist fetched logs to DB for future requests
+                    record.logs = live_logs
+                    record.save(update_fields=['logs'])
+            except Exception:
+                pass  # non-fatal, fall back to stored logs
 
     if not logs:
         logs = [{

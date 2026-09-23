@@ -47,8 +47,20 @@ export const GenerateFiles: React.FC = () => {
   const [pushingFiles, setPushingFiles] = useState(false);
   const [inspectionLoading, setInspectionLoading] = useState(false);
   const [githubError, setGithubError] = useState('');
+  const [tokenExpired, setTokenExpired] = useState(false);
+  const [rateLimited, setRateLimited] = useState(false);
+  const [cachedScan, setCachedScan] = useState(false);
   
-  const [repoTree, setRepoTree] = useState<Array<{ path: string; type: string; size?: number }>>([]);
+  const [repoTree, setRepoTree] = useState<Array<{ path: string; type: string; size?: number; sha?: string }>>([]);
+  const [scanMetadata, setScanMetadata] = useState<{
+    repository?: string;
+    branch?: string;
+    commitSha?: string;
+    totalFiles?: number;
+    totalDirectories?: number;
+    truncated?: boolean;
+    scannedAt?: string;
+  }>({});
   const [detectedInfo, setDetectedInfo] = useState<{
     technology?: string;
     dockerfilePreserved?: boolean;
@@ -229,7 +241,9 @@ jobs:
         setRepoInput(repoName);
         setShowGithubModal(false);
         setSyncedStatus(true);
-        // Small delay to allow backend DB write to complete before inspect
+        // Reset old repo tree before scanning new repo
+        setRepoTree([]);
+        setScanMetadata({});
         await new Promise((r) => setTimeout(r, 500));
         void handleInspectRepository(repoName);
       } else {
@@ -252,6 +266,9 @@ jobs:
 
     setInspectionLoading(true);
     setGithubError('');
+    setTokenExpired(false);
+    setRateLimited(false);
+    setCachedScan(false);
     try {
       const token = localStorage.getItem('cloudwise_token');
       const inspectUrl = activeProject?.id 
@@ -264,36 +281,73 @@ jobs:
           'Content-Type': 'application/json',
           Authorization: token ? `Bearer ${token}` : '' 
         },
-        // Pass repo name as fallback in case the DB hasn't been updated yet
         body: JSON.stringify({ repoName: targetRepo }),
       });
       const inspectData = await inspectResponse.json();
+
+      // Handle token-expired or rate-limited errors that include cached tree data
+      if (inspectData.token_expired) setTokenExpired(true);
+      if (inspectData.rate_limited) setRateLimited(true);
+      if (inspectData.cached) setCachedScan(true);
+
       if (!inspectResponse.ok || !inspectData.success) {
-        throw new Error(inspectData.error || 'Unable to inspect the selected repository.');
+        // If we have token_expired or rate_limited flags, show specific messaging
+        if (inspectData.token_expired) {
+          throw new Error('Your GitHub token has expired. Please re-authenticate with GitHub to scan a fresh copy of your repository.');
+        }
+        if (inspectData.rate_limited) {
+          throw new Error('GitHub API rate limit reached. Please connect a GitHub account or wait a few minutes before retrying.');
+        }
+        throw new Error(inspectData.error || inspectData.message || 'Unable to inspect the selected repository.');
       }
+
+      const repoInfo = inspectData.data.repository;
+      const repoFullName = typeof repoInfo === 'object' ? repoInfo?.full_name || repoInfo?.name : repoInfo;
+      
+      setScanMetadata({
+        repository: repoFullName || targetRepo,
+        branch: inspectData.data.branch || 'main',
+        commitSha: inspectData.data.commitSha,
+        totalFiles: inspectData.data.totalFiles ?? (inspectData.data.tree?.length || 0),
+        totalDirectories: inspectData.data.totalDirectories ?? 0,
+        truncated: inspectData.data.truncated ?? false,
+        scannedAt: inspectData.data.scannedAt || new Date().toISOString(),
+      });
 
       setRepoTree(inspectData.data.tree || []);
 
-      const generateResponse = await fetch('/api/deployment/generate-files', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider: providerName, files: inspectData.data.files }),
-      });
-      const generateData = await generateResponse.json();
-      if (!generateResponse.ok || !generateData.success) {
-        throw new Error(generateData.error || 'Unable to generate deployment files.');
+      // Only generate deployment files if we have actual file contents (not just cached paths)
+      const fileContents = inspectData.data.files || {};
+      const hasFileContents = Object.values(fileContents).some((v) => v && (v as string).length > 0);
+
+      if (hasFileContents) {
+        const generateResponse = await fetch('/api/deployment/generate-files', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ provider: providerName, files: fileContents }),
+        });
+        const generateData = await generateResponse.json();
+        if (!generateResponse.ok || !generateData.success) {
+          throw new Error(generateData.error || 'Unable to generate deployment files.');
+        }
+
+        setDetectedInfo({
+          technology: generateData.data.technology?.technology || inspectData.data.technology?.technology,
+          dockerfilePreserved: generateData.data.dockerfile_preserved,
+          composePreserved: generateData.data.compose_preserved,
+          cicdPreserved: generateData.data.cicd_preserved,
+          port: generateData.data.port,
+        });
+        setGeneratedFiles(generateData.data.files);
       }
 
-      setDetectedInfo({
-        technology: generateData.data.technology?.technology || inspectData.data.technology?.technology,
-        dockerfilePreserved: generateData.data.dockerfile_preserved,
-        composePreserved: generateData.data.compose_preserved,
-        cicdPreserved: generateData.data.cicd_preserved,
-        port: generateData.data.port,
-      });
-
-      setGeneratedFiles(generateData.data.files);
-      showToast(`Scanned ${inspectData.data.tree?.length || 0} repository files from ${targetRepo}.`, 'success');
+      if (inspectData.cached && inspectData.token_expired) {
+        showToast(`Showing cached tree (${inspectData.data.totalFiles || inspectData.data.tree?.length || 0} files). Re-authenticate GitHub for a fresh scan.`, 'warning');
+      } else if (inspectData.cached && inspectData.rate_limited) {
+        showToast(`Showing cached tree. GitHub rate limit reached — retry in a few minutes.`, 'warning');
+      } else {
+        showToast(`Scanned ${inspectData.data.totalFiles || inspectData.data.tree?.length || 0} repository files from ${repoFullName || targetRepo}.`, 'success');
+      }
     } catch (error: any) {
       setGithubError(error.message || 'Repository inspection failed.');
       showToast(error.message || 'Repository inspection failed.', 'error');
@@ -426,51 +480,165 @@ jobs:
         </div>
       )}
 
-      {/* Grid: Repo File Tree + Code Viewer */}
+      {/* Token Expired Banner */}
+      {tokenExpired && repoTree.length > 0 && (
+        <div className="p-4 rounded-2xl bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs flex flex-col sm:flex-row sm:items-center gap-3 font-semibold">
+          <AlertCircle size={20} className="text-amber-400 shrink-0" />
+          <div className="flex-1">
+            <span className="font-extrabold text-sm block text-amber-300">GitHub Token Expired — Showing Cached Tree</span>
+            <span className="text-amber-200/80 text-xs">
+              Your stored GitHub OAuth token has expired or been revoked. The tree below is from your last successful scan. Re-authenticate to fetch the latest file list and generate accurate deployment files.
+            </span>
+          </div>
+          <button
+            onClick={handleStartGithubOAuth}
+            disabled={oauthStarting}
+            className="px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs transition-colors flex items-center gap-2 shrink-0 disabled:opacity-50"
+          >
+            <Github size={14} />
+            <span>{oauthStarting ? 'Starting...' : 'Re-authenticate GitHub'}</span>
+          </button>
+        </div>
+      )}
+
+      {/* Rate Limited Banner */}
+      {rateLimited && repoTree.length > 0 && !tokenExpired && (
+        <div className="p-4 rounded-2xl bg-blue-500/10 border border-blue-500/30 text-blue-200 text-xs flex items-center gap-3 font-semibold">
+          <AlertCircle size={20} className="text-blue-400 shrink-0" />
+          <div>
+            <span className="font-extrabold text-sm block text-blue-300">GitHub Rate Limit Reached — Showing Cached Tree</span>
+            <span className="text-blue-200/80 text-xs">
+              GitHub's unauthenticated API limit (60 req/hr) has been reached. Displaying the last cached scan. Connect a GitHub account or wait a few minutes before retrying.
+            </span>
+          </div>
+        </div>
+      )}
+
+
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         
         {/* Repo File Tree (1 Col) */}
-        <div className="glass-panel p-5 rounded-3xl border border-slate-800 space-y-4 max-h-[550px] overflow-y-auto">
+        <div className="glass-panel p-5 rounded-3xl border border-slate-800 space-y-4 max-h-[600px] overflow-y-auto">
           <div className="flex items-center justify-between border-b border-slate-800 pb-3">
             <h3 className="text-sm font-bold text-white flex items-center gap-2">
               <Folder className="w-4 h-4 text-cyan-400" />
               <span>Full Repository File Tree</span>
             </h3>
             <span className="text-[10px] text-slate-400 font-mono">
-              {repoTree.length > 0 ? `${repoTree.length} items` : 'No repo loaded'}
+              {scanMetadata.totalFiles ? `${scanMetadata.totalFiles} files` : repoTree.length > 0 ? `${repoTree.length} items` : 'No repo loaded'}
             </span>
           </div>
 
-          {repoTree.length === 0 ? (
+          {/* Scan Metadata Badge */}
+          {scanMetadata.repository && (
+            <div className="p-3 rounded-2xl bg-slate-900/80 border border-slate-800 text-xs space-y-1.5 font-mono">
+              <div className="text-cyan-300 font-extrabold truncate flex items-center gap-1.5">
+                <Github size={13} className="shrink-0" />
+                <span className="truncate">{scanMetadata.repository}</span>
+              </div>
+              <div className="grid grid-cols-2 gap-x-2 gap-y-1 text-[11px] text-slate-400">
+                <div>Branch: <span className="text-slate-200 font-bold">{scanMetadata.branch || 'main'}</span></div>
+                <div>Files: <span className="text-slate-200 font-bold">{scanMetadata.totalFiles ?? repoTree.filter(i=>i.type==='file').length}</span></div>
+                <div>Folders: <span className="text-slate-200 font-bold">{scanMetadata.totalDirectories ?? repoTree.filter(i=>i.type!=='file').length}</span></div>
+                {scanMetadata.commitSha && (
+                  <div className="col-span-2 truncate">
+                    Commit: <span className="text-slate-300">{scanMetadata.commitSha.substring(0, 7)}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Loading state */}
+          {inspectionLoading && (
+            <div className="text-center py-10 text-cyan-400 text-xs space-y-3">
+              <RefreshCw size={28} className="mx-auto animate-spin text-cyan-400" />
+              <p className="font-semibold text-white">Fetching repository tree...</p>
+              <p className="text-[11px] text-slate-400">Analyzing repository structure recursively...</p>
+            </div>
+          )}
+
+          {/* Error state */}
+          {!inspectionLoading && githubError && (
+            <div className="p-4 rounded-2xl bg-red-500/10 border border-red-500/30 text-red-300 text-xs space-y-2">
+              <div className="flex items-center gap-2 font-bold text-red-200 text-sm">
+                <AlertCircle size={16} className="text-red-400 shrink-0" />
+                <span>Repository Scan Failed</span>
+              </div>
+              <p className="text-slate-300 leading-relaxed text-[11px]">
+                {githubError}
+              </p>
+              <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  onClick={() => handleInspectRepository()}
+                  className="px-3 py-1.5 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-200 border border-red-500/40 text-[11px] font-bold transition-colors flex items-center gap-1.5"
+                >
+                  <RefreshCw size={12} />
+                  <span>Retry Scan</span>
+                </button>
+                {tokenExpired && (
+                  <button
+                    onClick={handleStartGithubOAuth}
+                    disabled={oauthStarting}
+                    className="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/40 text-[11px] font-bold transition-colors flex items-center gap-1.5 disabled:opacity-50"
+                  >
+                    <Github size={12} />
+                    <span>{oauthStarting ? 'Starting...' : 'Re-authenticate GitHub'}</span>
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
+
+          {/* Tree items */}
+          {!inspectionLoading && !githubError && repoTree.length === 0 && (
             <div className="text-center py-10 text-slate-500 text-xs space-y-2">
               <GitBranch size={28} className="mx-auto text-slate-600" />
               <p>Click "Connect GitHub Repo" & "Scan Repo Tree" to view all repository files.</p>
             </div>
-          ) : (
-            <div className="space-y-1 font-mono text-xs">
-              {repoTree.map((item, idx) => (
-                <div 
-                  key={idx} 
-                  className={`flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-slate-900 transition-colors ${
-                    item.path.toLowerCase().includes('dockerfile') ? 'text-cyan-300 font-bold bg-cyan-950/30' : 'text-slate-300'
-                  }`}
-                >
-                  {item.type === 'folder' ? (
-                    <Folder size={14} className="text-amber-400 shrink-0" />
-                  ) : (
-                    <FileText size={14} className="text-slate-400 shrink-0" />
-                  )}
-                  <span className="truncate">{item.path}</span>
-                  {item.path.toLowerCase().includes('dockerfile') && (
-                    <span className="ml-auto text-[9px] px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/40">
-                      Dockerfile
-                    </span>
-                  )}
-                </div>
-              ))}
+          )}
+
+          {!inspectionLoading && repoTree.length > 0 && (
+            <div className="space-y-1 font-mono text-xs max-h-[420px] overflow-y-auto pr-1">
+              {repoTree.map((item, idx) => {
+                const isDockerfile = item.path.toLowerCase().includes('dockerfile');
+                const isCompose = item.path.toLowerCase().includes('docker-compose');
+                const isCicd = item.path.startsWith('.github/workflows');
+                const isPackage = item.path.endsWith('package.json') || item.path.endsWith('pom.xml');
+                return (
+                  <div 
+                    key={idx} 
+                    className={`flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-slate-900 transition-colors ${
+                      isDockerfile ? 'text-cyan-300 font-bold bg-cyan-950/30 border border-cyan-500/30' : 
+                      isCompose ? 'text-amber-300 font-bold bg-amber-950/20' : 
+                      isCicd ? 'text-violet-300 font-bold bg-violet-950/20' :
+                      'text-slate-300'
+                    }`}
+                  >
+                    {item.type === 'directory' || item.type === 'folder' ? (
+                      <Folder size={14} className="text-amber-400 shrink-0" />
+                    ) : (
+                      <FileText size={14} className="text-slate-400 shrink-0" />
+                    )}
+                    <span className="truncate">{item.path}</span>
+                    {isDockerfile && (
+                      <span className="ml-auto text-[9px] px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shrink-0 font-sans">
+                        Dockerfile
+                      </span>
+                    )}
+                    {isPackage && !isDockerfile && (
+                      <span className="ml-auto text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 shrink-0 font-sans">
+                        Manifest
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>
+
 
         {/* Tabbed Code Viewer (2 Cols) */}
         <div className="lg:col-span-2 glass-panel rounded-3xl border border-slate-800 overflow-hidden flex flex-col">

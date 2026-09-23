@@ -116,7 +116,9 @@ class VercelDeploymentService:
         # 5. Poll until terminal state
         final = self._poll_deployment(deployment_id)
 
-        url = final.get("url") or final.get("alias", [None])[0] if isinstance(final.get("alias"), list) else None
+        url = final.get("url") or (
+            final.get("alias", [None])[0] if isinstance(final.get("alias"), list) else None
+        )
         if url and not url.startswith("http"):
             url = f"https://{url}"
 
@@ -134,6 +136,12 @@ class VercelDeploymentService:
     def get_deployment_status(self, deployment_id: str) -> dict[str, Any]:
         path = f"/v13/deployments/{urllib.parse.quote(deployment_id)}"
         return self._request("GET", path)
+
+    def get_deployment_events(self, deployment_id: str) -> list[dict[str, Any]]:
+        """Retrieve build/deployment events (logs) from Vercel v3 API."""
+        path = f"/v3/deployments/{urllib.parse.quote(deployment_id)}/events"
+        result = self._request("GET", path)
+        return result if isinstance(result, list) else []
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -242,7 +250,8 @@ class VercelDeploymentService:
             "target": "production",
         }
 
-        # Include projectSettings — required for first deployment of new projects.
+        # Always include projectSettings — required for first deployment,
+        # and overrides cached settings on existing projects.
         if project_settings:
             body["projectSettings"] = project_settings
 

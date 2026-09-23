@@ -89,17 +89,25 @@ def detect_frontend_stack(
         (k for k in files if k.replace("\\", "/") == "package.json"), None,
     )
 
-    # ── Step 2: If root has pom.xml / build.gradle AND a sub-directory
+    # ── Step 2: If repo has a backend at root AND a sub-directory
     #            has package.json, prefer the sub-directory (full-stack repo).
-    has_java_root = any(
-        n in names for n in ("pom.xml", "build.gradle", "build.gradle.kts")
+    #            Check ALL file paths (not just root) so backend/pom.xml is found.
+    has_backend_root = any(
+        n in names for n in ("pom.xml", "build.gradle", "build.gradle.kts",
+                              "requirements.txt", "pyproject.toml", "manage.py",
+                              "Cargo.toml", "go.mod")
+    ) or any(
+        n.endswith("/pom.xml") or n.endswith("/build.gradle") or n.endswith("/build.gradle.kts")
+        or n.endswith("/requirements.txt") or n.endswith("/pyproject.toml")
+        or n.endswith("/manage.py")
+        for n in names
     )
 
     frontend_pkg_key = root_pkg_key
     frontend_root_dir = None
 
-    if has_java_root:
-        # Java backend at root — look for frontend in known sub-dirs
+    if has_backend_root:
+        # Backend at root — look for frontend in known sub-dirs
         for d in _FRONTEND_DIRS:
             candidate = _find_package_json_in_dir(files, d)
             if candidate:
@@ -187,9 +195,11 @@ def detect_frontend_stack(
         output_dir = "dist"
         port = 4200
     else:
-        # Generic Node.js — try `npm run build` if script exists
-        if build_cmd:
-            build_cmd = f"npm run {scripts['build']}" if scripts.get("build") else None
+        # Generic Node.js — use the build script value directly if it looks
+        # like a full command (contains spaces or starts with a known tool),
+        # otherwise prefix with "npm run ".
+        if build_cmd and ' ' not in build_cmd and not build_cmd.startswith(('./', 'npx', 'node')):
+            build_cmd = f"npm run {build_cmd}"
         technology = "NODE_JS"
         framework = None
 

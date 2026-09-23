@@ -44,13 +44,16 @@ export const Deployment: React.FC = () => {
   const [dailyBackup, setDailyBackup] = useState(true);
   const [showDeployConfirmation, setShowDeployConfirmation] = useState(false);
   
-  const [deploymentId, setDeploymentId] = useState<string | null>(null);
+  const [deploymentId, setDeploymentId] = useState<string | null>(
+    () => activeProject?.deployment?.providerDeploymentId || null
+  );
   // Restore persisted deployment state from active project on mount
   const [liveDeployment, setLiveDeployment] = useState(() => {
     const saved = activeProject?.deployment;
-    if (saved && saved.status !== 'idle' && saved.endpointUrl) return saved;
+    if (saved && saved.status !== 'idle') return saved;
     return contextDeployment;
   });
+  const [showLogs, setShowLogs] = useState(false);
   const [polling, setPolling] = useState(false);
 
   const deploymentEligible = true;
@@ -108,16 +111,16 @@ export const Deployment: React.FC = () => {
       if (data.success && data.data?.deployment_id) {
         setDeploymentId(data.data.deployment_id);
         if (simulateError || data.data.status === 'FAILED') {
-          const providerError = data.data.provider_error;
+          const providerError = data.data.provider_error || null;
           const failureMsg = providerError
-            ? `Vercel Error: ${providerError.errorCode} -- ${providerError.errorMessage}`
+            ? `Vercel Error: ${providerError.errorCode} — ${providerError.errorMessage}`
             : data.error || 'Deployment failed.';
           setLiveDeployment(prev => ({
             ...prev,
             status: 'failed',
             progress: 45,
             failureReason: failureMsg,
-            providerError: providerError || null,
+            providerError: providerError,
             logs: data.data.logs?.map((l: any) => `[${l.timestamp}] [${l.level}] ${l.message}`) || prev.logs,
           }));
           setPolling(true);
@@ -139,6 +142,7 @@ export const Deployment: React.FC = () => {
               logs: data.data.logs?.map((l: any) => `[${l.timestamp}] [${l.level}] ${l.message}`) || [],
               deployedAt: new Date().toISOString(),
               endpointUrl: realUrl,
+              providerDeploymentId: data.data.deployment_id,
               ipAddress: data.data.ip_address || null,
               environmentName: envName,
               failureReason: null,
@@ -148,6 +152,21 @@ export const Deployment: React.FC = () => {
         } else {
           setPolling(true);
         }
+      } else if (data.data?.deployment_id && !data.success) {
+        // Backend returned success=false but with deployment data (Vercel ERROR state)
+        setDeploymentId(data.data.deployment_id);
+        const providerError = data.data.provider_error || null;
+        const failureMsg = providerError
+          ? `Vercel Error: ${providerError.errorCode} — ${providerError.errorMessage}`
+          : data.error || 'Deployment failed.';
+        setLiveDeployment(prev => ({
+          ...prev,
+          status: 'failed',
+          progress: 45,
+          failureReason: failureMsg,
+          providerError: providerError,
+          logs: data.data.logs?.map((l: any) => `[${l.timestamp}] [${l.level}] ${l.message}`) || prev.logs,
+        }));
       } else if (!res.ok) {
         setLiveDeployment(prev => ({
           ...prev,
@@ -214,6 +233,14 @@ export const Deployment: React.FC = () => {
             failureReason: uiStatus === 'failed'
               ? (logsData.data.filter((l: any) => l.level === 'ERROR').pop()?.message ?? prev.failureReason)
               : prev.failureReason,
+            providerError: uiStatus === 'failed' && statusData.data.error
+              ? {
+                  errorCode: statusData.data.error.errorCode,
+                  errorMessage: statusData.data.error.errorMessage,
+                  errorStep: statusData.data.error.errorStep,
+                  ...prev.providerError,
+                }
+              : prev.providerError,
           }));
 
           if (['deployed', 'failed', 'idle'].includes(uiStatus)) {
@@ -228,6 +255,7 @@ export const Deployment: React.FC = () => {
                   logs: logsData.data.map((l: any) => `[${l.timestamp}] [${l.level}] ${l.message}`),
                   deployedAt: new Date().toISOString(),
                   endpointUrl: statusData.data.endpoint_url || null,
+                  providerDeploymentId: deploymentId,
                   ipAddress: statusData.data.ip_address || null,
                   environmentName: envName,
                   failureReason: null,
@@ -292,6 +320,43 @@ export const Deployment: React.FC = () => {
       }
     } catch (err) {
       console.error('Health check failed:', err);
+    }
+  };
+
+  const handleRefreshUrl = async () => {
+    if (!deploymentId) return;
+    try {
+      showToast('Fetching live URL from Vercel...', 'info');
+      const [statusRes, logsRes] = await Promise.all([
+        fetch(`/api/deployments/${deploymentId}/status`),
+        fetch(`/api/deployments/${deploymentId}/logs`)
+      ]);
+      const statusData = await statusRes.json();
+      const logsData = await logsRes.json();
+
+      if (statusData.success) {
+        const newUrl = statusData.data.endpoint_url;
+        setLiveDeployment(prev => ({
+          ...prev,
+          endpointUrl: newUrl || prev.endpointUrl,
+          logs: logsData.success ? logsData.data.map((l: any) => `[${l.timestamp}] [${l.level}] ${l.message}`) : prev.logs,
+        }));
+        if (newUrl) {
+          updateActiveProject({
+            deployment: {
+              ...activeProject?.deployment,
+              endpointUrl: newUrl,
+              status: 'deployed',
+              providerDeploymentId: deploymentId,
+            }
+          });
+          showToast(`Live URL: ${newUrl}`, 'success');
+        } else {
+          showToast('URL not available yet from Vercel. Try again in a moment.', 'info');
+        }
+      }
+    } catch (err) {
+      console.error('Refresh URL failed:', err);
     }
   };
 
@@ -636,6 +701,15 @@ export const Deployment: React.FC = () => {
                   </div>
 
                   <div className="flex items-center gap-2">
+                    {!liveDeployment.endpointUrl && (
+                      <button
+                        onClick={handleRefreshUrl}
+                        className="px-4 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs transition-all shadow flex items-center gap-1.5"
+                      >
+                        <RefreshCw className="w-3.5 h-3.5" />
+                        <span>Fetch Live URL</span>
+                      </button>
+                    )}
                     <button
                       onClick={handleProceedToMonitoring}
                       className="px-4 py-2.5 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs transition-all shadow"
@@ -654,16 +728,87 @@ export const Deployment: React.FC = () => {
             )}
 
             {liveDeployment.status === 'failed' && (
-              <div className="p-4 rounded-2xl bg-rose-500/10 border border-rose-500/30 space-y-2 text-xs text-rose-300">
+              <div className="p-4 rounded-2xl bg-rose-500/10 border border-rose-500/30 space-y-3 text-xs text-rose-300">
                 <div className="flex items-center gap-2 font-bold text-sm text-rose-400">
                   <AlertTriangle size={18} />
                   <span>
                     {liveDeployment.failureReason?.startsWith('BLOCKED')
                       ? 'Deployment Blocked — Provider Credentials Required'
-                      : 'Deployment Pipeline Execution Halted'}
+                      : 'Deployment Failed'}
                   </span>
                 </div>
-                <p className="text-slate-300 whitespace-pre-wrap">{liveDeployment.failureReason || 'Pipeline failed during provisioning.'}</p>
+
+                {/* Deployment ID */}
+                {liveDeployment.providerError?.deploymentId && (
+                  <div className="flex items-center gap-2 text-slate-400">
+                    <span className="font-semibold">Deployment ID:</span>
+                    <code className="text-white bg-slate-900/60 px-2 py-0.5 rounded font-mono text-[11px]">
+                      {liveDeployment.providerError.deploymentId}
+                    </code>
+                  </div>
+                )}
+
+                {/* Actual Vercel Error */}
+                {liveDeployment.providerError?.errorCode && (
+                  <div className="space-y-1">
+                    <span className="font-semibold text-rose-400">Actual Vercel Error:</span>
+                    <div className="bg-slate-900/60 rounded-xl p-3 border border-rose-500/20 space-y-1">
+                      <div className="flex items-center gap-2">
+                        <span className="text-slate-400">Error Code:</span>
+                        <code className="text-rose-300 font-bold">{liveDeployment.providerError.errorCode}</code>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-slate-400">Message:</span>
+                        <span className="text-white">{liveDeployment.providerError.errorMessage}</span>
+                      </div>
+                      {liveDeployment.providerError.errorStep && (
+                        <div className="flex items-center gap-2">
+                          <span className="text-slate-400">Failed At:</span>
+                          <span className="text-amber-300">{liveDeployment.providerError.errorStep}</span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Build Error Summary */}
+                {liveDeployment.failureReason && !liveDeployment.failureReason.startsWith('BLOCKED') && (
+                  <div className="space-y-1">
+                    <span className="font-semibold text-rose-400">Build Error:</span>
+                    <p className="text-slate-300 whitespace-pre-wrap bg-slate-900/60 rounded-xl p-3 border border-rose-500/20">
+                      {liveDeployment.failureReason}
+                    </p>
+                  </div>
+                )}
+
+                {/* Collapsible Build Logs */}
+                {liveDeployment.logs.length > 0 && (
+                  <div className="pt-1">
+                    <button
+                      onClick={() => setShowLogs(!showLogs)}
+                      className="flex items-center gap-2 text-[11px] font-semibold text-slate-400 hover:text-white transition-colors"
+                    >
+                      <span className={`transform transition-transform ${showLogs ? 'rotate-90' : ''}`}>▶</span>
+                      <span>View deployment logs ({liveDeployment.logs.length} lines)</span>
+                    </button>
+                    {showLogs && (
+                      <div className="mt-2 bg-slate-950 rounded-xl p-3 border border-slate-800 max-h-48 overflow-y-auto font-mono text-[10px] leading-relaxed space-y-0.5">
+                        {liveDeployment.logs.map((log, idx) => (
+                          <div key={idx} className={`flex gap-2 ${log.includes('ERROR') || log.includes('failed') ? 'text-rose-400' : 'text-slate-400'}`}>
+                            <span className="text-slate-600 select-none">&gt;</span>
+                            <span>{log}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Fallback message when no provider error details */}
+                {!liveDeployment.providerError && (
+                  <p className="text-slate-300 whitespace-pre-wrap">{liveDeployment.failureReason || 'Pipeline failed during provisioning.'}</p>
+                )}
+
                 {liveDeployment.failureReason?.startsWith('BLOCKED') ? (
                   <div className="pt-2">
                     <p className="text-amber-300 text-xs font-semibold">
