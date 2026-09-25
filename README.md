@@ -95,4 +95,18 @@ The frontend will start at `http://localhost:5173` and automatically proxy `/api
     .\.venv\Scripts\Activate.ps1 
     python manage.py runserver
 ```
+- cd backend
+- python -m venv .venv
+- .\.venv\Scripts\Activate.ps1
+- pip install -r requirements.txt
+- cp .env.example .env
+#### Edit the .env file with your credentials if necessary
+- python manage.py migrate
+- python manage.py runserver
+
+```bash
+    .\.venv\Scripts\Activate.ps1
+    .\.venv\Scripts\pip.exe install -r requirements.txt
+    .\.venv\Scripts\python.exe manage.py runserver 127.0.0.1:8000
+```
 

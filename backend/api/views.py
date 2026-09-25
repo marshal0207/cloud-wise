@@ -1159,7 +1159,7 @@ def health_view(request):
 
 
 @api_view(['GET'])
-@permission_classes([permissions.AllowAny])
+@permission_classes([permissions.IsAuthenticated])
 def github_oauth_start_view(request):
     if not settings.GITHUB_CLIENT_ID:
         return Response({
@@ -1253,7 +1253,17 @@ def github_oauth_callback_view(request):
                 'github_login': profile.get('login', ''),
             },
         )
-    except (urllib.error.HTTPError, urllib.error.URLError, KeyError, ValueError, json.JSONDecodeError) as exc:
+    except urllib.error.HTTPError as exc:
+        details = exc.read().decode(errors='replace')
+
+        return Response({
+            'success': False,
+            'error': 'GitHub OAuth exchange failed.',
+            'github_status': exc.code,
+            'github_response': details,
+        }, status=status.HTTP_502_BAD_GATEWAY)
+
+    except (urllib.error.URLError, KeyError, ValueError, json.JSONDecodeError) as exc:
         return Response({
             'success': False,
             'error': f'GitHub OAuth exchange failed: {exc}'
