@@ -23,7 +23,14 @@ get_logs, health_check, rollback) and reuses the shared deployment state
 machine (DeploymentStatus / is_valid_transition).
 """
 
-from __future__ import annotations
+"""
+AwsEc2Provider — AWS EC2 deployment provider (Parts 3–5).
+
+Deploys inside the USER's AWS account using an IAM role connection
+(sts:AssumeRole + External ID → short-lived temporary credentials).
+
+...
+"""
 
 import base64
 import json
@@ -465,6 +472,11 @@ class AwsEc2Provider(DeploymentProvider):
                     sg_name=sg_name,
                     env_name=env_name,
                     increment=True,
+                )
+                # Ensure the reused instance has the SSM instance profile.
+                # Only touches CloudWise-managed instances (ManagedBy tag).
+                self._ensure_instance_profile(
+                    ec2, instance_id, instance_profile, log
                 )
             else:
                 instance = self._run_instances(
@@ -1322,41 +1334,162 @@ class AwsEc2Provider(DeploymentProvider):
             time.sleep(interval)
         return False, last_message
 
-    def _ensure_ssm_managed(self, ssm, instance_id: str, log: DeploymentLogService) -> None:
-        """Verify the instance is registered with SSM (instance profile required)."""
-        try:
-            response = ssm.describe_instance_information(
-                InstanceIds=[instance_id]
-            )
-        except Exception as exc:  # noqa: BLE001
-            raise AwsEc2Error(
-                "SSM is not available for this instance. Attach an instance "
-                "profile with AmazonSSMManagedInstanceCore to the EC2 "
-                f"instance (AWS_EC2_INSTANCE_PROFILE). ({exc})"
-            ) from exc
-        infos = response.get("InstanceInformationList") or []
-        if not infos or not isinstance(infos[0], dict):
-            # MagicMock / empty — only fail on a real empty list.
-            if isinstance(infos, list) and len(infos) == 0:
-                raise AwsEc2Error(
-                    "EC2 instance is not yet registered with SSM. Ensure an "
-                    "instance profile with AmazonSSMManagedInstanceCore is "
-                    "attached and the SSM agent has started."
-                )
-            ping = "Online"
-        else:
-            ping = (infos[0] or {}).get("PingStatus", "") or ""
-            if not isinstance(ping, str):
-                ping = "Online"
-        if ping not in ("Online", "ConnectionLost"):
-            log.warning(
-                DeploymentStage.PREPARING,
-                f"SSM PingStatus is {ping or 'unknown'} — continuing.",
-            )
+    def _ensure_ssm_managed(
+        self,
+        ssm,
+        instance_id: str,
+        log: DeploymentLogService,
+        *,
+        poll_timeout: int = 150,
+        poll_interval: int = 10,
+    ) -> None:
+        """
+        Poll SSM until the instance appears as registered.
+
+        After attaching an instance profile, the SSM agent needs time to
+        phone home (typically 30–90 s). We poll up to *poll_timeout* seconds
+        before raising, so a fresh profile association never causes a false
+        failure.
+        """
         log.info(
             DeploymentStage.PREPARING,
-            f"SSM agent online for {instance_id} "
-            f"(PingStatus={ping or 'unknown'}).",
+            f"Waiting for {instance_id} to register with SSM "
+            f"(timeout {poll_timeout}s)…",
+        )
+        deadline = time.monotonic() + poll_timeout
+        last_error: str = ""
+        while time.monotonic() < deadline:
+            try:
+                response = ssm.describe_instance_information(
+                    Filters=[
+                        {
+                            "Key": "InstanceIds",
+                            "Values": [instance_id],
+                        }
+                    ]
+                )
+            except Exception as exc:  # noqa: BLE001
+                last_error = str(exc)
+                time.sleep(poll_interval)
+                continue
+
+            infos = response.get("InstanceInformationList") or []
+            if infos:
+                info = infos[0] or {}
+                ping = info.get("PingStatus", "") or ""
+                if ping not in ("Online", "ConnectionLost"):
+                    log.warning(
+                        DeploymentStage.PREPARING,
+                        f"SSM PingStatus is {ping or 'unknown'} — continuing.",
+                    )
+                log.info(
+                    DeploymentStage.PREPARING,
+                    f"SSM agent online for {instance_id} "
+                    f"(PingStatus={ping or 'unknown'}).",
+                )
+                return  # success
+
+            elapsed = int(poll_timeout - (deadline - time.monotonic()))
+            log.info(
+                DeploymentStage.PREPARING,
+                f"SSM: {instance_id} not yet registered "
+                f"({elapsed}s elapsed, retrying in {poll_interval}s)…",
+            )
+            time.sleep(poll_interval)
+
+        detail = f" Last error: {last_error}" if last_error else ""
+        raise AwsEc2Error(
+            f"EC2 instance {instance_id} did not register with SSM within "
+            f"{poll_timeout}s. Verify that the instance profile "
+            "(cloudwise-ec2-ssm) has AmazonSSMManagedInstanceCore attached "
+            f"and that the SSM agent is running on the instance.{detail}"
+        )
+
+    def _ensure_instance_profile(
+        self,
+        ec2,
+        instance_id: str,
+        instance_profile: str,
+        log: DeploymentLogService,
+    ) -> None:
+        """
+        Attach *instance_profile* to *instance_id* when it is not already
+        associated.
+
+        Safety: only CloudWise-managed instances (ManagedBy=CloudWise tag)
+        are ever modified.
+        """
+        profile_name = instance_profile or "cloudwise-ec2-ssm"
+
+        # Verify ManagedBy=CloudWise tag before touching the instance.
+        instance = self._describe_instance(ec2, instance_id)
+        if instance is None:
+            return
+        tags = {t.get("Key"): t.get("Value") for t in (instance.get("Tags") or [])}
+        if tags.get("ManagedBy") != "CloudWise":
+            log.warning(
+                DeploymentStage.PREPARING,
+                f"Instance {instance_id} is not tagged ManagedBy=CloudWise — "
+                "skipping instance-profile association.",
+            )
+            return
+
+        try:
+            assoc_resp = ec2.describe_iam_instance_profile_associations(
+                Filters=[{"Name": "instance-id", "Values": [instance_id]}]
+            )
+        except (ClientError, BotoCoreError) as exc:
+            log.warning(
+                DeploymentStage.PREPARING,
+                f"Could not query instance profile associations: {exc}",
+            )
+            return
+
+        associations = assoc_resp.get("IamInstanceProfileAssociations") or []
+        for assoc in associations:
+            state = assoc.get("State", "")
+            profile = (assoc.get("IamInstanceProfile") or {}).get("Arn", "")
+            if state in ("associated", "associating"):
+                log.info(
+                    DeploymentStage.PREPARING,
+                    f"Instance {instance_id} already has an instance profile "
+                    f"({profile}) — skipping association.",
+                )
+                return
+
+        # No live association — attach the required profile.
+        log.info(
+            DeploymentStage.PREPARING,
+            f"Attaching instance profile '{profile_name}' to "
+            f"{instance_id} (required for SSM).",
+        )
+        try:
+            ec2.associate_iam_instance_profile(
+                IamInstanceProfile={"Name": profile_name},
+                InstanceId=instance_id,
+            )
+        except ClientError as exc:
+            code = str((exc.response.get("Error") or {}).get("Code", ""))
+            if code == "IncorrectInstanceState":
+                log.warning(
+                    DeploymentStage.PREPARING,
+                    f"Cannot attach instance profile while instance is not "
+                    f"in running state ({code}) — the SSM check may fail.",
+                )
+            else:
+                raise AwsEc2Error(
+                    f"Failed to attach instance profile '{profile_name}' "
+                    f"to {instance_id}: {exc}"
+                ) from exc
+        except (BotoCoreError, Exception) as exc:  # noqa: BLE001
+            raise AwsEc2Error(
+                f"Failed to attach instance profile '{profile_name}' "
+                f"to {instance_id}: {exc}"
+            ) from exc
+        log.info(
+            DeploymentStage.PREPARING,
+            f"Instance profile '{profile_name}' association requested for "
+            f"{instance_id}. Waiting for SSM agent to register…",
         )
 
     @staticmethod
@@ -1554,7 +1687,14 @@ class AwsEc2Provider(DeploymentProvider):
         try:
             session = self.get_session()
             ssm = session.client("ssm", region_name=self._region())
-            ssm.describe_instance_information(InstanceIds=[instance_id])
+            response = ssm.describe_instance_information(
+                Filters=[
+                    {
+                        "Key": "InstanceIds",
+                        "Values": [instance_id]
+                    }
+                ]
+            )
             self._run_ssm_commands(
                 ssm,
                 instance_id,
@@ -1834,15 +1974,25 @@ class AwsEc2Provider(DeploymentProvider):
             "#!/bin/bash\n"
             "set -x\n"
             "exec > /var/log/cloudwise-userdata.log 2>&1\n"
-            "if command -v dnf >/dev/null 2>&1; then\n"
+            "if command -v dnf > /dev/null 2>&1; then\n"
+            "  dnf install -y amazon-ssm-agent || true\n"
+            "elif command -v yum > /dev/null 2>&1; then\n"
+            "  yum install -y amazon-ssm-agent || true\n"
+            "elif command -v apt-get > /dev/null 2>&1; then\n"
+            "  snap install amazon-ssm-agent --classic || "
+            "(apt-get update -y && apt-get install -y amazon-ssm-agent) || true\n"
+            "fi\n"
+            "systemctl enable amazon-ssm-agent || true\n"
+            "systemctl start  amazon-ssm-agent || true\n"
+            "if command -v dnf > /dev/null 2>&1; then\n"
             "  dnf install -y docker && systemctl enable --now docker\n"
-            "elif command -v yum >/dev/null 2>&1; then\n"
+            "elif command -v yum > /dev/null 2>&1; then\n"
             "  yum install -y docker && systemctl enable --now docker\n"
-            "elif command -v apt-get >/dev/null 2>&1; then\n"
+            "elif command -v apt-get > /dev/null 2>&1; then\n"
             "  apt-get update -y && apt-get install -y docker.io "
             "&& systemctl enable --now docker\n"
             "fi\n"
-            "if ! command -v docker-compose >/dev/null 2>&1; then\n"
+            "if ! command -v docker-compose > /dev/null 2>&1; then\n"
             "  curl -fsSL "
             "https://github.com/docker/compose/releases/latest/"
             "download/docker-compose-linux-x86_64 "
