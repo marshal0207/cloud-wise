@@ -13,10 +13,11 @@ Covers:
 from unittest.mock import MagicMock, patch
 
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 
 from api.models import AWSConnection, DeploymentRecord, EC2Instance, Project, GitHubConnection
+from api.services.deployment.aws_ec2_provider import AwsEc2Error
 
 User = get_user_model()
 
@@ -209,9 +210,13 @@ class DeployAwsFlowTests(TestCase):
         self.assertEqual(response.data["required"], ["AWS_ROLE_ARN"])
         self.assertEqual(response.data["connectUrl"], "/connect-aws")
 
-    @patch("api.views.AwsEc2Provider")
+    @patch("api.services.deployment.pipeline.assume_role_credentials")
+    @patch("api.services.deployment.pipeline.AwsEc2Provider")
     @patch("api.services.github_repository_service.inspect_repository")
-    def test_aws_provisions_ec2_when_connected(self, mock_inspect, mock_provider_cls):
+    @override_settings(DEPLOYMENT_RUN_INLINE=True)
+    def test_aws_queues_deployment_and_pipeline_provisions_ec2(
+        self, mock_inspect, mock_provider_cls, mock_assume_role
+    ):
         mock_inspect.return_value = {
             "files": {"package.json": '{"dependencies":{"react":"18.3.1"}}'},
             "tree": [],
@@ -278,32 +283,42 @@ class DeployAwsFlowTests(TestCase):
 
         response = self._deploy()
 
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 201)
         self.assertTrue(response.data["success"])
-        data = response.data["data"]
-        self.assertEqual(data["deployment_id"], "i-0abc123")
-        self.assertEqual(data["status"], "RUNNING")
-        self.assertEqual(data["ipAddress"], "13.232.1.10")
-        self.assertEqual(data["endpoint_url"], "http://13.232.1.10")
-        self.assertFalse(data["simulated"])
-        self.assertEqual(data["reused"], False)
+        self.assertEqual(response.data["stage"], "QUEUED")
+        self.assertEqual(response.data["data"]["deploymentStatus"], "RUNNING")
+        self.assertEqual(response.data["data"]["liveUrl"], "http://13.232.1.10")
+        self.assertEqual(response.data["data"]["instanceId"], "i-0abc123")
+        self.assertEqual(response.data["data"]["awsAccountId"], "999988887777")
+        self.assertEqual(response.data["data"]["provider"], "AWS")
         mock_provider.deploy.assert_called_once()
 
-        # DeploymentRecord persisted and findable by status/logs endpoints
-        record = DeploymentRecord.objects.get(provider_deployment_id="i-0abc123")
+        # DeploymentRecord persisted with the required per-deployment fields
+        record = DeploymentRecord.objects.get(
+            pk=response.data["deployment_id"]
+        )
         self.assertEqual(record.provider, "AWS")
-        self.assertEqual(record.status, "RUNNING")
+        self.assertEqual(record.deployment_status, "RUNNING")
         self.assertEqual(record.user_id, self.user.id)
+        self.assertEqual(record.repository, "demo/aws-demo")
+        self.assertEqual(record.aws_account_id, "999988887777")
+        self.assertEqual(record.instance_id, "i-0abc123")
+        self.assertIsNotNone(record.github_connection_id)
+        self.assertIsNotNone(record.aws_connection_id)
+        self.assertIsNotNone(record.created_at)
+        self.assertIsNotNone(record.updated_at)
 
         # Project deployment state persisted
         self.project.refresh_from_db()
         self.assertEqual(self.project.deployment["awsInstanceId"], "i-0abc123")
 
-    @patch("api.views.AwsEc2Provider")
+    @patch("api.services.deployment.pipeline.assume_role_credentials")
+    @patch("api.services.deployment.pipeline.AwsEc2Provider")
     @patch("api.services.github_repository_service.inspect_repository")
-    def test_aws_deploy_failure_returns_502(self, mock_inspect, mock_provider_cls):
-        from api.services.deployment.aws_ec2_provider import AwsEc2Error
-
+    @override_settings(DEPLOYMENT_RUN_INLINE=True)
+    def test_aws_pipeline_failure_marks_record_failed(
+        self, mock_inspect, mock_provider_cls, mock_assume_role
+    ):
         mock_inspect.return_value = {
             "files": {"package.json": '{"dependencies":{"react":"18.3.1"}}'},
             "tree": [],
@@ -326,13 +341,18 @@ class DeployAwsFlowTests(TestCase):
 
         response = self._deploy()
 
-        self.assertEqual(response.status_code, 502)
-        self.assertFalse(response.data["success"])
-        self.assertIn("missing a required EC2 permission", response.data["error"])
-        record = DeploymentRecord.objects.filter(
-            provider="AWS", status="FAILED"
-        ).first()
-        self.assertIsNotNone(record)
+        # Pre-flight validation passed; the pipeline records the failure.
+        self.assertEqual(response.status_code, 201)
+        record = DeploymentRecord.objects.get(pk=response.data["deployment_id"])
+        self.assertEqual(record.deployment_status, "FAILED")
+        self.assertEqual(record.user_id, self.user.id)
+        self.assertTrue(
+            any(
+                "missing a required EC2 permission" in entry.get("message", "")
+                for entry in record.logs
+            )
+        )
+        mock_provider.deploy.assert_not_called()
 
 
 class AwsStatusRollbackTests(TestCase):
@@ -358,7 +378,11 @@ class AwsStatusRollbackTests(TestCase):
             environment_name="prod",
             provider="AWS",
             provider_deployment_id="i-status1",
-            status="RUNNING",
+            instance_id="i-status1",
+            instance_type="t3.micro",
+            aws_account_id="999988887777",
+            repository="demo/aws-demo",
+            deployment_status="RUNNING",
             ip_address="13.232.1.10",
             logs=[],
         )
@@ -376,8 +400,10 @@ class AwsStatusRollbackTests(TestCase):
         self.connection.save()
         response = self.client.get("/api/deployments/i-status1/status")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["data"]["status"], "RUNNING")
-        self.assertIn("stored status", response.data["data"]["message"])
+        data = response.data["data"]
+        self.assertEqual(data["deploymentStatus"], "RUNNING")
+        self.assertEqual(data["instanceId"], "i-status1")
+        self.assertIn("stored status", data["message"])
 
     @patch("api.views.AwsEc2Provider")
     def test_status_queries_live_ec2(self, mock_provider_cls):
@@ -387,7 +413,6 @@ class AwsStatusRollbackTests(TestCase):
             "status": "RUNNING",
             "progress": 100,
             "provider_type": "AWS",
-            "endpoint_url": None,
             "ip_address": "13.232.1.10",
             "instance_state": "running",
             "region": "ap-south-1",
@@ -398,9 +423,28 @@ class AwsStatusRollbackTests(TestCase):
         response = self.client.get("/api/deployments/i-status1/status")
         self.assertEqual(response.status_code, 200)
         data = response.data["data"]
-        self.assertEqual(data["status"], "RUNNING")
-        self.assertEqual(data["provider_type"], "AWS")
-        self.assertEqual(data["instance_state"], "running")
+        self.assertEqual(data["deploymentStatus"], "RUNNING")
+        self.assertEqual(data["providerType"], "AWS")
+        self.assertEqual(data["instanceState"], "running")
+        self.assertEqual(data["ipAddress"], "13.232.1.10")
+        self.assertEqual(data["awsAccountId"], "999988887777")
+        self.assertNotIn("SIMULATED", str(response.data))
+        mock_provider.get_status.assert_called_once_with("i-status1")
+
+    def test_status_requires_authentication(self):
+        response = APIClient().get("/api/deployments/i-status1/status")
+        self.assertIn(response.status_code, (401, 403))
+
+    @patch("api.views.AwsEc2Provider")
+    def test_status_hidden_from_another_user(self, mock_provider_cls):
+        intruder = User.objects.create_user(
+            username="notmine", password="pass1234", email="notmine@example.com"
+        )
+        client = APIClient()
+        client.force_authenticate(user=intruder)
+        response = client.get("/api/deployments/i-status1/status")
+        self.assertEqual(response.status_code, 404)
+        mock_provider_cls.assert_not_called()
 
     @patch("api.views.AwsEc2Provider")
     def test_rollback_records_rolled_back(self, mock_provider_cls):
@@ -423,9 +467,9 @@ class AwsStatusRollbackTests(TestCase):
 
         response = self.client.post("/api/deployments/i-status1/rollback")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["data"]["status"], "ROLLED_BACK")
+        self.assertEqual(response.data["data"]["deploymentStatus"], "ROLLED_BACK")
         self.record.refresh_from_db()
-        self.assertEqual(self.record.status, "ROLLED_BACK")
+        self.assertEqual(self.record.deployment_status, "ROLLED_BACK")
         self.assertTrue(self.record.logs)
 
     def test_rollback_blocked_without_connection(self):

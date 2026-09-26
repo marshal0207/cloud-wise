@@ -22,10 +22,13 @@ Rules
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Literal
 
 from .status import DeploymentStage
+
+logger = logging.getLogger(__name__)
 
 LogLevel = Literal["INFO", "WARNING", "ERROR"]
 
@@ -73,6 +76,10 @@ class DeploymentLogService:
     """
     Manages an in-memory log buffer for a single deployment session.
 
+    An optional ``listener`` is invoked for every entry as it is written,
+    which lets a long-running pipeline stream structured logs to a
+    DeploymentRecord in real time instead of only at the end.
+
     Usage::
 
         log_svc = DeploymentLogService(deployment_id="dep_abc123")
@@ -80,22 +87,36 @@ class DeploymentLogService:
         entries = log_svc.all()
     """
 
-    def __init__(self, deployment_id: str) -> None:
+    def __init__(
+        self,
+        deployment_id: str,
+        listener=None,
+    ) -> None:
         self.deployment_id = deployment_id
         self._entries: list[dict[str, str]] = []
+        self._listener = listener
+
+    def _emit(self, entry: dict[str, str]) -> None:
+        self._entries.append(entry)
+        if self._listener is None:
+            return
+        try:
+            self._listener(entry)
+        except Exception:  # noqa: BLE001 — a listener must never break a deploy
+            logger.exception("Deployment log listener failed for %s", self.deployment_id)
 
     # ------------------------------------------------------------------
     # Convenience writers
     # ------------------------------------------------------------------
 
     def info(self, stage: str, message: str) -> None:
-        self._entries.append(make_log_entry(stage, message, level="INFO"))
+        self._emit(make_log_entry(stage, message, level="INFO"))
 
     def warning(self, stage: str, message: str) -> None:
-        self._entries.append(make_log_entry(stage, message, level="WARNING"))
+        self._emit(make_log_entry(stage, message, level="WARNING"))
 
     def error(self, stage: str, message: str) -> None:
-        self._entries.append(make_log_entry(stage, message, level="ERROR"))
+        self._emit(make_log_entry(stage, message, level="ERROR"))
 
     # ------------------------------------------------------------------
     # Queries

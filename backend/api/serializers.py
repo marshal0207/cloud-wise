@@ -147,26 +147,49 @@ class EstimationRecordSerializer(serializers.ModelSerializer):
 
 
 class DeploymentRecordSerializer(serializers.ModelSerializer):
+    """Wire format for a deployment — canonical field names only."""
     environmentName = serializers.CharField(source='environment_name')
     monthlyCost = serializers.DecimalField(source='monthly_cost', max_digits=12, decimal_places=2)
     ipAddress = serializers.CharField(source='ip_address', allow_blank=True, allow_null=True)
-    endpointUrl = serializers.CharField(source='endpoint_url', allow_blank=True, allow_null=True)
+    liveUrl = serializers.CharField(source='live_url', allow_blank=True, allow_null=True)
+    deploymentStatus = serializers.CharField(source='deployment_status')
+    awsAccountId = serializers.CharField(source='aws_account_id')
+    instanceId = serializers.CharField(source='instance_id')
+    instanceType = serializers.CharField(source='instance_type')
+    commitSha = serializers.CharField(source='commit_sha')
+    projectType = serializers.CharField(source='project_type')
+    projectId = serializers.CharField(source='project_id', allow_blank=True, allow_null=True)
+    githubConnectionId = serializers.PrimaryKeyRelatedField(source='github_connection', read_only=True)
+    awsConnectionId = serializers.PrimaryKeyRelatedField(source='aws_connection', read_only=True)
     createdAt = serializers.DateTimeField(source='created_at', read_only=True)
+    updatedAt = serializers.DateTimeField(source='updated_at', read_only=True)
+    failureStage = serializers.CharField(source='failure_stage', read_only=True)
 
     class Meta:
         model = DeploymentRecord
         fields = [
             'id',
             'environmentName',
+            'repository',
+            'commitSha',
+            'projectType',
+            'projectId',
             'provider',
+            'githubConnectionId',
+            'awsConnectionId',
+            'awsAccountId',
+            'region',
+            'instanceId',
+            'instanceType',
             'monthlyCost',
             'specs',
-            'region',
-            'status',
+            'deploymentStatus',
             'ipAddress',
-            'endpointUrl',
+            'liveUrl',
             'logs',
-            'createdAt'
+            'failureStage',
+            'createdAt',
+            'updatedAt',
         ]
 
 

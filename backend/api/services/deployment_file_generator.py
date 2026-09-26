@@ -165,40 +165,6 @@ jobs:
 """
 
 
-# Isolated for future compatibility — NOT generated in the default AWS flow.
-def generate_vercel_config() -> str:
-    return """{
-  "version": 2,
-  "builds": [
-    {
-      "src": "package.json",
-      "use": "@vercel/node"
-    }
-  ],
-  "routes": [
-    {
-      "src": "/(.*)",
-      "dest": "/$1"
-    }
-  ]
-}
-"""
-
-
-# Isolated for future compatibility — NOT generated in the default AWS flow.
-def generate_render_config(port: int) -> str:
-    return f"""services:
-  - type: web
-    name: cloudwise-app
-    env: docker
-    dockerfilePath: ./Dockerfile
-    envVars:
-      - key: PORT
-        value: "{port}"
-    plan: free
-"""
-
-
 # ---------------------------------------------------------------------------
 # Structured Dockerfiles (driven by Part 1 repository analysis)
 # ---------------------------------------------------------------------------
@@ -562,7 +528,7 @@ def build_deployment_plan(
 
 def generate_deployment_files(
     files: Mapping[str, str],
-    provider: str = "MOCK",
+    provider: str = "AWS",
     tree: list[dict] | None = None,
 ) -> dict[str, object]:
     """

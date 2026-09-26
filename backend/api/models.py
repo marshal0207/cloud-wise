@@ -108,20 +108,77 @@ class EstimationRecord(models.Model):
 
 
 class DeploymentRecord(models.Model):
+    """
+    One end-to-end deployment of a user's GitHub repository into the
+    same user's AWS account.
+
+    Every row is owned by exactly one user and pins the GitHub
+    connection, the AWS connection, the repository and the EC2
+    instance that were used, so authorization and auditing never have
+    to guess.
+    """
     id = models.CharField(max_length=100, primary_key=True, editable=False)
+
+    # --- ownership / provenance -------------------------------------
     user = models.ForeignKey(CustomUser, on_delete=models.CASCADE, null=True, blank=True, related_name='deployment_records')
+    project = models.ForeignKey('Project', on_delete=models.SET_NULL, null=True, blank=True, related_name='deployment_records')
+    github_connection = models.ForeignKey('GitHubConnection', on_delete=models.SET_NULL, null=True, blank=True, related_name='deployment_records')
+    aws_connection = models.ForeignKey('AWSConnection', on_delete=models.SET_NULL, null=True, blank=True, related_name='deployment_records')
+
+    # --- source -----------------------------------------------------
     environment_name = models.CharField(max_length=255)
+    repository = models.CharField(max_length=255, blank=True, default='')
+    commit_sha = models.CharField(max_length=64, blank=True, default='')
+    project_type = models.CharField(max_length=150, blank=True, default='')
+
+    # --- provider ---------------------------------------------------
     provider = models.CharField(max_length=100, default='AWS')
     provider_deployment_id = models.CharField(max_length=255, blank=True, null=True)
     provider_project_id = models.CharField(max_length=255, blank=True, null=True)
+
+    # --- target infrastructure (inside the user's AWS account) ------
+    aws_account_id = models.CharField(max_length=64, blank=True, default='')
+    region = models.CharField(max_length=100, default='Asia Pacific (Mumbai)')
+    instance_id = models.CharField(max_length=64, blank=True, default='')
+    instance_type = models.CharField(max_length=50, blank=True, default='')
+
+    # --- outcome ----------------------------------------------------
     monthly_cost = models.DecimalField(max_digits=12, decimal_places=2, default=12280.00)
     specs = models.JSONField(default=dict)
-    region = models.CharField(max_length=100, default='Asia Pacific (Mumbai)')
-    status = models.CharField(max_length=50, default='deployed')
+    deployment_status = models.CharField(max_length=50, default='QUEUED')
     ip_address = models.CharField(max_length=100, blank=True, null=True)
-    endpoint_url = models.CharField(max_length=255, blank=True, null=True)
+    live_url = models.CharField(max_length=255, blank=True, null=True)
     logs = models.JSONField(default=list)
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    # ------------------------------------------------------------------
+    # Compatibility aliases — the canonical columns are
+    # ``deployment_status`` and ``live_url``.
+    # ------------------------------------------------------------------
+    @property
+    def status(self):
+        return self.deployment_status
+
+    @status.setter
+    def status(self, value):
+        self.deployment_status = value
+
+    @property
+    def endpoint_url(self):
+        return self.live_url
+
+    @endpoint_url.setter
+    def endpoint_url(self, value):
+        self.live_url = value
+
+    @property
+    def failure_stage(self):
+        """Stage of the most recent ERROR log entry, if the deployment failed."""
+        for entry in reversed(self.logs or []):
+            if entry.get('level') == 'ERROR':
+                return str(entry.get('stage') or '')
+        return ''
 
     def save(self, *args, **kwargs):
         if not self.id:
@@ -129,7 +186,7 @@ class DeploymentRecord(models.Model):
         super().save(*args, **kwargs)
 
     def __str__(self):
-        return f"Deployment {self.environment_name} ({self.status})"
+        return f"Deployment {self.environment_name} ({self.deployment_status})"
 
 
 class WaitlistSubscriber(models.Model):
@@ -149,14 +206,24 @@ class WaitlistSubscriber(models.Model):
 
 class GitHubConnection(models.Model):
     user = models.OneToOneField(CustomUser, on_delete=models.CASCADE, related_name='github_connection')
-    access_token = models.TextField()
-    github_user_id = models.CharField(max_length=100)
-    github_login = models.CharField(max_length=255)
+    access_token = models.TextField()  # Encrypted access token storage
+    github_user_id = models.CharField(max_length=100, blank=True, default='')
+    github_login = models.CharField(max_length=255, blank=True, default='')
+    scopes = models.CharField(max_length=255, default='repo,workflow', blank=True)
+    status = models.CharField(max_length=50, default='connected', blank=True)  # connected | expired | revoked
     connected_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    def set_token(self, plain_token: str):
+        from .services.token_encryption import encrypt_token
+        self.access_token = encrypt_token(plain_token)
+
+    def get_token(self) -> str:
+        from .services.token_encryption import decrypt_token
+        return decrypt_token(self.access_token)
+
     def __str__(self):
-        return f"GitHub connection for {self.user.email or self.user.username}"
+        return f"GitHub connection for {self.user.email or self.user.username} ({self.github_login or 'connected'})"
 
 
 class AWSConnection(models.Model):

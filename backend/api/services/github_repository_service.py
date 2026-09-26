@@ -1,4 +1,5 @@
 import base64
+import re
 import time
 import urllib.parse
 from datetime import datetime
@@ -24,10 +25,12 @@ SUPPORTED_REPOSITORY_FILES = (
 
 _SUPPORTED_REPOSITORY_FILENAMES = {name.lower() for name in SUPPORTED_REPOSITORY_FILES}
 
+_SENSITIVE_FILENAMES = {'.env', '.env.local', '.env.production', '.env.staging', '.env.development'}
 
-# ---------------------------------------------------------------------------
-# CloudWise platform repository analysis limits
-# ---------------------------------------------------------------------------
+_SECRETS_PATTERN = re.compile(
+    r'(?i)(secret|password|passwd|pass|token|api[_-]?key|access[_-]?key|private[_-]?key|credential|auth|bearer|client_secret|db_url|database_url|connection_string|aws_secret|stripe|sk_live|ghp_|gho_|github_pat_)',
+)
+
 
 class RepositoryLimitError(ValueError):
     """Raised when a repository exceeds CloudWise platform analysis limits."""
@@ -49,11 +52,9 @@ _LIMIT_SETTINGS = {
 
 
 def get_repository_limits() -> dict:
-    """Resolve repository analysis limits from Django settings (env-configurable)."""
     limits = dict(DEFAULT_REPOSITORY_LIMITS)
     try:
         from django.conf import settings
-
         for key, setting_name in _LIMIT_SETTINGS.items():
             value = getattr(settings, setting_name, None)
             if value is not None:
@@ -87,7 +88,6 @@ def _file_nodes(full_tree) -> list[dict]:
 
 
 def compute_repository_size(full_tree) -> dict:
-    """Summarise repository size from the scanned tree."""
     nodes = _file_nodes(full_tree)
     total_bytes = 0
     largest_bytes = 0
@@ -105,13 +105,8 @@ def compute_repository_size(full_tree) -> dict:
 
 
 def check_repository_limits(full_tree, *, elapsed_seconds: float = 0.0, limits: dict | None = None) -> None:
-    """
-    Raise RepositoryLimitError when the repository exceeds CloudWise
-    platform analysis limits (size, file count, single file, analysis time).
-    """
     limits = limits if limits is not None else get_repository_limits()
     nodes = _file_nodes(full_tree)
-
     total_bytes = 0
     largest_bytes = 0
     largest_path = ''
@@ -121,7 +116,6 @@ def check_repository_limits(full_tree, *, elapsed_seconds: float = 0.0, limits: 
         if size > largest_bytes:
             largest_bytes = size
             largest_path = node.get('path', '')
-
     max_bytes = int(limits['max_repository_size_mb']) * 1024 * 1024
     if total_bytes > max_bytes:
         raise RepositoryLimitError(
@@ -129,14 +123,12 @@ def check_repository_limits(full_tree, *, elapsed_seconds: float = 0.0, limits: 
             f"Repository size: {_format_size(total_bytes)}\n"
             f"Maximum supported size: {_format_mb_limit(int(limits['max_repository_size_mb']))}"
         )
-
     if len(nodes) > int(limits['max_files']):
         raise RepositoryLimitError(
             "Repository analysis limit reached.\n\n"
             f"Repository files: {len(nodes)}\n"
             f"Maximum supported files: {int(limits['max_files'])}"
         )
-
     max_single_bytes = int(limits['max_single_file_mb']) * 1024 * 1024
     if largest_bytes > max_single_bytes:
         raise RepositoryLimitError(
@@ -144,7 +136,6 @@ def check_repository_limits(full_tree, *, elapsed_seconds: float = 0.0, limits: 
             f"File size: {_format_size(largest_bytes)} ({largest_path})\n"
             f"Maximum supported single file size: {_format_mb_limit(int(limits['max_single_file_mb']))}"
         )
-
     max_seconds = int(limits['max_analysis_time_minutes']) * 60
     if elapsed_seconds > max_seconds:
         raise RepositoryLimitError(
@@ -154,24 +145,12 @@ def check_repository_limits(full_tree, *, elapsed_seconds: float = 0.0, limits: 
         )
 
 
-def _is_sensitive_env_filename(filename: str) -> bool:
-    """True for real secret files (.env, .env.local, ...) — never downloaded."""
-    return filename == '.env' or filename.startswith('.env.')
-
-
 def _is_analysis_file(path: str) -> bool:
-    """Whether a repository file should be downloaded for CloudWise analysis.
-
-    Environment templates (.env.example / .env.sample / .env.template) are
-    downloaded for variable-name detection. Sensitive .env files are never
-    downloaded.
-    """
     normalized = path.replace('\\', '/')
     filename = normalized.split('/')[-1].lower()
-
     if filename in ENV_TEMPLATE_FILENAMES:
         return True
-    if _is_sensitive_env_filename(filename):
+    if filename in _SENSITIVE_FILENAMES:
         return False
     if filename in _SUPPORTED_REPOSITORY_FILENAMES:
         return True
@@ -190,22 +169,27 @@ def _is_analysis_file(path: str) -> bool:
     return False
 
 
-def _repository_parts(repository):
-    return normalize_github_repo_url(repository)
+def _redact_secrets(content: str) -> str:
+    """Return a redacted copy — secret VALUES are replaced with [REDACTED]."""
+    return re.sub(
+        r'(?i)(secret|password|passwd|pass|token|api[_-]?key|access[_-]?key|private[_-]?key|credential|auth|bearer|client_secret|db_url|database_url|connection_string|aws_secret|stripe|sk_live|ghp_|gho_|github_pat_)\s*[=:]\s*["\']?[^\s"\',;}\]]+["\']?',
+        r'\1=[REDACTED]',
+        content,
+    )
+
+
+def _looks_like_secret_path(path: str) -> bool:
+    filename = path.strip('/').split('/')[-1].lower()
+    return filename in _SENSITIVE_FILENAMES
 
 
 def _walk_directory_contents(owner, repo, path, branch, token):
-    """
-    Fallback recursive directory walker using GitHub Contents API
-    when Git Trees API returns truncated = true.
-    """
     nodes = []
     encoded_path = urllib.parse.quote(path, safe='/')
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{encoded_path}?ref={urllib.parse.quote(branch)}"
     contents = _request_json(url, token, allow_404=True)
     if not isinstance(contents, list):
         return nodes
-
     for item in contents:
         item_path = item.get('path', '')
         item_type = item.get('type')
@@ -223,47 +207,100 @@ def _walk_directory_contents(owner, repo, path, branch, token):
                 'size': 0,
                 'sha': item.get('sha', ''),
             })
-            # Recurse subfolder
             sub_nodes = _walk_directory_contents(owner, repo, item_path, branch, token)
             nodes.extend(sub_nodes)
     return nodes
 
 
-def inspect_repository(token, repository):
+def _extract_commit_info(commit_info):
+    if not isinstance(commit_info, dict):
+        return '', '', '', ''
+    commit = commit_info.get('commit', {})
+    return (
+        commit_info.get('sha', ''),
+        commit.get('message', '')[:200] if commit.get('message') else '',
+        commit.get('author', {}).get('date', '') if isinstance(commit.get('author'), dict) else '',
+        commit_info.get('commit', {}).get('committer', {}).get('date', '') if isinstance(commit_info.get('commit', {}).get('committer'), dict) else '',
+    )
+
+
+def inspect_repository(token, repository, progress_callback=None):
     """
-    Fetch comprehensive recursive repository structure through GitHub's Git Trees API.
-    Handles truncated responses, access verification, and metadata calculation.
-    Enforces CloudWise platform repository analysis limits.
+    Inspect a real GitHub repository using the caller's own token.
+
+    Steps:
+      1. Validate repo format (owner/repo)
+      2. Fetch repository metadata
+      3. Verify access (private repos require the connected account)
+      4. Get latest commit
+      5. Fetch recursive tree
+      6. Download relevant file contents (with secrets redaction)
+      7. Return full analysis object
     """
     started_at = time.monotonic()
-    owner, repo_name, full_name = normalize_github_repo_url(repository)
+
+    def _progress(stage: str, message: str, pct: int):
+        if progress_callback is not None:
+            progress_callback(stage, message, pct)
+
+    _progress('validating', 'Validating repository format...', 0)
+    try:
+        owner, repo_name, full_name = normalize_github_repo_url(repository)
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+
     encoded_full_name = urllib.parse.quote(full_name, safe='/')
 
-    # 1. Verify GitHub repository access & obtain metadata
+    _progress('fetching_repo', 'Fetching repository metadata...', 10)
     repo_url = f"https://api.github.com/repos/{encoded_full_name}"
     repo_meta = _request_json(repo_url, token, allow_404=False)
     if not repo_meta or not isinstance(repo_meta, dict):
-        raise GitHubApiError(f"Unable to access repository '{full_name}'.", status_code=404)
+        raise GitHubApiError(
+            f"Unable to access repository '{full_name}'.", status_code=404
+        )
 
-    default_branch = (
-        (repository.get('default_branch') if isinstance(repository, dict) else None)
-        or repo_meta.get('default_branch')
-        or 'main'
-    )
+    if repo_meta.get('private') and not repo_meta.get('permissions', {}).get('pull', False):
+        try:
+            permissions_url = f"https://api.github.com/repos/{encoded_full_name}/collaborators/{owner}/permission"
+            perm = _request_json(permissions_url, token, allow_404=True)
+            if perm and perm.get('permission') in ('pull', 'triage', 'push', 'maintain', 'admin'):
+                pass
+            else:
+                raise GitHubApiError(
+                    f"Account does not have access to private repository '{full_name}'.",
+                    status_code=403, details='access_denied'
+                )
+        except GitHubApiError:
+            raise
+        except Exception as exc:
+            raise GitHubApiError(
+                f"Unable to verify access to private repository '{full_name}'.",
+                status_code=403, details=str(exc)
+            )
 
-    # 2. Get latest commit SHA for the branch
+    default_branch = repo_meta.get('default_branch') or 'main'
+    visibility = repo_meta.get('visibility', 'private' if repo_meta.get('private') else 'public')
+    language = repo_meta.get('language') or ''
+    size = repo_meta.get('size', 0)
+    description = repo_meta.get('description', '')
+    stargazers = repo_meta.get('stargazers_count', 0)
+    forks = repo_meta.get('forks_count', 0)
+    open_issues = repo_meta.get('open_issues_count', 0)
+
+    _progress('fetching_commit', 'Reading latest commit...', 25)
     commit_sha = ''
+    commit_message = ''
+    commit_date = ''
     commit_url = f"https://api.github.com/repos/{encoded_full_name}/commits/{urllib.parse.quote(default_branch)}"
     commit_info = _request_json(commit_url, token, allow_404=True)
     if isinstance(commit_info, dict):
-        commit_sha = commit_info.get('sha', '')
+        commit_sha, commit_message, commit_date, _ = _extract_commit_info(commit_info)
 
-    # 3. Fetch full recursive tree
+    _progress('fetching_tree', 'Reading repository tree...', 40)
     tree_url = (
         f'https://api.github.com/repos/{encoded_full_name}/git/trees/'
         f'{urllib.parse.quote(default_branch)}?recursive=1'
     )
-
     tree_data = _request_json(tree_url, token, allow_404=True)
     raw_tree = tree_data.get('tree', []) if isinstance(tree_data, dict) else []
     truncated = bool(tree_data.get('truncated')) if isinstance(tree_data, dict) else False
@@ -274,10 +311,9 @@ def inspect_repository(token, repository):
     if raw_tree:
         for node in raw_tree:
             path = node.get('path', '')
-            node_type = node.get('type', 'blob')  # 'blob' or 'tree'
+            node_type = node.get('type', 'blob')
             size = node.get('size', 0)
             sha = node.get('sha', '')
-
             is_dir = node_type in ('tree', 'dir', 'directory')
             full_tree.append({
                 'path': path,
@@ -285,11 +321,9 @@ def inspect_repository(token, repository):
                 'size': size if not is_dir else 0,
                 'sha': sha,
             })
-
             if not is_dir and _is_analysis_file(path):
                 target_paths_to_fetch.add(path)
 
-    # Fallback to Contents API if tree was truncated or empty
     if truncated or not full_tree:
         walked_nodes = _walk_directory_contents(owner, repo_name, "", default_branch, token)
         if walked_nodes:
@@ -298,28 +332,37 @@ def inspect_repository(token, repository):
                 if node['type'] == 'file' and _is_analysis_file(node['path']):
                     target_paths_to_fetch.add(node['path'])
 
-    total_files = len([node for node in full_tree if node.get('type') == 'file'])
-    total_directories = len([node for node in full_tree if node.get('type') in ('directory', 'folder')])
+    total_files = len([n for n in full_tree if n.get('type') == 'file'])
+    total_directories = len([n for n in full_tree if n.get('type') in ('directory', 'folder')])
 
-    # Enforce CloudWise platform analysis limits before downloading file contents
     check_repository_limits(full_tree, elapsed_seconds=time.monotonic() - started_at)
     repository_size = compute_repository_size(full_tree)
 
-    # Standard fallbacks if target_paths_to_fetch is empty
     if not target_paths_to_fetch:
         for fname in SUPPORTED_REPOSITORY_FILES:
             target_paths_to_fetch.add(fname)
 
-    # 4. Fetch contents of discovered target files for tech stack analysis
+    _progress('detecting_files', 'Detecting project files...', 55)
     found_files = {}
-    for path in target_paths_to_fetch:
-        filename = path.replace('\\', '/').split('/')[-1].lower()
-        if filename not in ENV_TEMPLATE_FILENAMES and _is_sensitive_env_filename(filename):
+    for path in sorted(target_paths_to_fetch):
+        if _looks_like_secret_path(path):
             continue
-        check_repository_limits(
-            full_tree,
-            elapsed_seconds=time.monotonic() - started_at,
+        filename = path.replace('\\', '/').split('/')[-1].lower()
+        is_target = (
+            filename in ENV_TEMPLATE_FILENAMES
+            or filename in _SUPPORTED_REPOSITORY_FILENAMES
+            or filename.startswith('dockerfile')
+            or filename.startswith('docker-compose')
+            or filename == 'manage.py'
+            or filename.startswith('vite.config')
+            or filename.startswith('next.config')
+            or filename.startswith('drizzle.config')
+            or filename == 'schema.prisma'
+            or path.startswith('.github/workflows/')
         )
+        if not is_target:
+            continue
+        check_repository_limits(full_tree, elapsed_seconds=time.monotonic() - started_at)
         encoded_path = urllib.parse.quote(path, safe='/')
         url = (
             f'https://api.github.com/repos/{encoded_full_name}/contents/'
@@ -328,23 +371,31 @@ def inspect_repository(token, repository):
         item = _request_json(url, token, allow_404=True)
         if item is None or not isinstance(item, dict) or item.get('type') != 'file':
             continue
-
         encoded_content = item.get('content')
         if not encoded_content:
             continue
-
         try:
             content = base64.b64decode(
-                encoded_content.replace('\n', '').encode(),
-                validate=True,
+                encoded_content.replace('\n', '').encode(), validate=True
             ).decode('utf-8')
-            found_files[path] = content
+            redacted = _redact_secrets(content)
+            found_files[path] = redacted
         except (ValueError, UnicodeDecodeError):
             pass
 
+    _progress('analyzing', 'Analyzing project structure...', 75)
     has_dockerfile = any(p.lower().endswith('dockerfile') for p in found_files.keys())
     has_compose = any('docker-compose' in p.lower() for p in found_files.keys())
     has_cicd = any('.github/workflows' in p.lower() for p in found_files.keys())
+    has_readme = any(p.lower() == 'readme.md' for p in found_files.keys())
+    has_env_example = any(p.lower().startswith('.env.') or p.lower() == '.env.example' for p in found_files.keys())
+
+    env_files = sorted(
+        p for p in found_files.keys()
+        if p.lower().endswith(('.env', '.env.example', '.env.sample', '.env.template', '.env.local'))
+    )
+
+    _progress('scanning_complete', 'Scan completed.', 100)
 
     return {
         'repository': {
@@ -352,9 +403,18 @@ def inspect_repository(token, repository):
             'name': repo_name,
             'full_name': full_name,
             'defaultBranch': default_branch,
+            'visibility': visibility,
+            'language': language,
+            'description': description,
+            'sizeMb': size,
+            'stargazersCount': stargazers,
+            'forksCount': forks,
+            'openIssuesCount': open_issues,
         },
         'branch': default_branch,
         'commitSha': commit_sha,
+        'commitMessage': commit_message,
+        'commitDate': commit_date,
         'tree': full_tree,
         'files': found_files,
         'totalFiles': total_files,
@@ -365,5 +425,6 @@ def inspect_repository(token, repository):
         'has_dockerfile': has_dockerfile,
         'has_compose': has_compose,
         'has_cicd': has_cicd,
+        'has_readme': has_readme,
+        'env_files_detected': env_files,
     }
-

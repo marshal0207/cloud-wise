@@ -15,6 +15,7 @@ RUNNING       — Deployment is live and healthy.
 FAILED        — Deployment encountered an unrecoverable error.
 ROLLING_BACK  — Rollback is in progress.
 ROLLED_BACK   — Rollback completed successfully.
+TERMINATED    — The EC2 instance was terminated by its owner.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ class DeploymentStatus:
     FAILED = "FAILED"
     ROLLING_BACK = "ROLLING_BACK"
     ROLLED_BACK = "ROLLED_BACK"
+    TERMINATED = "TERMINATED"
 
     ALL: tuple[str, ...] = (
         QUEUED,
@@ -41,6 +43,7 @@ class DeploymentStatus:
         FAILED,
         ROLLING_BACK,
         ROLLED_BACK,
+        TERMINATED,
     )
 
 
@@ -76,10 +79,20 @@ _VALID_TRANSITIONS: dict[str, set[str]] = {
     DeploymentStatus.BUILDING: {DeploymentStatus.DEPLOYING, DeploymentStatus.FAILED},
     DeploymentStatus.DEPLOYING: {DeploymentStatus.HEALTH_CHECK, DeploymentStatus.FAILED},
     DeploymentStatus.HEALTH_CHECK: {DeploymentStatus.RUNNING, DeploymentStatus.FAILED},
-    DeploymentStatus.RUNNING: {DeploymentStatus.ROLLING_BACK, DeploymentStatus.FAILED},
-    DeploymentStatus.FAILED: {DeploymentStatus.ROLLING_BACK},
+    DeploymentStatus.RUNNING: {
+        DeploymentStatus.ROLLING_BACK,
+        DeploymentStatus.FAILED,
+        DeploymentStatus.TERMINATED,
+    },
+    DeploymentStatus.FAILED: {
+        DeploymentStatus.ROLLING_BACK,
+        DeploymentStatus.TERMINATED,
+    },
     DeploymentStatus.ROLLING_BACK: {DeploymentStatus.ROLLED_BACK, DeploymentStatus.FAILED},
-    DeploymentStatus.ROLLED_BACK: set(),  # terminal state
+    DeploymentStatus.ROLLED_BACK: {
+        DeploymentStatus.TERMINATED,
+    },
+    DeploymentStatus.TERMINATED: set(),  # terminal state
 }
 
 

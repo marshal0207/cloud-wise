@@ -1,453 +1,669 @@
 """
-Tests for real deployment management endpoints.
+Tests for the deployment management endpoints.
 
-These tests verify that the deployment status, logs, health, and
-rollback endpoints use real provider APIs (or return stored data)
-instead of mock/simulated responses, and that ownership is enforced.
+The endpoints are the production surface for the AWS EC2 pipeline:
 
-Covers:
-  - deployment_status_view returns stored status when no record found
-  - deployment_status_view uses Vercel API when provider is VERCEL
-  - deployment_status_view uses Render API when provider is RENDER
-  - deployment_logs_view returns stored logs from DeploymentRecord
-  - deployment_health_view performs real HTTP health check
-  - deployment_health_view handles no endpoint URL
-  - deployment_fail_view marks record as FAILED
-  - deployment_rollback_view requires provider credentials
-  - No SIMULATED/mock responses in production endpoints
-  - Endpoints require authentication + record ownership
+    GET  /api/deployments                      — my deployments
+    GET  /api/deployments/<id>                 — full details
+    GET  /api/deployments/<id>/status          — live status
+    GET  /api/deployments/<id>/logs            — structured logs
+    POST /api/deployments/<id>/health          — real HTTP health check
+    POST /api/deployments/<id>/retry           — rerun a failed deploy
+    POST /api/deployments/<id>/terminate       — terminate my EC2 instance
+    POST /api/deployments/<id>/rollback        — stop app, keep instance
+
+What is verified here:
+  - every endpoint requires authentication and is scoped to the owner
+  - status is either the record's own state or a live EC2 query — never
+    a simulated response
+  - health performs a real HTTP request and reports the real status code
+  - rollback / terminate only run against the user's own AWS account
+  - error paths return actionable, stage-tagged responses
 """
 
 import json
-from unittest.mock import patch, MagicMock
-from django.test import TestCase, RequestFactory
-from rest_framework.test import force_authenticate
-from api.models import DeploymentRecord, CustomUser
+from unittest.mock import MagicMock, patch
+
+from django.contrib.auth import get_user_model
+from django.test import TestCase
+from rest_framework.test import APIClient
+
+from api.models import AWSConnection, DeploymentRecord
+from api.services.deployment.aws_ec2_provider import AwsEc2Error
+from api.services.deployment.status import DeploymentStatus
+
+User = get_user_model()
 
 
-def _authed_request(factory, method, path, user, **kwargs):
-    """Build an authenticated DRF request via RequestFactory + force_authenticate."""
-    request = getattr(factory, method)(path, **kwargs)
-    force_authenticate(request, user=user)
-    return request
+def _make_record(user, **overrides):
+    defaults = {
+        "environment_name": "prod",
+        "provider": "AWS",
+        "provider_deployment_id": "i-abc123",
+        "instance_id": "i-abc123",
+        "instance_type": "t3.micro",
+        "aws_account_id": "999988887777",
+        "repository": "demo/hello-world",
+        "commit_sha": "0123456789abcdef",
+        "project_type": "Node.js Web Application",
+        "region": "ap-south-1",
+        "deployment_status": DeploymentStatus.RUNNING,
+        "ip_address": "13.232.1.10",
+        "live_url": "http://13.232.1.10",
+        "logs": [],
+    }
+    defaults.update(overrides)
+    return DeploymentRecord.objects.create(user=user, **defaults)
+
+
+def _make_connection(user, status="active"):
+    return AWSConnection.objects.create(
+        user=user,
+        role_arn="arn:aws:iam::999988887777:role/CloudWiseDeployRole",
+        external_id="cloudwise-test",
+        account_id="999988887777",
+        region="ap-south-1",
+        status=status,
+    )
 
 
 class DeploymentStatusViewTest(TestCase):
-    """Tests for the real deployment_status_view."""
+    """GET /api/deployments/<id>/status reports real state only."""
 
     def setUp(self):
-        self.factory = RequestFactory()
-        self.user = CustomUser.objects.create_user(
-            username='teststatus', email='status@test.com', password='Test1234'
+        self.client = APIClient()
+        self.user = User.objects.create_user(
+            username="statusowner", password="Test1234", email="status@test.com"
         )
-        self.other_user = CustomUser.objects.create_user(
-            username='otherstatus', email='other@test.com', password='Test1234'
+        self.other_user = User.objects.create_user(
+            username="statusintruder", password="Test1234", email="other@test.com"
         )
-        self.record = DeploymentRecord.objects.create(
-            user=self.user,
-            environment_name='test-prod',
-            provider='VERCEL',
-            provider_deployment_id='dpl_abc123',
-            provider_project_id='prj_xyz789',
-            status='RUNNING',
-            endpoint_url='https://my-app.vercel.app',
+        self.connection = _make_connection(self.user)
+        self.record = _make_record(
+            self.user,
+            provider_deployment_id="i-status1",
+            instance_id="i-status1",
             logs=[{
-                'timestamp': '2026-01-01T00:00:00Z',
-                'level': 'INFO',
-                'stage': 'COMPLETED',
-                'message': 'Vercel deployment dpl_abc123 — state: READY',
+                "timestamp": "2026-01-01T00:00:00Z",
+                "level": "INFO",
+                "stage": "COMPLETED",
+                "message": "Deployment RUNNING: application live at http://13.232.1.10.",
             }],
         )
 
     def test_requires_authentication(self):
-        from api.views import deployment_status_view
-        request = self.factory.get('/api/deployments/dpl_abc123/status')
-        response = deployment_status_view(request, 'dpl_abc123')
+        response = APIClient().get("/api/deployments/i-status1/status")
         self.assertIn(response.status_code, (401, 403))
 
     def test_rejects_non_owner(self):
-        from api.views import deployment_status_view
-        request = _authed_request(
-            self.factory, 'get',
-            '/api/deployments/dpl_abc123/status',
-            self.other_user,
+        self.client.force_authenticate(user=self.other_user)
+        self.assertEqual(
+            self.client.get("/api/deployments/i-status1/status").status_code, 404
         )
-        response = deployment_status_view(request, 'dpl_abc123')
-        self.assertEqual(response.status_code, 404)
 
     def test_missing_deployment_returns_404(self):
-        from api.views import deployment_status_view
-        request = _authed_request(
-            self.factory, 'get',
-            '/api/deployments/nonexistent/status',
-            self.user,
-        )
-        response = deployment_status_view(request, 'nonexistent')
+        self.client.force_authenticate(user=self.user)
+        response = self.client.get("/api/deployments/nope/status")
         self.assertEqual(response.status_code, 404)
-        self.assertFalse(response.data['success'])
+        self.assertFalse(response.data["success"])
 
-    def test_vercel_deployment_returns_stored_status_without_credentials(self):
-        from api.views import deployment_status_view
-        request = _authed_request(
-            self.factory, 'get',
-            '/api/deployments/dpl_abc123/status',
-            self.user,
+    @patch("api.views.AwsEc2Provider")
+    def test_in_flight_deployment_reports_record_state_without_aws_call(
+        self, mock_provider_cls
+    ):
+        DeploymentRecord.objects.filter(pk=self.record.pk).update(
+            deployment_status=DeploymentStatus.DEPLOYING, live_url=None
         )
-        with patch('api.views.settings') as mock_settings:
-            mock_settings.VERCEL_TOKEN = ''
-            mock_settings.VERCEL_TEAM_ID = ''
-            response = deployment_status_view(request, 'dpl_abc123')
+        self.client.force_authenticate(user=self.user)
+        response = self.client.get("/api/deployments/i-status1/status")
+
         self.assertEqual(response.status_code, 200)
-        self.assertTrue(response.data['success'])
-        self.assertEqual(response.data['data']['status'], 'RUNNING')
-        self.assertEqual(response.data['data']['endpoint_url'], 'https://my-app.vercel.app')
-        self.assertEqual(response.data['data']['provider_type'], 'VERCEL')
+        data = response.data["data"]
+        self.assertEqual(data["deploymentStatus"], "DEPLOYING")
+        self.assertTrue(data["pipelineInFlight"])
+        self.assertEqual(data["progress"], 70)
+        self.assertEqual(data["liveUrl"], "")
+        mock_provider_cls.assert_not_called()
 
-    def test_vercel_deployment_queries_real_api(self):
-        from api.views import deployment_status_view
-        request = _authed_request(
-            self.factory, 'get',
-            '/api/deployments/dpl_abc123/status',
-            self.user,
-        )
-        mock_vercel_response = {
-            'readyState': 'READY',
-            'url': 'my-app-abc123.vercel.app',
+    @patch("api.views.AwsEc2Provider")
+    def test_status_queries_live_ec2(self, mock_provider_cls):
+        mock_provider = MagicMock()
+        mock_provider.get_status.return_value = {
+            "deployment_id": "i-status1",
+            "status": "RUNNING",
+            "progress": 100,
+            "provider_type": "AWS",
+            "ip_address": "13.232.1.10",
+            "instance_state": "running",
+            "region": "ap-south-1",
+            "message": "EC2 instance i-status1 is running at 13.232.1.10",
         }
-        with patch('api.views.settings') as mock_settings:
-            mock_settings.VERCEL_TOKEN = 'fake-token-for-test'
-            mock_settings.VERCEL_TEAM_ID = ''
-            with patch('api.views.VercelDeploymentService') as MockSvc:
-                mock_instance = MagicMock()
-                mock_instance.get_deployment_status.return_value = mock_vercel_response
-                MockSvc.return_value = mock_instance
-                response = deployment_status_view(request, 'dpl_abc123')
-        self.assertEqual(response.status_code, 200)
-        self.assertTrue(response.data['success'])
-        self.assertEqual(response.data['data']['status'], 'RUNNING')
-        self.assertIn('vercel.app', response.data['data']['endpoint_url'])
+        mock_provider_cls.return_value = mock_provider
+        self.client.force_authenticate(user=self.user)
 
-    def test_vercel_error_returns_stored_status(self):
-        from api.views import deployment_status_view
-        from api.services.deployment.vercel_provider import VercelApiError
-        request = _authed_request(
-            self.factory, 'get',
-            '/api/deployments/dpl_abc123/status',
-            self.user,
-        )
-        with patch('api.views.settings') as mock_settings:
-            mock_settings.VERCEL_TOKEN = 'fake-token'
-            mock_settings.VERCEL_TEAM_ID = ''
-            with patch('api.views.VercelDeploymentService') as MockSvc:
-                mock_instance = MagicMock()
-                mock_instance.get_deployment_status.side_effect = VercelApiError('API limit')
-                MockSvc.return_value = mock_instance
-                response = deployment_status_view(request, 'dpl_abc123')
-        self.assertEqual(response.status_code, 200)
-        self.assertTrue(response.data['success'])
-        self.assertEqual(response.data['data']['status'], 'RUNNING')
+        response = self.client.get("/api/deployments/i-status1/status")
 
-    def test_render_deployment_returns_stored_status_without_credentials(self):
-        render_record = DeploymentRecord.objects.create(
-            user=self.user,
-            environment_name='render-test',
-            provider='RENDER',
-            provider_deployment_id='rdp_456',
-            provider_project_id='srv_789',
-            status='RUNNING',
-            endpoint_url='https://my-app.onrender.com',
-        )
-        from api.views import deployment_status_view
-        request = _authed_request(
-            self.factory, 'get',
-            '/api/deployments/rdp_456/status',
-            self.user,
-        )
-        with patch('api.views.settings') as mock_settings:
-            mock_settings.RENDER_API_KEY = ''
-            mock_settings.RENDER_OWNER_ID = ''
-            response = deployment_status_view(request, 'rdp_456')
         self.assertEqual(response.status_code, 200)
-        self.assertTrue(response.data['success'])
-        self.assertEqual(response.data['data']['status'], 'RUNNING')
-        self.assertEqual(response.data['data']['provider_type'], 'RENDER')
+        data = response.data["data"]
+        self.assertEqual(data["deploymentStatus"], "RUNNING")
+        self.assertEqual(data["instanceState"], "running")
+        self.assertEqual(data["providerType"], "AWS")
+        self.assertEqual(data["repository"], "demo/hello-world")
+        self.assertEqual(data["liveUrl"], "http://13.232.1.10")
+        mock_provider.get_status.assert_called_once_with("i-status1")
 
-    def test_no_simulated_field_in_response(self):
-        from api.views import deployment_status_view
-        request = _authed_request(
-            self.factory, 'get',
-            '/api/deployments/dpl_abc123/status',
-            self.user,
+    @patch("api.views.AwsEc2Provider")
+    def test_status_falls_back_to_stored_when_disconnected(self, mock_provider_cls):
+        self.connection.status = "pending"
+        self.connection.save()
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.get("/api/deployments/i-status1/status")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.data["data"]
+        self.assertEqual(data["deploymentStatus"], "RUNNING")
+        self.assertEqual(data["instanceId"], "i-status1")
+        self.assertIn("stored status", data["message"])
+        mock_provider_cls.assert_not_called()
+
+    @patch("api.views.AwsEc2Provider")
+    def test_status_falls_back_to_stored_on_aws_error(self, mock_provider_cls):
+        mock_provider = MagicMock()
+        mock_provider.get_status.side_effect = AwsEc2Error("AccessDenied on ec2")
+        mock_provider_cls.return_value = mock_provider
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.get("/api/deployments/i-status1/status")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.data["data"]
+        self.assertEqual(data["deploymentStatus"], "RUNNING")
+        self.assertIn("AWS EC2 error", data["message"])
+
+    @patch("api.views.AwsEc2Provider")
+    def test_no_simulated_field_in_response(self, mock_provider_cls):
+        mock_provider = MagicMock()
+        mock_provider.get_status.return_value = {
+            "instance_state": "running",
+            "ip_address": "13.232.1.10",
+            "region": "ap-south-1",
+            "message": "ok",
+        }
+        mock_provider_cls.return_value = mock_provider
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.get("/api/deployments/i-status1/status")
+        blob = json.dumps(response.data)
+        self.assertNotIn("SIMULATED", blob)
+        self.assertNotIn("simulated", blob)
+        self.assertNotIn("mock_deployment_id", blob)
+
+
+class DeploymentDetailAndListTest(TestCase):
+    """GET /api/deployments and /api/deployments/<id>."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.user = User.objects.create_user(
+            username="detailuser", password="Test1234", email="detail@test.com"
         )
-        with patch('api.views.settings') as mock_settings:
-            mock_settings.VERCEL_TOKEN = ''
-            mock_settings.VERCEL_TEAM_ID = ''
-            response = deployment_status_view(request, 'dpl_abc123')
-        data_str = json.dumps(response.data)
-        self.assertNotIn('SIMULATED', data_str)
-        self.assertNotIn('simulated', data_str)
-        self.assertNotIn('mock', data_str.lower().replace('mock_deployment_id', ''))
+        self.other_user = User.objects.create_user(
+            username="detailother", password="Test1234", email="dother@test.com"
+        )
+        self.record = _make_record(self.user)
+
+    def test_requires_authentication(self):
+        anonymous = APIClient()
+        self.assertEqual(anonymous.get("/api/deployments").status_code, 401)
+        self.assertEqual(anonymous.get(f"/api/deployments/{self.record.pk}").status_code, 401)
+
+    def test_list_is_scoped_to_the_calling_user(self):
+        _make_record(self.other_user, provider_deployment_id="i-other9")
+
+        self.client.force_authenticate(user=self.user)
+        response = self.client.get("/api/deployments")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["total"], 1)
+        self.assertEqual(response.data["data"][0]["id"], str(self.record.pk))
+        # list responses omit the (potentially large) log payload
+        self.assertNotIn("logs", response.data["data"][0])
+        self.assertIn("logCount", response.data["data"][0])
+
+    def test_detail_returns_canonical_fields(self):
+        self.client.force_authenticate(user=self.user)
+        response = self.client.get(f"/api/deployments/{self.record.pk}")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.data["data"]
+        expected = {
+            "id": str(self.record.pk),
+            "repository": "demo/hello-world",
+            "commitSha": "0123456789abcdef",
+            "projectType": "Node.js Web Application",
+            "awsAccountId": "999988887777",
+            "region": "ap-south-1",
+            "instanceId": "i-abc123",
+            "instanceType": "t3.micro",
+            "deploymentStatus": "RUNNING",
+            "liveUrl": "http://13.232.1.10",
+            "provider": "AWS",
+            "ipAddress": "13.232.1.10",
+            "progress": 100,
+            "openUrl": "http://13.232.1.10",
+        }
+        for key, value in expected.items():
+            self.assertEqual(data[key], value, key)
+        self.assertIn("createdAt", data)
+        self.assertIn("updatedAt", data)
+        self.assertIn("logs", data)
+
+    def test_detail_hidden_from_non_owner(self):
+        self.client.force_authenticate(user=self.other_user)
+        self.assertEqual(
+            self.client.get(f"/api/deployments/{self.record.pk}").status_code, 404
+        )
 
 
 class DeploymentLogsViewTest(TestCase):
-    """Tests for the real deployment_logs_view."""
+    """GET /api/deployments/<id>/logs returns the stored structured logs."""
 
     def setUp(self):
-        self.factory = RequestFactory()
-        self.user = CustomUser.objects.create_user(
-            username='testlogs', email='logs@test.com', password='Test1234'
+        self.client = APIClient()
+        self.user = User.objects.create_user(
+            username="logsowner", password="Test1234", email="logs@test.com"
         )
-        self.record = DeploymentRecord.objects.create(
-            user=self.user,
-            environment_name='logs-test',
-            provider='VERCEL',
-            provider_deployment_id='dpl_logs1',
-            status='RUNNING',
-            endpoint_url='https://app.vercel.app',
+        self.intruder = User.objects.create_user(
+            username="logsintruder", password="Test1234", email="lintruder@test.com"
+        )
+        self.record = _make_record(
+            self.user,
+            provider_deployment_id="i-logs1",
+            instance_id="i-logs1",
             logs=[{
-                'timestamp': '2026-01-01T00:00:00Z',
-                'level': 'INFO',
-                'stage': 'COMPLETED',
-                'message': 'Deployment complete',
+                "timestamp": "2026-01-01T00:00:00Z",
+                "level": "INFO",
+                "stage": "COMPLETED",
+                "message": "Deployment complete",
             }],
         )
 
     def test_requires_authentication(self):
-        from api.views import deployment_logs_view
-        request = self.factory.get('/api/deployments/dpl_logs1/logs')
-        response = deployment_logs_view(request, 'dpl_logs1')
-        self.assertIn(response.status_code, (401, 403))
+        self.assertEqual(APIClient().get("/api/deployments/i-logs1/logs").status_code, 401)
 
     def test_missing_deployment_returns_404(self):
-        from api.views import deployment_logs_view
-        request = _authed_request(
-            self.factory, 'get',
-            '/api/deployments/nonexistent/logs',
-            self.user,
+        self.client.force_authenticate(user=self.user)
+        self.assertEqual(
+            self.client.get("/api/deployments/nonexistent/logs").status_code, 404
         )
-        response = deployment_logs_view(request, 'nonexistent')
-        self.assertEqual(response.status_code, 404)
+
+    def test_hidden_from_non_owner(self):
+        self.client.force_authenticate(user=self.intruder)
+        self.assertEqual(
+            self.client.get("/api/deployments/i-logs1/logs").status_code, 404
+        )
 
     def test_returns_stored_logs(self):
-        from api.views import deployment_logs_view
-        request = _authed_request(
-            self.factory, 'get',
-            '/api/deployments/dpl_logs1/logs',
-            self.user,
-        )
-        response = deployment_logs_view(request, 'dpl_logs1')
+        self.client.force_authenticate(user=self.user)
+        response = self.client.get("/api/deployments/i-logs1/logs")
+
         self.assertEqual(response.status_code, 200)
-        self.assertTrue(response.data['success'])
-        self.assertEqual(len(response.data['data']), 1)
-        self.assertEqual(response.data['data'][0]['message'], 'Deployment complete')
+        self.assertTrue(response.data["success"])
+        self.assertEqual(len(response.data["data"]), 1)
+        self.assertEqual(response.data["data"][0]["message"], "Deployment complete")
 
     def test_no_simulated_logs(self):
-        from api.views import deployment_logs_view
-        request = _authed_request(
-            self.factory, 'get',
-            '/api/deployments/dpl_logs1/logs',
-            self.user,
-        )
-        response = deployment_logs_view(request, 'dpl_logs1')
-        for log_entry in response.data['data']:
-            self.assertNotIn('SIMULATED', log_entry.get('message', ''))
+        self.client.force_authenticate(user=self.user)
+        response = self.client.get("/api/deployments/i-logs1/logs")
+        for entry in response.data["data"]:
+            self.assertNotIn("SIMULATED", entry.get("message", ""))
+            self.assertNotIn("mock", entry.get("message", "").lower())
 
 
 class DeploymentHealthViewTest(TestCase):
-    """Tests for the real deployment_health_view."""
+    """POST /api/deployments/<id>/health performs a real HTTP request."""
 
     def setUp(self):
-        self.factory = RequestFactory()
-        self.user = CustomUser.objects.create_user(
-            username='testhealth', email='health@test.com', password='Test1234'
+        self.client = APIClient()
+        self.user = User.objects.create_user(
+            username="healthowner", password="Test1234", email="health@test.com"
         )
-        self.record = DeploymentRecord.objects.create(
-            user=self.user,
-            environment_name='health-test',
-            provider='VERCEL',
-            provider_deployment_id='dpl_health1',
-            status='RUNNING',
-            endpoint_url='https://httpbin.org/get',
+        self.intruder = User.objects.create_user(
+            username="healthintruder", password="Test1234", email="hintruder@test.com"
+        )
+        self.record = _make_record(
+            self.user,
+            provider_deployment_id="i-health1",
+            instance_id="i-health1",
+            live_url="https://httpbin.org/get",
         )
 
     def test_requires_authentication(self):
-        from api.views import deployment_health_view
-        request = self.factory.post('/api/deployments/dpl_health1/health')
-        response = deployment_health_view(request, 'dpl_health1')
-        self.assertIn(response.status_code, (401, 403))
+        self.assertEqual(
+            APIClient().post("/api/deployments/i-health1/health").status_code, 401
+        )
+
+    def test_hidden_from_non_owner(self):
+        self.client.force_authenticate(user=self.intruder)
+        self.assertEqual(
+            self.client.post("/api/deployments/i-health1/health").status_code, 404
+        )
 
     def test_missing_deployment_returns_404(self):
-        from api.views import deployment_health_view
-        request = _authed_request(
-            self.factory, 'post',
-            '/api/deployments/nonexistent/health',
-            self.user,
+        self.client.force_authenticate(user=self.user)
+        self.assertEqual(
+            self.client.post("/api/deployments/nonexistent/health").status_code, 404
         )
-        response = deployment_health_view(request, 'nonexistent')
-        self.assertEqual(response.status_code, 404)
 
-    def test_no_endpoint_url_returns_unhealthy(self):
-        record = DeploymentRecord.objects.create(
-            user=self.user,
-            environment_name='no-url',
-            provider='VERCEL',
-            provider_deployment_id='dpl_nourl',
-            status='BUILDING',
-            endpoint_url=None,
-        )
-        from api.views import deployment_health_view
-        request = _authed_request(
-            self.factory, 'post',
-            '/api/deployments/dpl_nourl/health',
-            self.user,
-        )
-        response = deployment_health_view(request, 'dpl_nourl')
+    def test_no_live_url_returns_unhealthy(self):
+        DeploymentRecord.objects.filter(pk=self.record.pk).update(live_url=None)
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.post("/api/deployments/i-health1/health")
+
         self.assertEqual(response.status_code, 200)
-        self.assertFalse(response.data['data']['healthy'])
+        self.assertFalse(response.data["data"]["healthy"])
+        self.assertIsNone(response.data["data"]["detail"]["httpStatus"])
+        self.assertIn("No live URL", response.data["data"]["message"])
 
-    def test_health_check_does_real_http_request(self):
-        from api.views import deployment_health_view
-        request = _authed_request(
-            self.factory, 'post',
-            '/api/deployments/dpl_health1/health',
-            self.user,
-        )
+    @patch("api.views.urllib.request.urlopen")
+    def test_health_check_does_real_http_request(self, mock_urlopen):
         mock_response = MagicMock()
         mock_response.status = 200
-        with patch('api.views.urllib.request.urlopen') as mock_urlopen:
-            mock_urlopen.return_value.__enter__ = lambda s: mock_response
-            mock_urlopen.return_value.__exit__ = MagicMock(return_value=False)
-            response = deployment_health_view(request, 'dpl_health1')
+        mock_urlopen.return_value.__enter__ = lambda s: mock_response
+        mock_urlopen.return_value.__exit__ = MagicMock(return_value=False)
+
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post("/api/deployments/i-health1/health")
+
         self.assertEqual(response.status_code, 200)
-        self.assertTrue(response.data['success'])
-        self.assertTrue(response.data['data']['healthy'])
-        self.assertEqual(response.data['data']['detail']['http_status'], 200)
+        self.assertTrue(response.data["success"])
+        self.assertTrue(response.data["data"]["healthy"])
+        self.assertEqual(response.data["data"]["detail"]["httpStatus"], 200)
+        self.assertEqual(
+            response.data["data"]["detail"]["url"], "https://httpbin.org/get"
+        )
+        # a real request was issued against the stored live URL
+        requested_url = mock_urlopen.call_args[0][0].full_url
+        self.assertEqual(requested_url, "https://httpbin.org/get")
 
     def test_health_check_handles_connection_failure(self):
-        record = DeploymentRecord.objects.create(
-            user=self.user,
-            environment_name='fail-url',
-            provider='VERCEL',
-            provider_deployment_id='dpl_fail',
-            status='RUNNING',
-            endpoint_url='https://nonexistent-domain-12345.example.com',
+        DeploymentRecord.objects.filter(pk=self.record.pk).update(
+            live_url="https://nonexistent-domain-12345.example.com"
         )
-        from api.views import deployment_health_view
-        request = _authed_request(
-            self.factory, 'post',
-            '/api/deployments/dpl_fail/health',
-            self.user,
-        )
-        response = deployment_health_view(request, 'dpl_fail')
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.post("/api/deployments/i-health1/health")
+
         self.assertEqual(response.status_code, 200)
-        self.assertFalse(response.data['data']['healthy'])
-        self.assertIn('error', response.data['data']['detail'])
+        self.assertFalse(response.data["data"]["healthy"])
+        self.assertIn("error", response.data["data"]["detail"])
 
 
-class DeploymentFailViewTest(TestCase):
-    """Tests for the deployment_fail_view (test endpoint)."""
+class DeploymentRetryViewTest(TestCase):
+    """POST /api/deployments/<id>/retry is only valid for failed records."""
 
     def setUp(self):
-        self.factory = RequestFactory()
-        self.user = CustomUser.objects.create_user(
-            username='testfail', email='fail@test.com', password='Test1234'
+        self.client = APIClient()
+        self.user = User.objects.create_user(
+            username="retryowner", password="Test1234", email="retry@test.com"
         )
-        self.record = DeploymentRecord.objects.create(
-            user=self.user,
-            environment_name='fail-test',
-            provider='VERCEL',
-            provider_deployment_id='dpl_fail1',
-            status='RUNNING',
-            endpoint_url='https://app.vercel.app',
+        self.intruder = User.objects.create_user(
+            username="retryintruder", password="Test1234", email="rintruder@test.com"
+        )
+        self.record = _make_record(
+            self.user,
+            provider_deployment_id="i-retry1",
+            instance_id="i-retry1",
+            deployment_status=DeploymentStatus.FAILED,
         )
 
     def test_requires_authentication(self):
-        from api.views import deployment_fail_view
-        request = self.factory.post('/api/deployments/dpl_fail1/fail')
-        response = deployment_fail_view(request, 'dpl_fail1')
-        self.assertIn(response.status_code, (401, 403))
-
-    def test_marks_record_as_failed(self):
-        from api.views import deployment_fail_view
-        request = _authed_request(
-            self.factory, 'post',
-            '/api/deployments/dpl_fail1/fail',
-            self.user,
-            data=json.dumps({'reason': 'Quota exceeded'}),
-            content_type='application/json',
+        self.assertEqual(
+            APIClient().post("/api/deployments/i-retry1/retry").status_code, 401
         )
-        response = deployment_fail_view(request, 'dpl_fail1')
+
+    def test_hidden_from_non_owner(self):
+        self.client.force_authenticate(user=self.intruder)
+        self.assertEqual(
+            self.client.post("/api/deployments/i-retry1/retry", {}, format="json").status_code,
+            404,
+        )
+
+    def test_missing_deployment_returns_404(self):
+        self.client.force_authenticate(user=self.user)
+        self.assertEqual(
+            self.client.post("/api/deployments/nonexistent/retry", {}, format="json").status_code,
+            404,
+        )
+
+    def test_retry_rejected_while_healthy(self):
+        DeploymentRecord.objects.filter(pk=self.record.pk).update(
+            deployment_status=DeploymentStatus.RUNNING
+        )
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.post("/api/deployments/i-retry1/retry", {}, format="json")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(response.data["success"])
+        self.assertEqual(response.data["currentStatus"], "RUNNING")
+
+
+class DeploymentTerminateViewTest(TestCase):
+    """POST /api/deployments/<id>/terminate runs in the user's own AWS account."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.user = User.objects.create_user(
+            username="termowner", password="Test1234", email="term@test.com"
+        )
+        self.intruder = User.objects.create_user(
+            username="termintruder", password="Test1234", email="tintruder@test.com"
+        )
+        self.connection = _make_connection(self.user)
+        self.record = _make_record(
+            self.user,
+            provider_deployment_id="i-term1",
+            instance_id="i-term1",
+        )
+
+    def test_requires_authentication(self):
+        self.assertEqual(
+            APIClient().post("/api/deployments/i-term1/terminate").status_code, 401
+        )
+
+    def test_hidden_from_non_owner(self):
+        self.client.force_authenticate(user=self.intruder)
+        self.assertEqual(
+            self.client.post("/api/deployments/i-term1/terminate").status_code, 404
+        )
+
+    def test_missing_deployment_returns_404(self):
+        self.client.force_authenticate(user=self.user)
+        self.assertEqual(
+            self.client.post("/api/deployments/nonexistent/terminate").status_code, 404
+        )
+
+    def test_without_instance_returns_400(self):
+        DeploymentRecord.objects.filter(pk=self.record.pk).update(instance_id="")
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.post("/api/deployments/i-term1/terminate")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["stage"], "AWS")
+
+    def test_without_aws_connection_returns_503(self):
+        self.connection.status = "pending"
+        self.connection.save()
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.post("/api/deployments/i-term1/terminate")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.data["connectUrl"], "/connect-aws")
+
+    @patch("api.views.AwsEc2Provider")
+    def test_already_terminated_returns_409(self, mock_provider_cls):
+        DeploymentRecord.objects.filter(pk=self.record.pk).update(
+            deployment_status=DeploymentStatus.TERMINATED
+        )
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.post("/api/deployments/i-term1/terminate")
+
+        self.assertEqual(response.status_code, 409)
+        mock_provider_cls.assert_not_called()
+
+    @patch("api.views.AwsEc2Provider")
+    def test_terminate_marks_record_terminated(self, mock_provider_cls):
+        mock_provider = MagicMock()
+        mock_provider.terminate_instance.return_value = {
+            "instance_id": "i-term1",
+            "region": "ap-south-1",
+            "message": "EC2 instance i-term1 terminated.",
+            "logs": [{
+                "timestamp": "2026-01-01T00:00:00Z",
+                "level": "INFO",
+                "stage": "COMPLETED",
+                "message": "EC2 instance i-term1 terminated.",
+            }],
+        }
+        mock_provider_cls.return_value = mock_provider
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.post("/api/deployments/i-term1/terminate")
+
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data['data']['status'], 'FAILED')
+        self.assertEqual(response.data["data"]["deploymentStatus"], "TERMINATED")
+        self.assertEqual(response.data["data"]["instanceId"], "i-term1")
+        mock_provider.terminate_instance.assert_called_once_with("i-term1")
         self.record.refresh_from_db()
-        self.assertEqual(self.record.status, 'FAILED')
+        self.assertEqual(self.record.deployment_status, "TERMINATED")
+        self.assertTrue(self.record.logs)
+
+    @patch("api.views.AwsEc2Provider")
+    def test_terminate_aws_failure_returns_502(self, mock_provider_cls):
+        mock_provider = MagicMock()
+        mock_provider.terminate_instance.side_effect = AwsEc2Error(
+            "Instance i-term1 is not tagged ManagedBy=CloudWise."
+        )
+        mock_provider_cls.return_value = mock_provider
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.post("/api/deployments/i-term1/terminate")
+
+        self.assertEqual(response.status_code, 502)
+        self.assertFalse(response.data["success"])
+        self.record.refresh_from_db()
+        self.assertEqual(self.record.deployment_status, "RUNNING")
 
 
 class DeploymentRollbackViewTest(TestCase):
-    """Tests for the deployment_rollback_view."""
+    """POST /api/deployments/<id>/rollback stops the app, keeps the instance."""
 
     def setUp(self):
-        self.factory = RequestFactory()
-        self.user = CustomUser.objects.create_user(
-            username='testrb', email='rb@test.com', password='Test1234'
+        self.client = APIClient()
+        self.user = User.objects.create_user(
+            username="rbowner", password="Test1234", email="rb@test.com"
         )
-        self.record = DeploymentRecord.objects.create(
-            user=self.user,
-            environment_name='rb-test',
-            provider='VERCEL',
-            provider_deployment_id='dpl_rb1',
-            provider_project_id='prj_rb1',
-            status='RUNNING',
-            endpoint_url='https://app.vercel.app',
+        self.intruder = User.objects.create_user(
+            username="rbintruder", password="Test1234", email="rbintruder@test.com"
+        )
+        self.connection = _make_connection(self.user)
+        self.record = _make_record(
+            self.user,
+            provider_deployment_id="i-rb1",
+            instance_id="i-rb1",
         )
 
     def test_requires_authentication(self):
-        from api.views import deployment_rollback_view
-        request = self.factory.post('/api/deployments/dpl_rb1/rollback')
-        response = deployment_rollback_view(request, 'dpl_rb1')
-        self.assertIn(response.status_code, (401, 403))
+        self.assertEqual(
+            APIClient().post("/api/deployments/i-rb1/rollback").status_code, 401
+        )
+
+    def test_hidden_from_non_owner(self):
+        self.client.force_authenticate(user=self.intruder)
+        self.assertEqual(
+            self.client.post("/api/deployments/i-rb1/rollback").status_code, 404
+        )
 
     def test_missing_deployment_returns_404(self):
-        from api.views import deployment_rollback_view
-        request = _authed_request(
-            self.factory, 'post',
-            '/api/deployments/nonexistent/rollback',
-            self.user,
+        self.client.force_authenticate(user=self.user)
+        self.assertEqual(
+            self.client.post("/api/deployments/nonexistent/rollback").status_code, 404
         )
-        response = deployment_rollback_view(request, 'nonexistent')
-        self.assertEqual(response.status_code, 404)
 
-    def test_vercel_rollback_requires_credentials(self):
-        from api.views import deployment_rollback_view
-        request = _authed_request(
-            self.factory, 'post',
-            '/api/deployments/dpl_rb1/rollback',
-            self.user,
-        )
-        with patch('api.views.settings') as mock_settings:
-            mock_settings.VERCEL_TOKEN = ''
-            mock_settings.VERCEL_TEAM_ID = ''
-            response = deployment_rollback_view(request, 'dpl_rb1')
+    def test_non_aws_provider_is_rejected(self):
+        DeploymentRecord.objects.filter(pk=self.record.pk).update(provider="VERCEL")
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.post("/api/deployments/i-rb1/rollback")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["supported"], ["AWS"])
+
+    def test_requires_aws_connection(self):
+        self.connection.status = "pending"
+        self.connection.save()
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.post("/api/deployments/i-rb1/rollback")
+
         self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.data["connectUrl"], "/connect-aws")
 
-    def test_vercel_rollback_triggers_new_deployment(self):
-        from api.views import deployment_rollback_view
-        request = _authed_request(
-            self.factory, 'post',
-            '/api/deployments/dpl_rb1/rollback',
-            self.user,
-        )
-        mock_response = {'id': 'dpl_rb_new_123'}
-        with patch('api.views.settings') as mock_settings:
-            mock_settings.VERCEL_TOKEN = 'fake-token'
-            mock_settings.VERCEL_TEAM_ID = ''
-            with patch('api.views.VercelDeploymentService') as MockSvc:
-                mock_instance = MagicMock()
-                mock_instance._create_deployment.return_value = mock_response
-                MockSvc.return_value = mock_instance
-                response = deployment_rollback_view(request, 'dpl_rb1')
+    def test_requires_an_instance(self):
+        DeploymentRecord.objects.filter(pk=self.record.pk).update(instance_id="")
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.post("/api/deployments/i-rb1/rollback")
+
+        self.assertEqual(response.status_code, 400)
+
+    @patch("api.views.AwsEc2Provider")
+    def test_rollback_records_rolled_back(self, mock_provider_cls):
+        mock_provider = MagicMock()
+        mock_provider.rollback.return_value = {
+            "deployment_id": "i-rb1",
+            "status": "ROLLED_BACK",
+            "provider_type": "AWS",
+            "message": "Rollback recorded. EC2 instance retained.",
+            "logs": [{
+                "timestamp": "2026-01-01T00:00:00Z",
+                "level": "INFO",
+                "stage": "ROLLBACK",
+                "message": "Rollback started.",
+            }],
+        }
+        mock_provider_cls.return_value = mock_provider
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.post("/api/deployments/i-rb1/rollback")
+
         self.assertEqual(response.status_code, 200)
-        self.assertTrue(response.data['success'])
-        self.assertEqual(response.data['data']['deployment_id'], 'dpl_rb_new_123')
+        self.assertTrue(response.data["success"])
+        self.assertEqual(response.data["data"]["deploymentStatus"], "ROLLED_BACK")
         self.record.refresh_from_db()
-        self.assertEqual(self.record.provider_deployment_id, 'dpl_rb_new_123')
+        self.assertEqual(self.record.deployment_status, "ROLLED_BACK")
+        self.assertTrue(self.record.logs)
+        mock_provider.rollback.assert_called_once_with("i-rb1")
+
+    @patch("api.views.AwsEc2Provider")
+    def test_rollback_aws_failure_returns_502(self, mock_provider_cls):
+        mock_provider = MagicMock()
+        mock_provider.rollback.side_effect = AwsEc2Error(
+            "docker compose down failed on the instance"
+        )
+        mock_provider_cls.return_value = mock_provider
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.post("/api/deployments/i-rb1/rollback")
+
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("docker compose down failed", response.data["error"])
+        self.record.refresh_from_db()
+        self.assertEqual(self.record.deployment_status, "RUNNING")

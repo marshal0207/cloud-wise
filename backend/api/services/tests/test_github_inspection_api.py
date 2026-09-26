@@ -72,10 +72,8 @@ class GitHubInspectionApiTests(APITestCase):
         self.assertTrue(response.data['success'])
         self.assertEqual(response.data['data']['technology']['technology'], 'REACT')
         self.assertEqual(response.data['data']['technology']['port'], 3000)
-        inspect.assert_called_once_with(
-            'server-token',
-            self.project.github_repo,
-        )
+        inspect.assert_called_once()
+        self.assertEqual(inspect.call_args[0], ('server-token', self.project.github_repo))
 
     @patch('api.views.detect_tech_stack')
     @patch('api.views.inspect_repository')

@@ -47,11 +47,13 @@ export const GenerateFiles: React.FC = () => {
   const [pushingFiles, setPushingFiles] = useState(false);
   const [inspectionLoading, setInspectionLoading] = useState(false);
   const [githubError, setGithubError] = useState('');
-  const [tokenExpired, setTokenExpired] = useState(false);
-  const [rateLimited, setRateLimited] = useState(false);
-  const [cachedScan, setCachedScan] = useState(false);
-  
-  const [repoTree, setRepoTree] = useState<Array<{ path: string; type: string; size?: number; sha?: string }>>([]);
+   const [tokenExpired, setTokenExpired] = useState(false);
+   const [rateLimited, setRateLimited] = useState(false);
+   const [cachedScan, setCachedScan] = useState(false);
+   const [scanProgress, setScanProgress] = useState<Array<{stage: string; message: string; progress: number}>>([]);
+   const [retryCount, setRetryCount] = useState(0);
+   
+   const [repoTree, setRepoTree] = useState<Array<{ path: string; type: string; size?: number; sha?: string }>>([]);
   const [scanMetadata, setScanMetadata] = useState<{
     repository?: string;
     branch?: string;
@@ -96,6 +98,55 @@ export const GenerateFiles: React.FC = () => {
 
   const providerName = selectedRecommendation.provider;
 
+  // Backend failures are always reported as {success, error}; Django/DRF can
+  // also answer with {detail}. Surface whichever reason the server sent
+  // instead of a generic message, and fall back to a useful default.
+  const readJson = async (response: Response): Promise<any | null> => {
+    try {
+      return await response.json();
+    } catch {
+      return null;
+    }
+  };
+
+  const apiErrorMessage = (status: number, body: any, fallback: string): string => {
+    const message = body?.error || body?.message || body?.detail;
+    if (typeof message === 'string' && message.trim()) return message;
+    if (status === 401) {
+      return 'Your CloudWise session has expired or you are not signed in. Please sign in again.';
+    }
+    if (status === 403) return 'You do not have permission to perform this action.';
+    if (status === 404) return 'The requested resource was not found on the CloudWise backend.';
+    if (status === 503) {
+      return 'The CloudWise backend is unavailable. Check the backend logs and try again.';
+    }
+    return fallback;
+  };
+
+  const GITHUB_OAUTH_ERROR_MESSAGES: Record<string, string> = {
+    access_denied:
+      'GitHub authorization was denied. Nothing was changed — choose "Authorize GitHub Account" again and approve access.',
+    invalid_code:
+      'The GitHub authorization expired before it finished. Please try authorizing again.',
+    state_expired:
+      'The GitHub authorization took too long to complete. Please try authorizing again.',
+    state_invalid:
+      'The GitHub authorization could not be verified. Please try authorizing again.',
+    missing_code:
+      'GitHub did not return an authorization code. Please try authorizing again.',
+    redirect_uri_mismatch:
+      'The GitHub OAuth app callback URL does not match GITHUB_REDIRECT_URI. Set the "Authorization callback URL" in your GitHub OAuth app to the exact value of GITHUB_REDIRECT_URI (http://localhost:8000/api/github/oauth/callback).',
+    bad_client_credentials:
+      'GitHub rejected the configured client ID/secret. Check GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET in backend/.env.',
+    exchange_failed:
+      'GitHub could not complete the token exchange. Check the backend logs for the exact reason.',
+    profile_failed:
+      'GitHub authorized the account but the profile lookup failed. Check the backend logs.',
+    cloudwise_user_missing:
+      'Your CloudWise session is no longer valid. Please sign in again and retry.',
+    save_failed: 'The GitHub connection could not be saved. Check the backend logs.',
+  };
+
   const loadRepositories = async () => {
     setLoadingRepositories(true);
     setGithubError('');
@@ -107,9 +158,11 @@ export const GenerateFiles: React.FC = () => {
         },
         credentials: 'include',
       });
-      const data = await response.json();
-      if (!response.ok || !data.success) {
-        throw new Error(data.error || 'Unable to retrieve GitHub repositories.');
+      const data = await readJson(response);
+      if (!response.ok || !data?.success) {
+        throw new Error(
+          apiErrorMessage(response.status, data, 'Unable to retrieve GitHub repositories.')
+        );
       }
       setRepositories(data.data || []);
       if (data.data && data.data.length > 0 && !repoInput) {
@@ -123,9 +176,26 @@ export const GenerateFiles: React.FC = () => {
   };
 
   useEffect(() => {
-    if (searchParams.get('github') === 'connected') {
+    const oauthResult = searchParams.get('github');
+    const oauthDetail = searchParams.get('github_detail');
+
+    if (oauthResult === 'error') {
+      setShowGithubModal(true);
+      setGithubError(
+        (oauthDetail && GITHUB_OAUTH_ERROR_MESSAGES[oauthDetail]) ||
+          'GitHub authorization failed. Check the backend logs for details.'
+      );
+      searchParams.delete('github');
+      searchParams.delete('github_detail');
+      setSearchParams(searchParams, { replace: true });
+      return;
+    }
+
+    if (oauthResult === 'connected') {
       setShowGithubModal(true);
       setSyncedStatus(false);
+      setGithubError('');
+      showToast('GitHub account connected. Choose a repository to scan.', 'success');
       loadRepositories();
       searchParams.delete('github');
       setSearchParams(searchParams, { replace: true });
@@ -145,15 +215,20 @@ export const GenerateFiles: React.FC = () => {
     setGithubError('');
     try {
       const token = localStorage.getItem('cloudwise_token');
+      if (!token) {
+        throw new Error('Please sign in to CloudWise before connecting your GitHub account.');
+      }
       const response = await fetch('/api/github/oauth/start', {
         headers: {
-          Authorization: token ? `Bearer ${token}` : '',
+          Authorization: `Bearer ${token}`,
         },
         credentials: 'include',
       });
-      const data = await response.json();
-      if (!response.ok || !data.success) {
-        throw new Error(data.error || 'Unable to start GitHub authorization.');
+      const data = await readJson(response);
+      if (!response.ok || !data?.success || !data?.authorizationUrl) {
+        throw new Error(
+          apiErrorMessage(response.status, data, 'Unable to start GitHub authorization.')
+        );
       }
       window.location.assign(data.authorizationUrl);
     } catch (error: any) {
@@ -246,142 +321,210 @@ server {
     showToast(`Downloaded ${filenames[activeTab]}`, 'success');
   };
 
-  const handleConnectSubmit = async (e?: React.FormEvent, repoToSelect?: string) => {
-    if (e) e.preventDefault();
-    const repoName = (repoToSelect || repoInput).trim();
-    if (!repoName) return;
+   const handleConnectSubmit = async (e?: React.FormEvent, repoToSelect?: string) => {
+     if (e) e.preventDefault();
+     const repoName = (repoToSelect || repoInput).trim();
+     if (!repoName) return;
 
-    setConnecting(true);
-    setGithubError('');
-    try {
-      const success = await connectGitHub(repoName);
-      if (success) {
-        setRepoInput(repoName);
-        setShowGithubModal(false);
-        setSyncedStatus(true);
-        // Reset old repo tree before scanning new repo
-        setRepoTree([]);
-        setScanMetadata({});
-        await new Promise((r) => setTimeout(r, 500));
-        void handleInspectRepository(repoName);
-      } else {
-        setGithubError('Failed to link repository. Please try again.');
-      }
-    } catch (err: any) {
-      setGithubError(err?.message || 'Failed to link repository. Please try again.');
-    } finally {
-      setConnecting(false);
-    }
-  };
+     setConnecting(true);
+     setGithubError('');
+     setScanProgress([]);
+     setRetryCount(0);
+     try {
+       const { projectId, error } = await connectGitHub(repoName);
+       if (projectId) {
+         setRepoInput(repoName);
+         setShowGithubModal(false);
+         setSyncedStatus(true);
+         // Reset old repo tree before scanning new repo
+         setRepoTree([]);
+         setScanMetadata({});
+         void handleInspectRepository(repoName, projectId);
+       } else {
+         setGithubError(error || 'Failed to link repository. Please try again.');
+       }
+     } catch (err: any) {
+       setGithubError(err?.message || 'Failed to link repository. Please try again.');
+     } finally {
+       setConnecting(false);
+     }
+   };
 
-  const handleInspectRepository = async (overrideRepoName?: string) => {
-    const targetRepo = overrideRepoName || repoInput || activeProject?.githubRepo?.name;
-    if (!targetRepo) {
-      setGithubError('Connect and select a GitHub repository before inspecting it.');
-      setShowGithubModal(true);
-      return;
-    }
+   const handleRetryInspect = async () => {
+     setRetryCount(prev => prev + 1);
+     setGithubError('');
+     setTokenExpired(false);
+     setRateLimited(false);
+     setCachedScan(false);
+     setScanProgress([]);
+     const currentRetry = retryCount + 1;
+     try {
+       const projectId = activeProject?.id;
+       if (!projectId || !repoInput) throw new Error('No project or repository selected.');
+       const token = localStorage.getItem('cloudwise_token');
+       if (!token) throw new Error('Your CloudWise session has expired.');
+       const inspectUrl = `/api/projects/${encodeURIComponent(projectId)}/github/inspect`;
+       const inspectResponse = await fetch(inspectUrl, {
+         method: 'POST',
+         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+         body: JSON.stringify({ repoName: repoInput }),
+       });
+       const inspectData = await readJson(inspectResponse);
+       if (inspectData?.progress && Array.isArray(inspectData.progress)) {
+         setScanProgress(inspectData.progress);
+       }
+       if (inspectData?.token_expired) setTokenExpired(true);
+       if (inspectData?.rate_limited) setRateLimited(true);
+       if (inspectData?.cached) setCachedScan(true);
+       if (!inspectResponse.ok || !inspectData?.success) {
+         if (inspectData?.token_expired) throw new Error('Your GitHub token has expired. Please re-authenticate.');
+         if (inspectData?.rate_limited) throw new Error('GitHub API rate limit reached. Please wait a few minutes.');
+         throw new Error(apiErrorMessage(inspectResponse.status, inspectData, 'Unable to inspect the selected repository.'));
+       }
+       setRepoTree(inspectData.data.tree || []);
+       setScanMetadata({
+         repository: inspectData.data.repository?.full_name || repoInput,
+         branch: inspectData.data.branch || 'main',
+         commitSha: inspectData.data.commitSha,
+         totalFiles: inspectData.data.totalFiles ?? (inspectData.data.tree?.length || 0),
+         totalDirectories: inspectData.data.totalDirectories ?? 0,
+         truncated: inspectData.data.truncated ?? false,
+         scannedAt: inspectData.data.scannedAt || new Date().toISOString(),
+       });
+       showToast(`Scan retry #${currentRetry} completed — ${inspectData.data.totalFiles || 0} files inspected.`, 'success');
+     } catch (error: any) {
+       setGithubError(error.message || 'Retry failed.');
+       showToast(error.message || 'Retry failed.', 'error');
+     }
+   };
 
-    setInspectionLoading(true);
-    setGithubError('');
-    setTokenExpired(false);
-    setRateLimited(false);
-    setCachedScan(false);
-    try {
-      const token = localStorage.getItem('cloudwise_token');
-      const inspectUrl = activeProject?.id 
-        ? `/api/projects/${activeProject.id}/github/inspect`
-        : `/api/projects/default/github/inspect`;
+   const handleInspectRepository = async (overrideRepoName?: string, projectIdOverride?: string) => {
+     const targetRepo = overrideRepoName || repoInput || activeProject?.githubRepo?.name;
+     if (!targetRepo) {
+       setGithubError('Connect and select a GitHub repository before inspecting it.');
+       setShowGithubModal(true);
+       return;
+     }
 
-      const inspectResponse = await fetch(inspectUrl, {
-        method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          Authorization: token ? `Bearer ${token}` : '' 
-        },
-        body: JSON.stringify({ repoName: targetRepo }),
-      });
-      const inspectData = await inspectResponse.json();
+     const projectId = projectIdOverride || activeProject?.id;
+     if (!projectId) {
+       setGithubError('Connect a repository first — a CloudWise project is required to store the scan.');
+       setShowGithubModal(true);
+       return;
+     }
 
-      // Handle token-expired or rate-limited errors that include cached tree data
-      if (inspectData.token_expired) setTokenExpired(true);
-      if (inspectData.rate_limited) setRateLimited(true);
-      if (inspectData.cached) setCachedScan(true);
+     setInspectionLoading(true);
+     setGithubError('');
+     setTokenExpired(false);
+     setRateLimited(false);
+     setCachedScan(false);
+     setScanProgress([]);
+     const currentRetry = retryCount;
+     try {
+       const token = localStorage.getItem('cloudwise_token');
+       if (!token) {
+         throw new Error('Your CloudWise session has expired. Please sign in again to scan a repository.');
+       }
+       const inspectUrl = `/api/projects/${encodeURIComponent(projectId)}/github/inspect`;
 
-      if (!inspectResponse.ok || !inspectData.success) {
-        // If we have token_expired or rate_limited flags, show specific messaging
-        if (inspectData.token_expired) {
-          throw new Error('Your GitHub token has expired. Please re-authenticate with GitHub to scan a fresh copy of your repository.');
-        }
-        if (inspectData.rate_limited) {
-          throw new Error('GitHub API rate limit reached. Please connect a GitHub account or wait a few minutes before retrying.');
-        }
-        throw new Error(inspectData.error || inspectData.message || 'Unable to inspect the selected repository.');
-      }
+       const inspectResponse = await fetch(inspectUrl, {
+         method: 'POST',
+         headers: { 
+           'Content-Type': 'application/json',
+           Authorization: `Bearer ${token}`
+         },
+         body: JSON.stringify({ repoName: targetRepo }),
+       });
+       const inspectData = await readJson(inspectResponse);
 
-      const repoInfo = inspectData.data.repository;
-      const repoFullName = typeof repoInfo === 'object' ? repoInfo?.full_name || repoInfo?.name : repoInfo;
-      
-      setScanMetadata({
-        repository: repoFullName || targetRepo,
-        branch: inspectData.data.branch || 'main',
-        commitSha: inspectData.data.commitSha,
-        totalFiles: inspectData.data.totalFiles ?? (inspectData.data.tree?.length || 0),
-        totalDirectories: inspectData.data.totalDirectories ?? 0,
-        truncated: inspectData.data.truncated ?? false,
-        scannedAt: inspectData.data.scannedAt || new Date().toISOString(),
-      });
+       // Show progress stages if the server returned them
+       if (inspectData?.progress && Array.isArray(inspectData.progress)) {
+         setScanProgress(inspectData.progress);
+       }
 
-      setRepoTree(inspectData.data.tree || []);
+       // Handle token-expired or rate-limited errors that include cached tree data
+       if (inspectData?.token_expired) setTokenExpired(true);
+       if (inspectData?.rate_limited) setRateLimited(true);
+       if (inspectData?.cached) setCachedScan(true);
 
-      // Only generate deployment files if we have actual file contents (not just cached paths)
-      const fileContents = inspectData.data.files || {};
-      const hasFileContents = Object.values(fileContents).some((v) => v && (v as string).length > 0);
+       if (!inspectResponse.ok || !inspectData?.success) {
+         if (inspectData?.token_expired) {
+           throw new Error('Your GitHub token has expired. Please re-authenticate with GitHub to scan a fresh copy of your repository.');
+         }
+         if (inspectData?.rate_limited) {
+           throw new Error('GitHub API rate limit reached. Please wait a few minutes before retrying.');
+         }
+         throw new Error(
+           apiErrorMessage(inspectResponse.status, inspectData, 'Unable to inspect the selected repository.')
+         );
+       }
 
-      if (hasFileContents) {
-        const generateResponse = await fetch('/api/deployment/generate-files', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: token ? `Bearer ${token}` : '',
-          },
-          body: JSON.stringify({
-            provider: providerName,
-            files: fileContents,
-            tree: inspectData.data.tree || [],
-          }),
-        });
-        const generateData = await generateResponse.json();
-        if (!generateResponse.ok || !generateData.success) {
-          throw new Error(generateData.error || 'Unable to generate deployment files.');
-        }
+       const repoInfo = inspectData.data.repository;
+       const repoFullName = typeof repoInfo === 'object' ? repoInfo?.full_name || repoInfo?.name : repoInfo;
+       
+       setScanMetadata({
+         repository: repoFullName || targetRepo,
+         branch: inspectData.data.branch || 'main',
+         commitSha: inspectData.data.commitSha,
+         totalFiles: inspectData.data.totalFiles ?? (inspectData.data.tree?.length || 0),
+         totalDirectories: inspectData.data.totalDirectories ?? 0,
+         truncated: inspectData.data.truncated ?? false,
+         scannedAt: inspectData.data.scannedAt || new Date().toISOString(),
+       });
 
-        setDetectedInfo({
-          technology: generateData.data.technology?.technology || inspectData.data.technology?.technology,
-          dockerfilePreserved: generateData.data.dockerfile_preserved,
-          composePreserved: generateData.data.compose_preserved,
-          cicdPreserved: generateData.data.cicd_preserved,
-          port: generateData.data.port,
-          detection: generateData.data.detection,
-          deploymentPlan: generateData.data.deploymentPlan,
-        });
-        setGeneratedFiles(generateData.data.files);
-      }
+       setRepoTree(inspectData.data.tree || []);
+       setScanProgress(inspectData.progress || []);
 
-      if (inspectData.cached && inspectData.token_expired) {
-        showToast(`Showing cached tree (${inspectData.data.totalFiles || inspectData.data.tree?.length || 0} files). Re-authenticate GitHub for a fresh scan.`, 'warning');
-      } else if (inspectData.cached && inspectData.rate_limited) {
-        showToast(`Showing cached tree. GitHub rate limit reached — retry in a few minutes.`, 'warning');
-      } else {
-        showToast(`Scanned ${inspectData.data.totalFiles || inspectData.data.tree?.length || 0} repository files from ${repoFullName || targetRepo}.`, 'success');
-      }
-    } catch (error: any) {
-      setGithubError(error.message || 'Repository inspection failed.');
-      showToast(error.message || 'Repository inspection failed.', 'error');
-    } finally {
-      setInspectionLoading(false);
-    }
-  };
+       // Only generate deployment files if we have actual file contents (not just cached paths)
+       const fileContents = inspectData.data.files || {};
+       const hasFileContents = Object.values(fileContents).some((v) => v && (v as string).length > 0);
+
+       if (hasFileContents) {
+         const generateResponse = await fetch('/api/deployment/generate-files', {
+           method: 'POST',
+           headers: {
+             'Content-Type': 'application/json',
+             Authorization: token ? `Bearer ${token}` : '',
+           },
+           body: JSON.stringify({
+             provider: providerName,
+             files: fileContents,
+             tree: inspectData.data.tree || [],
+           }),
+         });
+         const generateData = await readJson(generateResponse);
+         if (!generateResponse.ok || !generateData?.success) {
+           throw new Error(
+             apiErrorMessage(generateResponse.status, generateData, 'Unable to generate deployment files.')
+           );
+         }
+
+         setDetectedInfo({
+           technology: generateData.data.technology?.technology || inspectData.data.technology?.technology,
+           dockerfilePreserved: generateData.data.dockerfile_preserved,
+           composePreserved: generateData.data.compose_preserved,
+           cicdPreserved: generateData.data.cicd_preserved,
+           port: generateData.data.port,
+           detection: generateData.data.detection,
+           deploymentPlan: generateData.data.deploymentPlan,
+         });
+         setGeneratedFiles(generateData.data.files);
+       }
+
+       if (inspectData.cached && inspectData.token_expired) {
+         showToast(`Showing cached tree (${inspectData.data.totalFiles || inspectData.data.tree?.length || 0} files). Re-authenticate GitHub for a fresh scan.`, 'warning');
+       } else if (inspectData.cached && inspectData.rate_limited) {
+         showToast(`Showing cached tree. GitHub rate limit reached — retry in a few minutes.`, 'warning');
+       } else {
+         showToast(`Scanned ${inspectData.data.totalFiles || inspectData.data.tree?.length || 0} repository files from ${repoFullName || targetRepo}.`, 'success');
+       }
+     } catch (error: any) {
+       setGithubError(error.message || 'Repository inspection failed.');
+       showToast(error.message || 'Repository inspection failed.', 'error');
+     } finally {
+       setInspectionLoading(false);
+     }
+   };
 
   const handleProceedToDeployment = () => {
     updateActiveProject({ currentStep: 'deployment' });
@@ -414,9 +557,9 @@ server {
           commit_message: 'Add CloudWise deployment configuration',
         }),
       });
-      const data = await response.json();
-      if (!response.ok || !data.success) {
-        throw new Error(data.error || 'Unable to push generated files.');
+      const data = await readJson(response);
+      if (!response.ok || !data?.success) {
+        throw new Error(apiErrorMessage(response.status, data, 'Unable to push generated files.'));
       }
       showToast(`Files committed to ${data.data.repository}.`, 'success');
     } catch (error: any) {
@@ -631,46 +774,68 @@ server {
             </div>
           )}
 
-          {/* Loading state */}
-          {inspectionLoading && (
-            <div className="text-center py-10 text-cyan-400 text-xs space-y-3">
-              <RefreshCw size={28} className="mx-auto animate-spin text-cyan-400" />
-              <p className="font-semibold text-white">Fetching repository tree...</p>
-              <p className="text-[11px] text-slate-400">Analyzing repository structure recursively...</p>
-            </div>
-          )}
+           {/* Loading state with progress steps */}
+           {inspectionLoading && (
+             <div className="text-center py-6 space-y-3">
+               <RefreshCw size={28} className="mx-auto animate-spin text-cyan-400" />
+               <p className="font-semibold text-white text-sm">Scanning repository...</p>
+               {scanProgress.length > 0 ? (
+                 <ul className="space-y-1.5 text-[11px]">
+                   {scanProgress.map((step, i) => (
+                     <li key={i} className={`flex items-center gap-1.5 ${i === scanProgress.length - 1 ? 'text-cyan-300' : 'text-slate-400'}`}>
+                       {i < scanProgress.length - 1 ? <CheckCircle2 size={12} className="text-green-400 shrink-0" /> : <RefreshCw size={12} className="animate-spin shrink-0" />}
+                       <span>{step.message}</span>
+                       {step.progress > 0 && step.progress < 100 && (
+                         <div className="w-16 h-1 bg-slate-700 rounded-full overflow-hidden ml-auto">
+                           <div className="h-full bg-cyan-400 rounded-full transition-all" style={{ width: `${step.progress}%` }} />
+                         </div>
+                       )}
+                     </li>
+                   ))}
+                 </ul>
+               ) : (
+                 <div className="space-y-1 text-slate-500">
+                   <p>→ Connecting to GitHub...</p>
+                   <p>→ Fetching repository...</p>
+                   <p>→ Reading repository tree...</p>
+                   <p>→ Detecting project type...</p>
+                   <p>→ Analyzing deployment requirements...</p>
+                 </div>
+               )}
+             </div>
+           )}
 
-          {/* Error state */}
-          {!inspectionLoading && githubError && (
-            <div className="p-4 rounded-2xl bg-red-500/10 border border-red-500/30 text-red-300 text-xs space-y-2">
-              <div className="flex items-center gap-2 font-bold text-red-200 text-sm">
-                <AlertCircle size={16} className="text-red-400 shrink-0" />
-                <span>Repository Scan Failed</span>
-              </div>
-              <p className="text-slate-300 leading-relaxed text-[11px]">
-                {githubError}
-              </p>
-              <div className="flex items-center gap-2 flex-wrap">
-                <button
-                  onClick={() => handleInspectRepository()}
-                  className="px-3 py-1.5 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-200 border border-red-500/40 text-[11px] font-bold transition-colors flex items-center gap-1.5"
-                >
-                  <RefreshCw size={12} />
-                  <span>Retry Scan</span>
-                </button>
-                {tokenExpired && (
-                  <button
-                    onClick={handleStartGithubOAuth}
-                    disabled={oauthStarting}
-                    className="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/40 text-[11px] font-bold transition-colors flex items-center gap-1.5 disabled:opacity-50"
-                  >
-                    <Github size={12} />
-                    <span>{oauthStarting ? 'Starting...' : 'Re-authenticate GitHub'}</span>
-                  </button>
-                )}
-              </div>
-            </div>
-          )}
+           {/* Error state */}
+           {!inspectionLoading && githubError && (
+             <div className="p-4 rounded-2xl bg-red-500/10 border border-red-500/30 text-red-300 text-xs space-y-2">
+               <div className="flex items-center gap-2 font-bold text-red-200 text-sm">
+                 <AlertCircle size={16} className="text-red-400 shrink-0" />
+                 <span>Repository Scan Failed</span>
+               </div>
+               <p className="text-slate-300 leading-relaxed text-[11px]">
+                 {githubError}
+               </p>
+               <div className="flex items-center gap-2 flex-wrap">
+                 <button
+                   onClick={handleRetryInspect}
+                   className="px-3 py-1.5 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-200 border border-red-500/40 text-[11px] font-bold transition-colors flex items-center gap-1.5"
+                 >
+                   <RefreshCw size={12} />
+                   <span>Retry Scan</span>
+                 </button>
+                 {tokenExpired && (
+                   <button
+                     onClick={handleStartGithubOAuth}
+                     disabled={oauthStarting}
+                     className="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/40 text-[11px] font-bold transition-colors flex items-center gap-1.5 disabled:opacity-50"
+                   >
+                     <Github size={12} />
+                     <span>{oauthStarting ? 'Starting...' : 'Re-authenticate GitHub'}</span>
+                   </button>
+                 )}
+               </div>
+             </div>
+           )}
 
 
           {/* Tree items */}

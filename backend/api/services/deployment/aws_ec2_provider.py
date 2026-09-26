@@ -26,6 +26,8 @@ machine (DeploymentStatus / is_valid_transition).
 from __future__ import annotations
 
 import base64
+import json
+import re
 import time
 import urllib.error
 import urllib.request
@@ -46,6 +48,14 @@ from .aws_connection_service import AwsConnectionError, get_session
 from .log_service import DeploymentLogService
 from .provider import DeploymentProvider
 from .status import DeploymentStage, DeploymentStatus, is_valid_transition
+
+try:
+    from ...services.tech_stack_detector import detect_tech_stack, UnsupportedTechStackError
+    from ...services.deployment_file_generator import analyze_repository
+except ImportError:
+    detect_tech_stack = None
+    analyze_repository = None
+    UnsupportedTechStackError = None
 
 # Lifecycle progress mapping for get_status()
 _PROGRESS = {
@@ -84,6 +94,18 @@ class AwsEc2Provider(DeploymentProvider):
         self.user = user
         self.connection = connection
         self.config: dict[str, Any] = dict(config or {})
+        self.log_listener = None
+
+    def set_log_listener(self, listener) -> "AwsEc2Provider":
+        """
+        Attach a callable invoked with every structured log entry as it is
+        produced, so a caller can stream progress to the caller/UI.
+        """
+        self.log_listener = listener
+        return self
+
+    def _new_log(self, deployment_id: str) -> DeploymentLogService:
+        return DeploymentLogService(deployment_id, listener=self.log_listener)
 
     # ------------------------------------------------------------------
     # Config resolution (settings first, per-request overrides second)
@@ -216,7 +238,7 @@ class AwsEc2Provider(DeploymentProvider):
         Rollback: stop application containers (best-effort) and record the
         transition. The EC2 instance itself is retained (never terminated).
         """
-        log = DeploymentLogService(deployment_id)
+        log = self._new_log(deployment_id)
         status = DeploymentStatus.ROLLING_BACK
         if is_valid_transition(DeploymentStatus.RUNNING, status) or is_valid_transition(
             DeploymentStatus.FAILED, status
@@ -271,6 +293,74 @@ class AwsEc2Provider(DeploymentProvider):
             "logs": log.all(),
         }
 
+    def terminate_instance(self, instance_id: str) -> dict[str, Any]:
+        """
+        Terminate the CloudWise-managed EC2 instance in the *user's* AWS
+        account.
+
+        Safety: only instances carrying the ``ManagedBy=CloudWise`` tag are
+        ever terminated, so a hand-typed instance id can never destroy a
+        resource CloudWise did not create.
+        """
+        instance_id = str(instance_id or "").strip()
+        if not instance_id:
+            raise AwsEc2Error("No EC2 instance id supplied for termination.")
+        if self.connection is None or self.connection.status != "active":
+            raise AwsEc2Error(
+                "AWS account not connected. Connect your AWS account "
+                "(IAM role) first."
+            )
+
+        log = self._new_log(instance_id)
+        session = self.get_session()
+        ec2 = session.client("ec2", region_name=self._region())
+
+        instance = self._describe_instance(ec2, instance_id)
+        if instance is None:
+            raise AwsEc2Error(
+                f'EC2 instance "{instance_id}" not found in AWS account.'
+            )
+
+        tags = {t.get("Key"): t.get("Value") for t in (instance.get("Tags") or [])}
+        if tags.get("ManagedBy") != "CloudWise":
+            raise AwsEc2Error(
+                f"Instance {instance_id} is not managed by CloudWise "
+                "(missing the ManagedBy=CloudWise tag). Refusing to "
+                "terminate it."
+            )
+
+        state = (instance.get("State") or {}).get("Name", "")
+        log.info(
+            DeploymentStage.DEPLOYING,
+            f"Terminating CloudWise-managed instance {instance_id} "
+            f"(current state: {state}) in {self._region()}.",
+        )
+        try:
+            ec2.terminate_instances(InstanceIds=[instance_id])
+        except (ClientError, BotoCoreError) as exc:
+            message = self._friendly_ec2_error(exc)
+            log.error(DeploymentStage.FAILED, message)
+            raise AwsEc2Error(message) from exc
+
+        row = EC2Instance.objects.filter(instance_id=instance_id).first()
+        if row is not None:
+            row.status = "terminated"
+            row.save(update_fields=["status", "updated_at"])
+            self._persist_logs(row, log.all())
+
+        log.info(
+            DeploymentStage.COMPLETED,
+            f"Termination requested for {instance_id}. The instance is "
+            "removed from your AWS account.",
+        )
+        return {
+            "instance_id": instance_id,
+            "region": self._region(),
+            "state": "terminated",
+            "message": f"Termination requested for {instance_id}.",
+            "logs": log.all(),
+        }
+
     # ------------------------------------------------------------------
     # Spec-named operations (provision / deploy / status / logs)
     # ------------------------------------------------------------------
@@ -289,7 +379,7 @@ class AwsEc2Provider(DeploymentProvider):
             )
 
         deployment_id = f"aws_{uuid.uuid4().hex[:12]}"
-        log = DeploymentLogService(deployment_id)
+        log = self._new_log(deployment_id)
         current = DeploymentStatus.QUEUED
 
         def advance(to_status: str, stage: str, message: str) -> None:
@@ -548,6 +638,10 @@ class AwsEc2Provider(DeploymentProvider):
         env_vars = self.config.get("env_vars") or {}
         project_id = str(self.config.get("project_id") or "default").strip() or "default"
         env_name = self._environment_name()
+        # Detect project type for Docker vs non-Deploy path
+        project_type = self._detect_project_type()
+        app_port = self._detect_app_port()
+        has_docker = self._has_docker()
 
         if not instance_id:
             raise AwsEc2Error(
@@ -559,7 +653,7 @@ class AwsEc2Provider(DeploymentProvider):
             )
 
         deployment_id = instance_id
-        log = DeploymentLogService(deployment_id)
+        log = self._new_log(deployment_id)
         current = DeploymentStatus.QUEUED
 
         def advance(to_status: str, stage: str, message: str) -> None:
@@ -608,7 +702,7 @@ class AwsEc2Provider(DeploymentProvider):
                 DeploymentStatus.BUILDING,
                 DeploymentStage.BUILDING,
                 f"Uploading deployment files to {remote_dir} "
-                "(SSM RunShellScript).",
+                f"({'non-Docker' if not has_docker else 'Docker'} deployment).",
             )
 
             upload_commands = self._build_upload_commands(
@@ -624,28 +718,59 @@ class AwsEc2Provider(DeploymentProvider):
                 f"({len(env_vars)} variable(s), values not logged).",
             )
 
-            # ---- DEPLOYING: docker compose up -d --build ----
-            advance(
-                DeploymentStatus.DEPLOYING,
-                DeploymentStage.DEPLOYING,
-                "Building and starting containers "
-                "(docker compose up -d --build).",
-            )
-            compose_commands = self._build_compose_commands(remote_dir)
-            compose_output = self._run_ssm_commands(
-                ssm, instance_id, compose_commands, log,
-                stage_message="docker compose up",
-                timeout_seconds=max(
-                    settings.AWS_SSM_TIMEOUT_SECONDS, 600
-                ),
-            )
-            log.info(
-                DeploymentStage.DEPLOYING,
-                "Container build/start command completed on the instance.",
-            )
+            if not has_docker:
+                # ---- NON-DOCKER DEPLOYMENT ----
+                advance(
+                    DeploymentStatus.DEPLOYING,
+                    DeploymentStage.DEPLOYING,
+                    f"Deploying {project_type.get('technology', 'UNKNOWN')} "
+                    f"application on port {app_port} "
+                    "(non-Docker runtime).",
+                )
+                healthy, health_message = self._deploy_non_docker(
+                    session, ssm, ec2, instance_id, log,
+                    project_type, app_port,
+                )
+                endpoint_url = ""
+                if healthy and public_ip:
+                    if app_port in (80, 443):
+                        endpoint_url = f"http://{public_ip}"
+                    else:
+                        endpoint_url = f"http://{public_ip}:{app_port}"
+                if not healthy:
+                    log.error(
+                        DeploymentStage.FAILED,
+                        f"Non-Docker deployment health check failed: {health_message}",
+                    )
+                    row = EC2Instance.objects.filter(instance_id=instance_id).first()
+                    if row is not None:
+                        self._persist_logs(row, log.all())
+                    raise AwsEc2Error(
+                        f"Non-Docker deployment health check failed: {health_message}"
+                    )
+            else:
+                # ---- DOCKER DEPLOYMENT (existing path) ----
+                advance(
+                    DeploymentStatus.DEPLOYING,
+                    DeploymentStage.DEPLOYING,
+                    "Building and starting containers "
+                    "(docker compose up -d --build).",
+                )
+                compose_commands = self._build_compose_commands(remote_dir)
+                compose_output = self._run_ssm_commands(
+                    ssm, instance_id, compose_commands, log,
+                    stage_message="docker compose up",
+                    timeout_seconds=max(
+                        settings.AWS_SSM_TIMEOUT_SECONDS, 600
+                    ),
+                )
+                log.info(
+                    DeploymentStage.DEPLOYING,
+                    "Container build/start command completed on the instance.",
+                )
 
             # ---- HEALTH_CHECK ----
-            app_port = int(self.config.get("port") or 80)
+            app_port = self._detect_app_port()
             advance(
                 DeploymentStatus.HEALTH_CHECK,
                 DeploymentStage.HEALTH_CHECK,
@@ -677,7 +802,7 @@ class AwsEc2Provider(DeploymentProvider):
                     )
             if not healthy:
                 tail = ""
-                if isinstance(compose_output, str) and compose_output.strip():
+                if has_docker and isinstance(compose_output, str) and compose_output.strip():
                     tail = (
                         " Last compose output: "
                         + compose_output.strip()[-500:]
@@ -692,7 +817,7 @@ class AwsEc2Provider(DeploymentProvider):
                 if row is not None:
                     self._persist_logs(row, log.all())
                 raise AwsEc2Error(
-                    f"Container deployment health check failed: "
+                    f"Application health check failed: "
                     f"{health_message}"
                 )
 
@@ -745,6 +870,328 @@ class AwsEc2Provider(DeploymentProvider):
             "file_count": len(files),
             "logs": log.all(),
         }
+
+    # ------------------------------------------------------------------
+    # Non-Docker deployment — runtime install, build, start
+    # ------------------------------------------------------------------
+
+    def _detect_project_type(self) -> dict[str, Any]:
+        """Detect the project type and technology stack from the files."""
+        files = self.config.get("files") or {}
+        if not files:
+            return {"technology": "UNKNOWN", "framework": None, "port": 8000}
+        if detect_tech_stack is not None:
+            try:
+                stack = detect_tech_stack(files)
+                return {"technology": stack.technology, "framework": stack.build_tool, "port": stack.port}
+            except Exception:
+                pass
+        return {"technology": "UNKNOWN", "framework": None, "port": 8000}
+
+    def _detect_app_port(self) -> int:
+        """Detect the application port from files, Dockerfile, compose, or tech stack."""
+        files = self.config.get("files") or {}
+        port = self.config.get("port")
+        if port and isinstance(port, int):
+            return port
+        # Check docker-compose.yml for port mapping
+        for key in files:
+            if key.endswith("docker-compose.yml") or key.endswith("docker-compose.yaml"):
+                content = files[key]
+                match = re.search(r'["\']?(\d+)["\']?\s*:\s*["\']?(\d+)["\']?', content)
+                if match:
+                    return int(match.group(2))
+        # Check Dockerfile EXPOSE directive
+        for key in files:
+            if key.endswith("Dockerfile"):
+                content = files[key]
+                match = re.search(r'EXPOSE\s+(\d+)', content, re.IGNORECASE)
+                if match:
+                    return int(match.group(1))
+        # Check package.json for port config
+        for key in files:
+            if key.endswith("package.json"):
+                try:
+                    pkg = json.loads(files[key])
+                    if "scripts" in pkg and "start" in pkg["scripts"]:
+                        pass
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+        # Check tech stack default port
+        if detect_tech_stack is not None:
+            try:
+                stack = detect_tech_stack(files)
+                return stack.port
+            except Exception:
+                pass
+        # Check deployment_plan from generate_deployment_files
+        plan = self.config.get("deployment_plan") or {}
+        ports = plan.get("ports") or []
+        if ports:
+            return ports[0]
+        return 8000
+
+    def _has_docker(self) -> bool:
+        """Return True if the project has a Dockerfile or docker-compose."""
+        files = self.config.get("files") or {}
+        for key in files:
+            if key.endswith("Dockerfile") or key.endswith("docker-compose.yml") or key.endswith("docker-compose.yaml"):
+                return True
+        return False
+
+    def _deploy_non_docker(
+        self,
+        session,
+        ssm,
+        ec2,
+        instance_id: str,
+        log: DeploymentLogService,
+        project_type: dict[str, Any],
+        app_port: int,
+    ) -> tuple[bool, str]:
+        """
+        Deploy a non-Docker application on the EC2 instance.
+
+        Installs the runtime, dependencies, builds the project,
+        starts the application, and configures nginx for frontend apps.
+
+        Returns (healthy, message).
+        """
+        region = self._region()
+        env_name = self._environment_name()
+        remote_root = str(settings.AWS_DEPLOY_ROOT).rstrip("/")
+        project_id = str(self.config.get("project_id") or "default").strip()
+        env_name = str(self.config.get("environment_name") or env_name).strip()
+        remote_dir = f"{remote_root}/{project_id}/{env_name}"
+        technology = project_type.get("technology", "UNKNOWN")
+        framework = project_type.get("framework", "")
+
+        # ---- Determine the installation/build/start commands ----
+        install_cmds, build_cmd, start_cmd, nginx_config = self._get_runtime_commands(
+            technology, framework, app_port, remote_dir,
+        )
+
+        # ---- Build SSM commands ----
+        commands: list[str] = [
+            f"mkdir -p '{remote_dir}'",
+            "cd '{remote_dir}'",
+        ]
+
+        # Install runtime
+        for cmd in install_cmds:
+            commands.append(cmd)
+
+        # Write files (base64-encoded)
+        files = self.config.get("files") or {}
+        for raw_path, content in files.items():
+            rel = self._safe_rel_path(raw_path)
+            target = f"{remote_dir}/{rel}"
+            parent = "/".join(target.split("/")[:-1])
+            if parent:
+                commands.append(f"mkdir -p '{parent}'")
+            data = content if isinstance(content, str) else str(content)
+            b64 = base64.b64encode(data.encode("utf-8")).decode("ascii")
+            commands.append(f"echo '{b64}' | base64 -d > '{target}'")
+
+        # Build
+        if build_cmd:
+            commands.append(f"cd '{remote_dir}' && {build_cmd}")
+
+        # Configure nginx for frontend apps
+        if nginx_config and technology in ("REACT", "NEXTJS", "NODE_JS", "VUE", "ANGULAR"):
+            commands.append(nginx_config)
+            commands.append("systemctl restart nginx || service nginx restart || true")
+            commands.append("systemctl enable nginx || true")
+
+        # Start the application
+        if start_cmd:
+            # Use nohup to keep the process running
+            commands.append(f"cd '{remote_dir}' && nohup {start_cmd} > /var/log/cloudwise-app.log 2>&1 &")
+            commands.append(f"echo $! > {remote_dir}/app.pid")
+
+        # Also start nginx if not already configured above
+        if not nginx_config and technology in ("REACT", "NEXTJS", "NODE_JS", "VUE", "ANGULAR"):
+            commands.append("systemctl restart nginx || service nginx restart || true")
+            commands.append("systemctl enable nginx || true")
+
+        # Write a status marker
+        commands.append(f"echo 'DEPLOYED:{technology}:{app_port}' > {remote_dir}/.cloudwise-status")
+
+        # Run the commands via SSM
+        self._run_ssm_commands(
+            ssm, instance_id, commands, log,
+            stage_message=f"Deploy {technology} app",
+            timeout_seconds=max(settings.AWS_SSM_TIMEOUT_SECONDS, 600),
+        )
+
+        # ---- Health check ----
+        healthy = False
+        message = f"Deployed {technology} application on port {app_port}."
+
+        # Check via SSM first (works even when ports aren't publicly exposed)
+        health_retries = max(1, settings.AWS_HEALTH_CHECK_RETRIES)
+        health_interval = max(0.1, settings.AWS_HEALTH_CHECK_INTERVAL_SECONDS)
+        for _ in range(health_retries):
+            curl_cmd = (
+                f"code=$(curl -s -o /dev/null -w '%{{http_code}}' "
+                f"--max-time 5 http://127.0.0.1:{app_port}/ || echo 000); "
+                f"echo \"HEALTH:$code\""
+            )
+            try:
+                response = ssm.send_command(
+                    InstanceIds=[instance_id],
+                    DocumentName="AWS-RunShellScript",
+                    Parameters={"commands": [curl_cmd]},
+                    TimeoutSeconds=30,
+                )
+                command_id = (response.get("Command") or {}).get("CommandId", "")
+                if isinstance(command_id, str) and command_id:
+                    deadline = time.monotonic() + 30
+                    while time.monotonic() < deadline:
+                        try:
+                            inv = ssm.get_command_invocation(
+                                CommandId=command_id,
+                                InstanceId=instance_id,
+                            )
+                        except Exception:
+                            time.sleep(1)
+                            continue
+                        if inv.get("Status") in (
+                            "Success", "Failed", "Cancelled", "TimedOut",
+                        ):
+                            stdout = (inv.get("StandardOutputContent") or "").strip()
+                            for line in stdout.splitlines():
+                                if line.startswith("HEALTH:"):
+                                    code_str = line.split(":", 1)[-1].strip()
+                                    try:
+                                        code = int(code_str)
+                                        if 0 < code < 500:
+                                            healthy = True
+                                            message = f"HTTP {code} from 127.0.0.1:{app_port}"
+                                        break
+                                    except ValueError:
+                                        pass
+                            break
+                        time.sleep(1)
+            except Exception:
+                pass
+            time.sleep(health_interval)
+
+        # Also try HTTP health check via public IP if not healthy yet
+        public_ip = ""
+        try:
+            instance = self._describe_instance(ec2, instance_id)
+            if instance:
+                public_ip = instance.get("PublicIpAddress") or ""
+        except Exception:
+            pass
+
+        if not healthy and public_ip and app_port in (80, 443, 3000, 5173, 8080, 4200):
+            endpoint_url = f"http://{public_ip}" if app_port in (80, 443) else f"http://{public_ip}:{app_port}"
+            http_ok, http_msg = self._http_health(endpoint_url)
+            if http_ok:
+                healthy = True
+                message = http_msg
+
+        return healthy, message
+
+    def _get_runtime_commands(
+        self, technology: str, framework: str, port: int, remote_dir: str,
+    ) -> tuple[list[str], str, str, str]:
+        """
+        Return (install_commands, build_command, start_command, nginx_config)
+        for the given technology stack.
+        """
+        install_cmds: list[str] = []
+        build_cmd = ""
+        start_cmd = ""
+        nginx_config = ""
+
+        if technology == "REACT":
+            install_cmds = [
+                "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -",
+                "apt-get install -y nodejs",
+                "npm install -g pnpm",
+            ]
+            build_cmd = "pnpm install && pnpm run build"
+            start_cmd = "pnpm start"
+            nginx_config = self._build_nginx_config(port)
+        elif technology == "NEXTJS":
+            install_cmds = [
+                "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -",
+                "apt-get install -y nodejs",
+                "npm install -g pnpm",
+            ]
+            build_cmd = "pnpm install && pnpm run build"
+            start_cmd = "pnpm start"
+            nginx_config = self._build_nginx_config(port)
+        elif technology == "NODE_JS":
+            install_cmds = [
+                "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -",
+                "apt-get install -y nodejs",
+            ]
+            build_cmd = "npm install && npm run build"
+            start_cmd = "npm start"
+            nginx_config = self._build_nginx_config(port)
+        elif technology == "PYTHON":
+            install_cmds = [
+                "apt-get update -y",
+                "apt-get install -y python3 python3-pip python3-venv",
+            ]
+            build_cmd = "pip3 install -r requirements.txt"
+            if framework == "Django":
+                start_cmd = f"python3 manage.py runserver 0.0.0.0:{port}"
+            else:
+                start_cmd = f"python3 app.py"
+            nginx_config = self._build_nginx_config(port)
+        elif technology == "SPRING_BOOT":
+            install_cmds = [
+                "apt-get update -y",
+                "apt-get install -y openjdk-21-jdk maven",
+            ]
+            build_cmd = "./mvnw clean package -DskipTests || mvn clean package -DskipTests"
+            start_cmd = f"java -jar target/*.jar --server.port={port}"
+            nginx_config = self._build_nginx_config(port)
+        elif technology == "VUE":
+            install_cmds = [
+                "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -",
+                "apt-get install -y nodejs",
+            ]
+            build_cmd = "npm install && npm run build"
+            start_cmd = "npm run dev"
+            nginx_config = self._build_nginx_config(port)
+        else:
+            # Generic Node.js
+            install_cmds = [
+                "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -",
+                "apt-get install -y nodejs",
+            ]
+            build_cmd = "npm install && npm run build"
+            start_cmd = "npm start"
+            nginx_config = self._build_nginx_config(port)
+
+        return install_cmds, build_cmd, start_cmd, nginx_config
+
+    def _build_nginx_config(self, port: int) -> str:
+        """Build nginx configuration to serve the app on port 80."""
+        return (
+            f"cat > /etc/nginx/sites-available/cloudwise <<'EOF'\n"
+            f"server {{\n"
+            f"    listen 80;\n"
+            f"    server_name _;\n"
+            f"    location / {{\n"
+            f"        proxy_pass http://127.0.0.1:{port};\n"
+            f"        proxy_set_header Host $host;\n"
+            f"        proxy_set_header X-Real-IP $remote_addr;\n"
+            f"        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
+            f"        proxy_set_header X-Forwarded-Proto $scheme;\n"
+            f"    }}\n"
+            f"}}\n"
+            f"EOF\n"
+            f"ln -sf /etc/nginx/sites-available/cloudwise /etc/nginx/sites-enabled/\n"
+            f"rm -f /etc/nginx/sites-enabled/default\n"
+            f"nginx -t\n"
+        )
 
     def status(self, deployment_id: str) -> dict[str, Any]:
         return self.get_status(deployment_id)

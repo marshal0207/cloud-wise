@@ -28,6 +28,7 @@ import { Recommendation } from '@/pages/Recommendation';
 import { GenerateFiles } from '@/pages/GenerateFiles';
 import { ConnectAws } from '@/pages/ConnectAws';
 import { Deployment } from '@/pages/Deployment';
+import { DeploymentDetails } from '@/pages/DeploymentDetails';
 import { Optimization } from '@/pages/Optimization';
 import { Monitoring } from '@/pages/Monitoring';
 import { About } from '@/pages/About';
@@ -69,6 +70,7 @@ const AnimatedRoutes: React.FC = () => {
           <Route path="/generate" element={<GenerateFiles />} />
           <Route path="/connect-aws" element={<ConnectAws />} />
           <Route path="/deployment" element={<Deployment />} />
+          <Route path="/deployment/:id" element={<DeploymentDetails />} />
           <Route path="/optimization" element={<Optimization />} />
           <Route path="/monitoring" element={<Monitoring />} />
           <Route path="/about" element={<About />} />

@@ -18,6 +18,8 @@ import {
   FileCode2,
   Database,
   GitBranch,
+  ListChecks,
+  ExternalLink,
 } from 'lucide-react';
 import { useCloudWise, formatINR } from '@/context/CloudWiseContext';
 
@@ -68,6 +70,28 @@ const NINE_STEPS = [
   { key: 'compose', label: '8. Upload & Compose Up', desc: 'SSM upload · docker compose up' },
   { key: 'health', label: '9. Health Check & Live URL', desc: 'Verify HTTP · expose endpoint' },
 ];
+
+// Four user-facing gates. Backend stage codes map onto these directly:
+//   PROJECT / GITHUB → Repository / GitHub, ENVIRONMENT → Deployment,
+//   AWS → AWS, and the pipeline's own failureStage → Deployment.
+const CHECKLIST_STAGES = [
+  { key: 'GITHUB', label: 'GitHub', desc: 'OAuth authorization accepted, token readable' },
+  { key: 'REPOSITORY', label: 'Repository', desc: 'Repository linked, files readable, commit resolved' },
+  { key: 'AWS', label: 'AWS', desc: 'IAM role assumed via STS, account validated' },
+  { key: 'DEPLOYMENT', label: 'Deployment', desc: 'EC2 provisioned · containers up · health check · live URL' },
+] as const;
+
+type ChecklistStatus = 'pending' | 'active' | 'done' | 'failed';
+type ChecklistKey = (typeof CHECKLIST_STAGES)[number]['key'];
+
+const stageKeyFromBackendStage = (stage?: string, message?: string): ChecklistKey => {
+  const s = (stage || '').toUpperCase();
+  const m = (message || '').trim();
+  if (s === 'GITHUB') return 'GITHUB';
+  if (s === 'PROJECT') return 'REPOSITORY';
+  if (s === 'AWS' || m.startsWith('AWS:') || m.startsWith('BLOCKED')) return 'AWS';
+  return 'DEPLOYMENT';
+};
 
 const PHASE_TO_STEP: Record<PipelinePhase, number> = {
   idle: -1,
@@ -127,10 +151,19 @@ export const Deployment: React.FC = () => {
   const [envRows, setEnvRows] = useState<EnvVarRow[]>([]);
   const [envMasked, setEnvMasked] = useState(true);
   const [envSource, setEnvSource] = useState<'manual' | 'upload' | null>(null);
-  const [activeStepIndex, setActiveStepIndex] = useState(-1);
+   const [activeStepIndex, setActiveStepIndex] = useState(-1);
+   const [scanProgress, setScanProgress] = useState<Array<{stage: string; message: string; progress: number}>>([]);
+   const [tokenExpired, setTokenExpired] = useState(false);
+   const [rateLimited, setRateLimited] = useState(false);
 
-  const repoName = activeProject?.githubRepo?.name;
+   const repoName = activeProject?.githubRepo?.name;
   const missingRepo = !repoName;
+
+  // Stage-tagged failure returned by POST /api/deploy or by the pipeline
+  const [stageError, setStageError] = useState<{ stage: string; message: string } | null>(null);
+  const [pipelineFailure, setPipelineFailure] = useState<{ stage: string; message: string } | null>(null);
+  const [retrying, setRetrying] = useState(false);
+  const [lastDeploymentId, setLastDeploymentId] = useState<string | null>(null);
 
   const refreshAwsConnection = async () => {
     try {
@@ -156,6 +189,12 @@ export const Deployment: React.FC = () => {
     }
   }, [activeProject]);
 
+  const handleRetryAnalysis = async () => {
+    setScanProgress([]);
+    setActiveStepIndex(0);
+    await runAnalysis();
+  };
+
   // Step 1: Analyze repository (inspect via backend)
   const runAnalysis = async () => {
     if (missingRepo) {
@@ -163,6 +202,7 @@ export const Deployment: React.FC = () => {
       return;
     }
     setActiveStepIndex(0);
+    setScanProgress([]);
     setLiveDeployment(prev => ({
       ...prev,
       status: 'preparing' as PipelinePhase,
@@ -175,9 +215,23 @@ export const Deployment: React.FC = () => {
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ repoName }),
       });
-      const data = await res.json();
-      if (!res.ok || !data.success) {
-        throw new Error(data.error || 'Repository analysis failed.');
+      const data = await res.json().catch(() => null);
+
+      // Show progress stages from the server
+      if (data?.progress && Array.isArray(data.progress)) {
+        setScanProgress(data.progress);
+      }
+
+      if (data?.token_expired) setTokenExpired(true);
+      if (data?.rate_limited) setRateLimited(true);
+
+      if (!res.ok || !data?.success) {
+        throw new Error(
+          data?.error || data?.message || data?.detail ||
+          (res.status === 401
+            ? 'Your CloudWise session has expired. Please sign in again.'
+            : 'Repository analysis failed.')
+        );
       }
       const detected = data.data.technology || {};
       setDetection({
@@ -187,6 +241,7 @@ export const Deployment: React.FC = () => {
         database: data.data.detection?.database,
         applicationType: data.data.detection?.applicationType,
       });
+      setScanProgress(data.progress || []);
       setLiveDeployment(prev => ({
         ...prev,
         progress: 15,
@@ -222,9 +277,19 @@ export const Deployment: React.FC = () => {
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ repoName }),
       });
-      const inspectData = await inspectRes.json();
-      if (!inspectRes.ok || !inspectData.success) {
-        throw new Error(inspectData.error || 'Repository inspection failed.');
+      const inspectData = await inspectRes.json().catch(() => null);
+      if (inspectData?.progress && Array.isArray(inspectData.progress)) {
+        setScanProgress(inspectData.progress);
+      }
+      if (inspectData?.token_expired) setTokenExpired(true);
+      if (inspectData?.rate_limited) setRateLimited(true);
+      if (!inspectRes.ok || !inspectData?.success) {
+        throw new Error(
+          inspectData?.error || inspectData?.message || inspectData?.detail ||
+          (inspectRes.status === 401
+            ? 'Your CloudWise session has expired. Please sign in again.'
+            : 'Repository inspection failed.')
+        );
       }
       const genRes = await fetch('/api/deployment/generate-files', {
         method: 'POST',
@@ -314,6 +379,79 @@ export const Deployment: React.FC = () => {
     return required.every(k => (map.get(k) || '').length > 0);
   }, [envRows, deploymentPlan]);
 
+  // Derived from real signals only: what the user actually linked, what
+  // the backend actually accepted, and the record's own deployment status.
+  const checklist = useMemo(() => {
+    const failedKey: ChecklistKey | null = stageError
+      ? stageKeyFromBackendStage(stageError.stage, stageError.message)
+      : liveDeployment.status === 'failed' && pipelineFailure
+      ? stageKeyFromBackendStage(pipelineFailure.stage, pipelineFailure.message)
+      : null;
+
+    const githubStatus: ChecklistStatus = failedKey === 'GITHUB'
+      ? 'failed'
+      : repoName
+      ? 'done'
+      : 'pending';
+
+    const repositoryStatus: ChecklistStatus = failedKey === 'REPOSITORY'
+      ? 'failed'
+      : repoName && detection
+      ? 'done'
+      : repoName
+      ? 'active'
+      : 'pending';
+
+    const awsStatus: ChecklistStatus = failedKey === 'AWS'
+      ? 'failed'
+      : awsConnection?.connected
+      ? 'done'
+      : 'pending';
+
+    let deploymentStatus: ChecklistStatus = 'pending';
+    if (failedKey === 'DEPLOYMENT' || (failedKey !== 'GITHUB' && failedKey !== 'REPOSITORY' && failedKey !== 'AWS' && liveDeployment.status === 'failed')) {
+      deploymentStatus = 'failed';
+    } else if (liveDeployment.status === 'deployed') {
+      deploymentStatus = 'done';
+    } else if (liveDeployment.status !== 'idle') {
+      deploymentStatus = 'active';
+    }
+
+    const deploymentLabel = (() => {
+      switch (liveDeployment.status) {
+        case 'preparing':
+          return 'Validating repository and environment';
+        case 'provisioning':
+          return 'Provisioning EC2 capacity';
+        case 'configuring':
+          return 'Uploading files and starting containers';
+        case 'deployed':
+          return `Live at ${liveDeployment.endpointUrl || 'health-checked URL'}`;
+        case 'failed':
+          return 'Failed — inspect the error and retry';
+        default:
+          return 'Queued for deployment';
+      }
+    })();
+
+    return [
+      { ...CHECKLIST_STAGES[0], status: githubStatus, detail: githubStatus === 'done' ? (repoName || '') : (missingRepo ? 'No repository linked yet' : '') },
+      { ...CHECKLIST_STAGES[1], status: repositoryStatus, detail: detection?.technology || (repositoryStatus === 'active' ? 'Awaiting analysis' : '') },
+      { ...CHECKLIST_STAGES[2], status: awsStatus, detail: awsConnection?.connected ? `Account ${awsConnection.accountId || 'connected'} · ${awsConnection.region || estimation.region}` : 'IAM role not connected' },
+      { ...CHECKLIST_STAGES[3], status: deploymentStatus, detail: deploymentLabel },
+    ];
+  }, [
+    stageError,
+    pipelineFailure,
+    liveDeployment.status,
+    liveDeployment.endpointUrl,
+    repoName,
+    detection,
+    awsConnection,
+    missingRepo,
+    estimation.region,
+  ]);
+
   const markEnvComplete = () => {
     if (!envVarsReady) {
       showToast('Fill all required environment variables first.', 'error');
@@ -371,6 +509,7 @@ export const Deployment: React.FC = () => {
       const data = await res.json();
 
       if (res.status === 503 && data.status === 'BLOCKED') {
+        setStageError({ stage: data.stage || 'AWS', message: data.error || '' });
         setLiveDeployment(prev => ({
           ...prev,
           status: 'failed',
@@ -383,11 +522,13 @@ export const Deployment: React.FC = () => {
       }
 
       if (res.status === 400 && data.status === 'RETIRED') {
+        setStageError({ stage: data.stage || 'PROJECT', message: data.error || '' });
         showToast(data.error || 'Provider retired. AWS only.', 'error');
         return;
       }
 
-      if (res.status === 400 && data.errorCode === 'MISSING_ENV_VARS') {
+      if (!res.ok && data.code === 'MISSING_ENV_VARS') {
+        setStageError({ stage: data.stage || 'ENVIRONMENT', message: data.error || '' });
         setLiveDeployment(prev => ({
           ...prev,
           status: 'failed',
@@ -399,7 +540,8 @@ export const Deployment: React.FC = () => {
         return;
       }
 
-      if (res.status === 400 && data.errorCode === 'INVALID_DATABASE_URL') {
+      if (!res.ok && data.code === 'INVALID_DATABASE_URL') {
+        setStageError({ stage: data.stage || 'ENVIRONMENT', message: data.error || '' });
         setLiveDeployment(prev => ({
           ...prev,
           status: 'failed',
@@ -411,48 +553,37 @@ export const Deployment: React.FC = () => {
         return;
       }
 
-      if (data.success && data.data?.deployment_id) {
-        setDeploymentId(data.data.deployment_id);
-        if (data.data.status === 'FAILED') {
-          const failureMsg = data.error || 'Deployment failed.';
-          setLiveDeployment(prev => ({
-            ...prev,
-            status: 'failed',
-            progress: data.data.progress || 45,
-            failureReason: failureMsg,
-            logs: data.data.logs?.map((l: any) => `[${l.timestamp}] [${l.level}] ${l.message}`) || prev.logs,
-          }));
-          setPolling(true);
-        } else if (data.data.status === 'RUNNING') {
-          const realUrl = data.data.endpoint_url;
-          setActiveStepIndex(8);
-          setLiveDeployment(prev => ({
-            ...prev,
-            status: 'deployed',
-            progress: 100,
-            endpointUrl: realUrl,
-            ipAddress: data.data.ip_address || prev.ipAddress,
-            logs: data.data.logs?.map((l: any) => `[${l.timestamp}] [${l.level}] ${l.message}`) || prev.logs,
-          }));
-          updateActiveProject({
-            currentStep: 'deployment',
-            deployment: {
-              status: 'deployed',
-              progress: 100,
-              logs: data.data.logs?.map((l: any) => `[${l.timestamp}] [${l.level}] ${l.message}`) || [],
-              deployedAt: new Date().toISOString(),
-              endpointUrl: realUrl,
-              providerDeploymentId: data.data.deployment_id,
-              ipAddress: data.data.ip_address || data.data.public_ip || null,
-              environmentName: envName,
-              failureReason: null,
-            },
-          });
-          showToast(`Deployed to AWS EC2! URL: ${realUrl}`, 'success');
-        } else {
-          setPolling(true);
-        }
-      } else if (!res.ok) {
+      if (res.ok && data.success && (data.deployment_id || data.data?.id)) {
+        const record = data.data || {};
+        const id: string = data.deployment_id || record.id;
+        const initialLogs: string[] = Array.isArray(record.logs)
+          ? record.logs.map((l: any) => `[${l.timestamp}] [${l.level}] ${l.message}`)
+          : liveDeployment.logs;
+
+        setDeploymentId(id);
+        setLastDeploymentId(id);
+        setStageError(null);
+        setPipelineFailure(null);
+        setActiveStepIndex(4);
+        setLiveDeployment(prev => ({
+          ...prev,
+          status: 'preparing',
+          progress: 5,
+          failureReason: null,
+          endpointUrl: record.liveUrl || null,
+          ipAddress: record.ipAddress || prev.ipAddress,
+          logs: initialLogs,
+        }));
+        setPolling(true);
+        showToast(
+          `Deployment ${id} queued for ${record.repository || repoName} in ${record.region || estimation.region}.`,
+          'success'
+        );
+        return;
+      }
+
+      if (!res.ok) {
+        setStageError({ stage: data.stage || 'PROJECT', message: data.error || 'Deployment failed to initialize.' });
         setLiveDeployment(prev => ({
           ...prev,
           status: 'failed',
@@ -467,6 +598,64 @@ export const Deployment: React.FC = () => {
         failureReason: err.message,
         logs: [...prev.logs, `ERROR: ${err.message}`],
       }));
+    }
+  };
+
+  // Re-run a failed deployment on the same record. CloudWise never stores
+  // secret values, so env vars are re-submitted with the retry request.
+  const handleRetryDeployment = async () => {
+    const id = deploymentId || lastDeploymentId;
+    if (!id) {
+      void handleDeploy();
+      return;
+    }
+
+    const envMap: Record<string, string> = {};
+    for (const row of envRows) {
+      if (row.key) envMap[row.key] = row.value;
+    }
+
+    try {
+      setRetrying(true);
+      const res = await fetch(`/api/deployments/${id}/retry`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ envVars: envMap, environmentName: envName }),
+      });
+      const data = await res.json();
+
+      if (res.status === 409) {
+        showToast(data.error || 'Only a failed deployment can be retried.', 'error');
+        return;
+      }
+      if (!res.ok || !data.success) {
+        setStageError({ stage: data.stage || 'DEPLOYMENT', message: data.error || 'Retry failed.' });
+        showToast(data.error || 'Retry failed.', 'error');
+        return;
+      }
+
+      const record = data.data || {};
+      setDeploymentId(id);
+      setLastDeploymentId(id);
+      setStageError(null);
+      setPipelineFailure(null);
+      setActiveStepIndex(4);
+      setLiveDeployment(prev => ({
+        ...prev,
+        status: 'preparing',
+        progress: 5,
+        failureReason: null,
+        endpointUrl: null,
+        logs: Array.isArray(record.logs)
+          ? record.logs.map((l: any) => `[${l.timestamp}] [${l.level}] ${l.message}`)
+          : [...prev.logs, `[CloudWise] Retry requested for ${record.repository || repoName}.`],
+      }));
+      setPolling(true);
+      showToast(`Retry queued for deployment ${id}.`, 'success');
+    } catch (err: any) {
+      showToast(err.message || 'Retry failed.', 'error');
+    } finally {
+      setRetrying(false);
     }
   };
 
@@ -485,7 +674,7 @@ export const Deployment: React.FC = () => {
         const logsData = await logsRes.json();
 
         if (statusData.success && logsData.success) {
-          const rawStatus: string = statusData.data.status.toUpperCase();
+          const rawStatus: string = String(statusData.data.deploymentStatus || '').toUpperCase();
 
           const statusMap: Record<string, string> = {
             QUEUED: 'preparing',
@@ -497,25 +686,40 @@ export const Deployment: React.FC = () => {
             FAILED: 'failed',
             ROLLING_BACK: 'failed',
             ROLLED_BACK: 'idle',
+            TERMINATED: 'failed',
+            // legacy lowercase records created before migration 0007
+            DEPLOYED: 'deployed',
+            DONE: 'deployed',
           };
           const uiStatus = statusMap[rawStatus] ?? 'preparing';
 
+          const serverProgress = Number(statusData.data.progress);
           const progressMap: Record<string, number> = {
-            preparing: statusData.data.progress || 40,
-            provisioning: statusData.data.progress || 55,
-            configuring: statusData.data.progress || 80,
+            preparing: Number.isFinite(serverProgress) ? serverProgress : 15,
+            provisioning: Number.isFinite(serverProgress) ? serverProgress : 45,
+            configuring: Number.isFinite(serverProgress) ? serverProgress : 70,
             deployed: 100,
-            failed: statusData.data.progress || 45,
+            failed: Number.isFinite(serverProgress) ? serverProgress : 60,
             idle: 0,
           };
+
+          const formattedLogs = logsData.data.map((l: any) => `[${l.timestamp}] [${l.level}] ${l.message}`);
+
+          if (uiStatus === 'failed') {
+            const lastError = [...logsData.data].reverse().find((l: any) => l.level === 'ERROR');
+            setPipelineFailure(
+              lastError ? { stage: String(lastError.stage || ''), message: String(lastError.message || '') } : null
+            );
+            setActiveStepIndex(-2);
+          }
 
           setLiveDeployment(prev => ({
             ...prev,
             status: uiStatus as any,
             progress: progressMap[uiStatus] ?? prev.progress,
-            logs: logsData.data.map((l: any) => `[${l.timestamp}] [${l.level}] ${l.message}`),
-            ipAddress: statusData.data.ip_address || prev.ipAddress,
-            endpointUrl: statusData.data.endpoint_url || prev.endpointUrl,
+            logs: formattedLogs,
+            ipAddress: statusData.data.ipAddress || prev.ipAddress,
+            endpointUrl: statusData.data.liveUrl || prev.endpointUrl,
             failureReason:
               uiStatus === 'failed'
                 ? (logsData.data.filter((l: any) => l.level === 'ERROR').pop()?.message ?? prev.failureReason)
@@ -526,23 +730,22 @@ export const Deployment: React.FC = () => {
             setPolling(false);
             if (uiStatus === 'deployed') {
               setActiveStepIndex(8);
+              setPipelineFailure(null);
               updateActiveProject({
                 currentStep: 'deployment',
                 deployment: {
                   status: 'deployed',
                   progress: 100,
-                  logs: logsData.data.map((l: any) => `[${l.timestamp}] [${l.level}] ${l.message}`),
+                  logs: formattedLogs,
                   deployedAt: new Date().toISOString(),
-                  endpointUrl: statusData.data.endpoint_url || null,
+                  endpointUrl: statusData.data.liveUrl || null,
                   providerDeploymentId: deploymentId,
-                  ipAddress: statusData.data.ip_address || null,
+                  ipAddress: statusData.data.ipAddress || null,
                   environmentName: envName,
                   failureReason: null,
                 },
               });
               showToast('Deployment live on AWS EC2!', 'success');
-            } else if (uiStatus === 'failed') {
-              setActiveStepIndex(-2);
             }
           }
         }
@@ -568,6 +771,8 @@ export const Deployment: React.FC = () => {
       const data = await res.json();
       if (data.success) {
         const rollbackLogs = (data.data.logs ?? []).map((l: any) => `[${l.timestamp}] [${l.level}] ${l.message}`);
+        setStageError(null);
+        setPipelineFailure(null);
         setLiveDeployment(prev => ({
           ...prev,
           status: 'idle',
@@ -624,7 +829,7 @@ export const Deployment: React.FC = () => {
       const logsData = await logsRes.json();
 
       if (statusData.success) {
-        const newUrl = statusData.data.endpoint_url;
+        const newUrl = statusData.data.liveUrl;
         setLiveDeployment(prev => ({
           ...prev,
           endpointUrl: newUrl || prev.endpointUrl,
@@ -653,6 +858,8 @@ export const Deployment: React.FC = () => {
 
   const handleReset = () => {
     setDeploymentId(null);
+    setStageError(null);
+    setPipelineFailure(null);
     setLiveDeployment({ ...contextDeployment, status: 'idle', progress: 0, logs: [] });
     setActiveStepIndex(-1);
     setPolling(false);
@@ -1026,6 +1233,92 @@ export const Deployment: React.FC = () => {
 
         {/* Right Column: 9-step pipeline + logs */}
         <div className="space-y-6 lg:col-span-2">
+          {/* Readiness checklist — every row reflects a real signal */}
+          <div className="glass-panel p-6 rounded-3xl space-y-4 border border-slate-800">
+            <div className="flex items-center justify-between gap-3">
+              <h3 className="text-base font-bold text-white flex items-center gap-2">
+                <ListChecks className="w-5 h-5 text-cyan-400" />
+                <span>Deployment Readiness</span>
+              </h3>
+              {(deploymentId || lastDeploymentId) && (
+                <button
+                  onClick={() => navigate(`/deployment/${deploymentId || lastDeploymentId}`)}
+                  className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-cyan-300 text-[11px] font-bold transition-colors flex items-center gap-1.5"
+                >
+                  <ExternalLink size={12} />
+                  <span>Deployment Details</span>
+                </button>
+              )}
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              {checklist.map(item => (
+                <div
+                  key={item.key}
+                  className={`p-3.5 rounded-2xl border transition-all ${
+                    item.status === 'done'
+                      ? 'bg-emerald-950/20 border-emerald-500/40 text-emerald-300'
+                      : item.status === 'active'
+                      ? 'bg-cyan-950/30 border-cyan-400 text-white shadow-lg shadow-cyan-950/50'
+                      : item.status === 'failed'
+                      ? 'bg-rose-950/20 border-rose-500/40 text-rose-300'
+                      : 'bg-slate-900/40 border-slate-800 text-slate-500'
+                  }`}
+                >
+                  <div className="flex items-center gap-2 font-bold text-xs">
+                    {item.status === 'done' && <CheckCircle2 size={15} className="text-emerald-400 shrink-0" />}
+                    {item.status === 'active' && <RefreshCw size={15} className="text-cyan-400 animate-spin shrink-0" />}
+                    {item.status === 'failed' && <AlertTriangle size={15} className="text-rose-400 shrink-0" />}
+                    {item.status === 'pending' && <Clock size={15} className="shrink-0" />}
+                    <span>{item.label}</span>
+                    <span className="ml-auto text-[10px] uppercase tracking-wider font-extrabold opacity-80">
+                      {item.status === 'done'
+                        ? '✓'
+                        : item.status === 'active'
+                        ? 'in progress'
+                        : item.status === 'failed'
+                        ? 'failed'
+                        : 'waiting'}
+                    </span>
+                  </div>
+                  <p className="text-[10px] text-slate-400 pt-1 leading-snug">{item.desc}</p>
+                  {item.detail && (
+                    <p className="text-[10px] text-slate-300/80 pt-1 font-mono truncate">{item.detail}</p>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            {stageError && (
+              <div className="p-4 rounded-2xl bg-rose-500/10 border border-rose-500/30 space-y-2 text-xs text-rose-300">
+                <div className="flex items-center gap-2 font-bold text-rose-400">
+                  <AlertTriangle size={15} />
+                  <span>{stageError.stage} stage failed</span>
+                </div>
+                <p className="whitespace-pre-wrap bg-slate-900/60 rounded-xl p-3 border border-rose-500/20 text-slate-300">
+                  {stageError.message}
+                </p>
+                <div className="flex items-center gap-2 flex-wrap pt-1">
+                  <button
+                    onClick={() => (stageKeyFromBackendStage(stageError.stage) === 'GITHUB' ? navigate('/files') : handleRetryDeployment())}
+                    className="px-3 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-200 border border-rose-500/40 text-[11px] font-bold transition-colors flex items-center gap-1.5"
+                  >
+                    <RefreshCw size={12} />
+                    <span>
+                      {stageKeyFromBackendStage(stageError.stage) === 'GITHUB' ? 'Fix GitHub Connection' : 'Retry'}
+                    </span>
+                  </button>
+                  <button
+                    onClick={() => setStageError(null)}
+                    className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-300 text-[11px] font-bold transition-colors"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+
           <div className="glass-panel p-6 rounded-3xl space-y-6 border border-slate-800">
             <div className="flex items-center justify-between">
               <h3 className="text-base font-bold text-white flex items-center gap-2">
@@ -1127,6 +1420,24 @@ export const Deployment: React.FC = () => {
                         <span>Fetch Live URL</span>
                       </button>
                     )}
+                    {liveDeployment.endpointUrl && (
+                      <a
+                        href={liveDeployment.endpointUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="px-4 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs transition-all shadow flex items-center gap-1.5"
+                      >
+                        <Globe className="w-3.5 h-3.5" />
+                        <span>Open Live Website</span>
+                      </a>
+                    )}
+                    <button
+                      onClick={() => navigate(`/deployment/${deploymentId || lastDeploymentId || ''}`)}
+                      className="px-4 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-cyan-300 font-bold text-xs transition-all flex items-center gap-1.5"
+                    >
+                      <ExternalLink className="w-3.5 h-3.5" />
+                      <span>Deployment Details</span>
+                    </button>
                     <button
                       onClick={handleProceedToMonitoring}
                       className="px-4 py-2.5 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs transition-all shadow"
@@ -1158,11 +1469,41 @@ export const Deployment: React.FC = () => {
                 </div>
 
                 {liveDeployment.failureReason && (
-                  <div className="space-y-1">
+                  <div className="space-y-2">
                     <span className="font-semibold text-rose-400">Error:</span>
-                    <p className="text-slate-300 whitespace-pre-wrap bg-slate-900/60 rounded-xl p-3 border border-rose-500/20">
+                    <p className="text-slate-300 whitespace-pre-wrap bg-slate-900/60 rounded-xl p-3 border border-rose-500/20 text-xs">
                       {liveDeployment.failureReason}
                     </p>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <button
+                        onClick={handleRetryAnalysis}
+                        className="px-3 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-200 border border-rose-500/40 text-[11px] font-bold transition-colors flex items-center gap-1.5"
+                      >
+                        <RefreshCw size={12} />
+                        <span>Retry Analysis</span>
+                      </button>
+                      {tokenExpired && (
+                        <button
+                          onClick={handleRetryAnalysis}
+                          className="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/40 text-[11px] font-bold transition-colors flex items-center gap-1.5"
+                        >
+                          <span>Re-authenticate GitHub</span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Scan progress steps */}
+                {scanProgress.length > 0 && (
+                  <div className="space-y-1 mt-2">
+                    <span className="font-semibold text-cyan-400 text-xs">Scan Progress:</span>
+                    {scanProgress.map((step, i) => (
+                      <div key={i} className={`flex items-center gap-1.5 text-[11px] ${i === scanProgress.length - 1 ? 'text-cyan-300' : 'text-slate-400'}`}>
+                        {i < scanProgress.length - 1 ? <CheckCircle2 size={12} className="text-green-400 shrink-0" /> : <RefreshCw size={12} className="animate-spin shrink-0" />}
+                        <span>{step.message}</span>
+                      </div>
+                    ))}
                   </div>
                 )}
 
@@ -1191,19 +1532,29 @@ export const Deployment: React.FC = () => {
                   </div>
                 )}
 
-                <div className="pt-2 flex items-center gap-2">
+                <div className="pt-2 flex items-center gap-2 flex-wrap">
+                  <button
+                    onClick={handleRetryDeployment}
+                    disabled={retrying}
+                    className="px-4 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white font-bold text-xs transition-colors disabled:opacity-50 flex items-center gap-1.5"
+                  >
+                    <RefreshCw size={13} className={retrying ? 'animate-spin' : ''} />
+                    <span>{retrying ? 'Retrying…' : 'Retry Failed Deployment'}</span>
+                  </button>
                   <button
                     onClick={handleRollback}
                     className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs transition-colors"
                   >
                     Initiate Instant Rollback
                   </button>
-                  <button
-                    onClick={handleDeploy}
-                    className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs border border-slate-700 transition-colors"
-                  >
-                    Retry Deployment
-                  </button>
+                  {(deploymentId || lastDeploymentId) && (
+                    <button
+                      onClick={() => navigate(`/deployment/${deploymentId || lastDeploymentId}`)}
+                      className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs border border-slate-700 transition-colors"
+                    >
+                      Deployment Details
+                    </button>
+                  )}
                 </div>
               </div>
             )}

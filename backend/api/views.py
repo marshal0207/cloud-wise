@@ -2,6 +2,7 @@ import random
 import math
 import re
 import secrets
+import logging
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -53,11 +54,12 @@ from .services.tech_stack_detector import (
 )
 from .services.aws_pricing_service import AwsPricingError, get_aws_price_snapshot
 from .services.free_tier_policy import FreeTierLimitError, validate_free_tier_deployment, evaluate_free_tier_eligibility
-from .services.deployment.mock_provider import MockDeploymentProvider, UnsupportedProviderError
-from .services.deployment.vercel_provider import VercelDeploymentService, VercelApiError
-from .services.deployment.render_provider import RenderDeploymentService, RenderApiError
-from .services.deployment.health_check import DeploymentHealthCheckService
-from .services.deployment.rollback import DeploymentRollbackService
+from .services.deployment.pipeline import (
+    append_log,
+    fail_deployment,
+    start_pipeline,
+)
+from .services.deployment.status import DeploymentStage, DeploymentStatus
 from .services.deployment.aws_connection_service import (
     AwsConnectionError,
     build_policies,
@@ -70,6 +72,37 @@ from .services.deployment.aws_connection_service import (
 from .services.deployment.aws_ec2_provider import AwsEc2Error, AwsEc2Provider
 
 User = get_user_model()
+
+logger = logging.getLogger(__name__)
+
+# Salt for the signed OAuth `state` parameter (CSRF protection). It keeps the
+# GitHub state value in a namespace of its own so a signed value issued for a
+# different purpose can never be replayed as an OAuth state.
+GITHUB_OAUTH_STATE_SALT = 'cloudwise.github.oauth.start'
+
+
+def get_user_github_connection(user):
+    """Return the GitHubConnection attached to a CloudWise user, or None."""
+    if user is None or not getattr(user, 'is_authenticated', False):
+        return None
+    try:
+        return user.github_connection
+    except GitHubConnection.DoesNotExist:
+        return None
+    except Exception:  # pragma: no cover - defensive (schema not migrated yet)
+        logger.exception(
+            "Unable to read GitHub connection for CloudWise user %s",
+            getattr(user, 'pk', None),
+        )
+        return None
+
+
+def get_user_github_token(user):
+    """Return (connection, decrypted_github_token) for a CloudWise user."""
+    connection = get_user_github_connection(user)
+    if connection is None:
+        return None, None
+    return connection, connection.get_token()
 
 
 # Helper to extract user identity and role from headers / auth
@@ -359,9 +392,27 @@ def project_github_connect_view(request, pk):
     }, status=status.HTTP_200_OK)
 
 
+def require_cloudwise_user(request):
+    """Return a {success, error} 401 envelope when the caller is not signed in.
+
+    GitHub endpoints answer with the project envelope instead of DRF's bare
+    {"detail": ...} so the React client can show a real message.
+    """
+    if request.user.is_authenticated:
+        return None
+    return Response({
+        'success': False,
+        'code': 'AUTH_REQUIRED',
+        'error': 'Please sign in to CloudWise before using GitHub features.',
+    }, status=status.HTTP_401_UNAUTHORIZED)
+
+
 @api_view(['POST'])
-@permission_classes([permissions.IsAuthenticated])
+@permission_classes([permissions.AllowAny])
 def project_github_push_view(request, pk):
+    unauthorized = require_cloudwise_user(request)
+    if unauthorized is not None:
+        return unauthorized
     try:
         project = Project.objects.get(pk=pk, user=request.user)
     except Project.DoesNotExist:
@@ -393,7 +444,7 @@ def project_github_push_view(request, pk):
     try:
         connection = request.user.github_connection
         result = push_files_to_repository(
-            connection.access_token,
+            connection.get_token(),
             repository,
             files,
             commit_message,
@@ -416,68 +467,46 @@ def project_github_push_view(request, pk):
     }, status=status.HTTP_200_OK)
 
 
-@api_view(['POST'])
-@permission_classes([permissions.IsAuthenticated])
-def project_github_inspect_view(request, pk):
-    try:
-        project = Project.objects.get(pk=pk)
-    except Project.DoesNotExist:
-        return Response({
-            'status': 'ERROR',
-            'code': 'PROJECT_NOT_FOUND',
-            'success': False,
-            'error': 'Project not found or access denied.'
-        }, status=status.HTTP_404_NOT_FOUND)
+def _run_repository_inspection(user, repository, persist_project=None):
+    """Scan a repository using *this* CloudWise user's GitHub authorization.
 
-    if project.user_id != request.user.id:
-        return Response({
-            'status': 'ERROR',
-            'code': 'PROJECT_ACCESS_DENIED',
-            'success': False,
-            'error': 'Project not found or access denied.'
-        }, status=status.HTTP_404_NOT_FOUND)
-
-    repository = project.github_repo or {}
-    body_repo_name = request.data.get('repoName', '').strip()
-    if not repository.get('name') and body_repo_name:
-        repository = {'name': body_repo_name}
-
-    if not repository or (isinstance(repository, dict) and not repository.get('name')):
-        return Response({
-            'status': 'ERROR',
-            'code': 'GITHUB_REPOSITORY_NOT_CONFIGURED',
-            'success': False,
-            'error': 'Select and connect a GitHub repository before inspecting it.'
-        }, status=status.HTTP_409_CONFLICT)
-
+    Returns a DRF Response. When ``persist_project`` is given, the scanned
+    tree is persisted on that project (project-scoped endpoint).
+    """
     access_token = None
     try:
-        connection = request.user.github_connection
-        access_token = connection.access_token
+        connection = user.github_connection
+        access_token = connection.get_token()
     except GitHubConnection.DoesNotExist:
         pass
 
+    # Progress callback for the frontend scan UI
+    _progress_items = []
+    def _progress(stage: str, message: str, pct: int):
+        _progress_items.append({'stage': stage, 'message': message, 'progress': pct})
+
     try:
-        inspection = inspect_repository(access_token, repository)
+        inspection = inspect_repository(
+            access_token, repository, progress_callback=_progress,
+        )
         try:
             stack = detect_tech_stack(inspection['files'])
             stack_data = asdict(stack)
         except UnsupportedTechStackError:
             stack_data = None
 
-        # Structured CloudWise analysis: frontend/backend/database/env/type
         analysis = analyze_repository(
             inspection.get('files') or {},
             tree=inspection.get('tree') or [],
             repository_size=inspection.get('repositorySize') or {},
         )
 
-        # Update and persist scanned repository metadata on the project
         repo_info = inspection.get('repository', {})
-        repo_full_name = repo_info.get('full_name') if isinstance(repo_info, dict) else str(repo_info)
+        repo_dict = repo_info if isinstance(repo_info, dict) else {}
+        repo_full_name = repo_dict.get('full_name') if repo_dict else str(repo_info)
         updated_github_repo = {
             'name': repo_full_name,
-            'owner': repo_info.get('owner') if isinstance(repo_info, dict) else '',
+            'owner': repo_dict.get('owner', '') if repo_dict else '',
             'defaultBranch': inspection.get('branch', 'main'),
             'commitSha': inspection.get('commitSha', ''),
             'synced': True,
@@ -487,8 +516,9 @@ def project_github_inspect_view(request, pk):
             'tree': inspection.get('tree', []),
             'files': list(inspection.get('files', {}).keys()),
         }
-        project.github_repo = updated_github_repo
-        project.save(update_fields=['github_repo', 'updated_at'])
+        if persist_project is not None:
+            persist_project.github_repo = updated_github_repo
+            persist_project.save(update_fields=['github_repo', 'updated_at'])
 
         return Response({
             'status': 'SUCCESS',
@@ -497,6 +527,8 @@ def project_github_inspect_view(request, pk):
                 'repository': inspection.get('repository'),
                 'branch': inspection.get('branch'),
                 'commitSha': inspection.get('commitSha'),
+                'commitMessage': inspection.get('commitMessage', ''),
+                'commitDate': inspection.get('commitDate', ''),
                 'tree': inspection.get('tree', []),
                 'files': inspection.get('files', {}),
                 'totalFiles': inspection.get('totalFiles', 0),
@@ -507,8 +539,10 @@ def project_github_inspect_view(request, pk):
                 'has_dockerfile': inspection.get('has_dockerfile', False),
                 'has_compose': inspection.get('has_compose', False),
                 'has_cicd': inspection.get('has_cicd', False),
+                'visibility': repo_dict.get('visibility', ''),
                 **analysis,
-            }
+            },
+            'progress': _progress_items,
         }, status=status.HTTP_200_OK)
     except RepositoryLimitError as exc:
         return Response({
@@ -534,12 +568,12 @@ def project_github_inspect_view(request, pk):
             403: 'GITHUB_PERMISSION_DENIED',
             404: 'GITHUB_REPO_NOT_FOUND',
             409: 'GITHUB_REPOSITORY_NOT_CONFIGURED',
+            422: 'INVALID_REPOSITORY_DATA',
             429: 'GITHUB_RATE_LIMITED',
             502: 'GITHUB_UPSTREAM_ERROR',
         }
         err_code = code_map.get(st_code, 'GITHUB_API_ERROR')
 
-        # For auth failures (401) or rate limits (403), try serving the cached tree
         if st_code in (401, 403) and isinstance(repository, dict) and repository.get('tree'):
             cached_tree = repository.get('tree', [])
             cached_files_list = repository.get('files', [])
@@ -581,19 +615,27 @@ def project_github_inspect_view(request, pk):
                     'has_compose': False,
                     'has_cicd': False,
                     **cached_analysis,
-                }
+                },
+                'progress': _progress_items,
             }, status=status.HTTP_200_OK)
 
-        res_status = st_code if st_code in (400, 401, 403, 404, 409, 429, 500, 502) else status.HTTP_500_INTERNAL_SERVER_ERROR
+        res_status = st_code if st_code in (400, 401, 403, 404, 409, 422, 429, 500, 502) else status.HTTP_500_INTERNAL_SERVER_ERROR
+        error_message = str(exc)
+        if access_token is None and st_code in (401, 404):
+            error_message = (
+                f"{error_message} Connect your GitHub account "
+                "(Authorize GitHub Account) to access private repositories."
+            )
         return Response({
             'status': 'ERROR',
             'code': err_code,
             'success': False,
-            'error': str(exc),
-            'message': str(exc),
+            'error': error_message,
+            'message': error_message,
             'details': getattr(exc, 'details', str(exc)),
             'token_expired': st_code == 401,
-            'rate_limited': st_code == 403,
+            'rate_limited': st_code == 429,
+            'progress': _progress_items,
         }, status=res_status)
     except Exception as exc:
         return Response({
@@ -605,6 +647,70 @@ def project_github_inspect_view(request, pk):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@api_view(['POST'])
+@permission_classes([permissions.AllowAny])
+def project_github_inspect_view(request, pk):
+    unauthorized = require_cloudwise_user(request)
+    if unauthorized is not None:
+        return unauthorized
+    try:
+        project = Project.objects.get(pk=pk)
+    except Project.DoesNotExist:
+        return Response({
+            'status': 'ERROR',
+            'code': 'PROJECT_NOT_FOUND',
+            'success': False,
+            'error': 'Project not found or access denied.'
+        }, status=status.HTTP_404_NOT_FOUND)
+
+    if project.user_id != request.user.id:
+        return Response({
+            'status': 'ERROR',
+            'code': 'PROJECT_ACCESS_DENIED',
+            'success': False,
+            'error': 'Project not found or access denied.'
+        }, status=status.HTTP_404_NOT_FOUND)
+
+    # Always prefer the repoName supplied by the caller.  A stale
+    # project.github_repo must never shadow a fresh selection.
+    body_repo_name = (request.data.get('repoName') or '').strip()
+    if body_repo_name:
+        repository = {'name': body_repo_name}
+    else:
+        repository = project.github_repo or {}
+
+    if not repository or (isinstance(repository, dict) and not repository.get('name')):
+        return Response({
+            'status': 'ERROR',
+            'code': 'GITHUB_REPOSITORY_NOT_CONFIGURED',
+            'success': False,
+            'error': 'Select and connect a GitHub repository before inspecting it.'
+        }, status=status.HTTP_409_CONFLICT)
+
+    return _run_repository_inspection(request.user, repository, persist_project=project)
+
+
+@api_view(['POST'])
+@permission_classes([permissions.AllowAny])
+def github_repository_inspect_view(request, repo_path):
+    """Inspect an arbitrary ``owner/repo`` using the caller's GitHub token.
+
+    Used by the deployment pipeline, which analyses a repository directly
+    instead of through a CloudWise project.
+    """
+    unauthorized = require_cloudwise_user(request)
+    if unauthorized is not None:
+        return unauthorized
+    repository_name = (request.data.get('repoName') or '').strip() or repo_path.strip()
+    if not repository_name:
+        return Response({
+            'status': 'ERROR',
+            'code': 'GITHUB_REPOSITORY_NOT_CONFIGURED',
+            'success': False,
+            'error': 'Provide a repository in owner/repo form.'
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    return _run_repository_inspection(request.user, {'name': repository_name})
 
 
 # -------------------------------------------------------------
@@ -683,104 +789,114 @@ def estimate_view(request):
     }, status=status.HTTP_200_OK)
 
 
-@api_view(['POST'])
-@permission_classes([permissions.IsAuthenticated])
-def deploy_view(request):
+def _project_type_label(detection: dict) -> str:
+    """Compact human label for the detected stack (shown on the details page)."""
+    detection = detection or {}
+    parts = [
+        str(detection.get('frontend') or '').strip(),
+        str(detection.get('backend') or '').strip(),
+    ]
+    label = ' + '.join(p for p in parts if p)
+    if not label:
+        label = str(detection.get('applicationType') or '').strip() or 'UNKNOWN'
+    database = str(detection.get('database') or '').strip()
+    if database:
+        label = f'{label} / {database}'
+    return label[:150]
+
+
+def _prepare_repository_payload(user, project_id, data, env_vars):
     """
-    Real deployment endpoint — AWS EC2 only (active target).
+    Shared pre-flight for creating a deployment and for retrying one.
 
-    Vercel and Render are isolated/deprecated: their provider modules are
-    retained for existing records but new deploys are rejected.
+    Resolves the user's project, reads the linked GitHub repository,
+    generates the deployment files, validates the environment variables
+    and checks the user's AWS connection.
 
-    AWS flow:
-      1. Inspect the linked GitHub repository.
-      2. Generate Docker/compose files (preserve existing Dockerfiles).
-      3. Validate required environment variables + DATABASE_URL scheme.
-      4. Provision (or reuse) EC2 in the user's AWS account (Part 3).
-      5. Upload files + run docker compose via SSM (Part 4).
-      6. Health-check and return the live URL (Part 5).
+    Returns ``(payload, project, None)`` on success, or
+    ``(None, None, Response)`` carrying a stage-tagged, actionable error:
 
-    Returns BLOCKED if the AWS account is not connected.
-    Returns FAILED with the real provider error on build/deploy failure.
-    Returns RUNNING with the real provider URL on success.
+        PROJECT     — project missing or not owned by this user
+        GITHUB      — repository not linked / unreadable
+        ENVIRONMENT — missing or invalid environment variables
+        AWS         — no AWS connection for this user
     """
-    data = request.data or {}
-    provider_name = str(data.get('provider', 'AWS')).strip()
-    project_id = data.get('projectId', '').strip()
-    simulate_error = bool(data.get('simulateError', False))
-
     # ----------------------------------------------------------------
-    # Isolate deprecated providers — code retained, new deploys rejected
-    # ----------------------------------------------------------------
-    if provider_name.upper() in ('VERCEL', 'RENDER'):
-        return Response({
-            'success': False,
-            'status': 'RETIRED',
-            'error': (
-                f'{provider_name} deployments are retired. '
-                'CloudWise deploys to AWS EC2 only. '
-                'Connect your AWS account and redeploy there.'
-            ),
-            'required': ['AWS_ROLE_ARN'],
-            'connectUrl': '/connect-aws',
-            'supported': ['AWS'],
-        }, status=status.HTTP_400_BAD_REQUEST)
-
-    # ----------------------------------------------------------------
-    # Resolve active project and its GitHub repository
+    # Stage: PROJECT
     # ----------------------------------------------------------------
     project = None
     if project_id:
-        try:
-            project = Project.objects.get(pk=project_id, user=request.user)
-        except Project.DoesNotExist:
-            pass
-    if project is None:
-        project = Project.objects.filter(user=request.user).order_by('-updated_at').first()
+        project = Project.objects.filter(pk=project_id, user=user).first()
+        if project is None:
+            return None, None, Response({
+                'success': False,
+                'stage': 'PROJECT',
+                'error': f'Project "{project_id}" not found.',
+            }, status=status.HTTP_404_NOT_FOUND)
+    else:
+        project = Project.objects.filter(user=user).order_by('-updated_at').first()
 
     if project is None:
-        return Response({
+        return None, None, Response({
             'success': False,
+            'stage': 'PROJECT',
             'error': 'No active project found. Create a project first.',
         }, status=status.HTTP_400_BAD_REQUEST)
 
+    # ----------------------------------------------------------------
+    # Stage: GITHUB
+    # ----------------------------------------------------------------
     github_repo = project.github_repo or {}
-    repo_name = github_repo.get('name', '').strip()
+    repo_name = str(github_repo.get('name', '')).strip()
     if not repo_name or '/' not in repo_name:
-        return Response({
+        return None, None, Response({
             'success': False,
-            'error': 'No GitHub repository linked to this project. Connect a repository first.',
+            'stage': 'GITHUB',
+            'error': (
+                'No GitHub repository linked to this project. '
+                'Authorize GitHub and select a repository first.'
+            ),
+            'connectUrl': '/generate',
         }, status=status.HTTP_400_BAD_REQUEST)
 
-    # ----------------------------------------------------------------
-    # Resolve GitHub access token
-    # ----------------------------------------------------------------
-    try:
-        github_connection = request.user.github_connection
-        github_token = github_connection.access_token
-    except GitHubConnection.DoesNotExist:
-        return Response({
+    github_connection = get_user_github_connection(user)
+    if github_connection is None:
+        return None, None, Response({
             'success': False,
+            'stage': 'GITHUB',
             'error': 'GitHub account not connected. Authorize GitHub first.',
+            'connectUrl': '/generate',
+        }, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        github_token = github_connection.get_token()
+    except Exception:  # noqa: BLE001 — decryption/rotation failure
+        logger.exception("Stored GitHub token unreadable for user %s", user.pk)
+        return None, None, Response({
+            'success': False,
+            'stage': 'GITHUB',
+            'error': (
+                'Stored GitHub authorization could not be read. '
+                'Re-authorize your GitHub account and try again.'
+            ),
+            'connectUrl': '/generate',
         }, status=status.HTTP_400_BAD_REQUEST)
 
-    # ----------------------------------------------------------------
-    # Inspect repository + generate Docker deployment files
-    # ----------------------------------------------------------------
+    # Imported here so the repository reader is resolved at call time.
     from .services.github_repository_service import inspect_repository
-    from .services.deployment_file_generator import generate_deployment_files
 
     try:
         inspection = inspect_repository(github_token, github_repo)
     except RepositoryLimitError as exc:
-        return Response({
+        return None, None, Response({
             'success': False,
+            'stage': 'GITHUB',
             'code': 'REPOSITORY_LIMIT_EXCEEDED',
             'error': str(exc),
         }, status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
     except Exception as exc:
-        return Response({
+        return None, None, Response({
             'success': False,
+            'stage': 'GITHUB',
             'error': f'Cannot access GitHub repository "{repo_name}": {exc}',
         }, status=status.HTTP_400_BAD_REQUEST)
 
@@ -788,31 +904,28 @@ def deploy_view(request):
     tree = inspection.get('tree') or []
 
     try:
-        generated = generate_deployment_files(
-            repo_files, provider='AWS', tree=tree,
-        )
+        generated = generate_deployment_files(repo_files, provider='AWS', tree=tree)
     except (TypeError, ValueError) as exc:
-        return Response({
+        return None, None, Response({
             'success': False,
+            'stage': 'GITHUB',
             'error': str(exc),
         }, status=status.HTTP_400_BAD_REQUEST)
 
-    # Merge generated Docker/compose/nginx over the inspected tree
-    # (generator already preserves existing Dockerfiles/compose).
     deploy_files = {**repo_files, **(generated.get('files') or {})}
-    # Do not upload GitHub Actions workflows to the instance.
+    # Never upload GitHub Actions workflows to the instance.
     deploy_files = {
         k: v for k, v in deploy_files.items()
         if not str(k).replace('\\', '/').startswith('.github/')
     }
     deployment_plan = generated.get('deploymentPlan') or {}
     app_port = int(generated.get('port') or 80)
+    detection = generated.get('detection') or {}
 
     # ----------------------------------------------------------------
-    # Environment variables (user-supplied) + validation
+    # Stage: ENVIRONMENT
     # ----------------------------------------------------------------
-    env_vars = dict(data.get('envVars') or {})
-    env_vars = {str(k): str(v) for k, v in env_vars.items() if k}
+    env_vars = {str(k): str(v) for k, v in dict(env_vars or {}).items() if k}
 
     required_env = list(deployment_plan.get('requiredEnvVars') or [])
     missing_env = [
@@ -820,8 +933,9 @@ def deploy_view(request):
         if not str(env_vars.get(key, '')).strip()
     ]
     if missing_env:
-        return Response({
+        return None, None, Response({
             'success': False,
+            'stage': 'ENVIRONMENT',
             'code': 'MISSING_ENV_VARS',
             'error': (
                 'Missing required environment variable(s): '
@@ -833,7 +947,6 @@ def deploy_view(request):
             'required': required_env,
         }, status=status.HTTP_400_BAD_REQUEST)
 
-    # Validate DATABASE_URL / MONGO_URI style schemes when present
     allowed_schemes = getattr(
         settings, 'AWS_ALLOWED_DB_URL_SCHEMES',
         ('postgres://', 'postgresql://', 'mysql://', 'mongodb://'),
@@ -844,8 +957,9 @@ def deploy_view(request):
             continue
         lowered = raw_url.strip().lower()
         if not any(lowered.startswith(s) for s in allowed_schemes):
-            return Response({
+            return None, None, Response({
                 'success': False,
+                'stage': 'ENVIRONMENT',
                 'code': 'INVALID_DATABASE_URL',
                 'error': (
                     f'{url_key} has an invalid scheme. Expected one of: '
@@ -856,227 +970,153 @@ def deploy_view(request):
             }, status=status.HTTP_400_BAD_REQUEST)
 
     # ----------------------------------------------------------------
-    # Simulate error path (test button) — uses mock, clearly labelled
+    # Stage: AWS — the user must have connected their own account
     # ----------------------------------------------------------------
-    if simulate_error:
-        mock_provider = MockDeploymentProvider()
-        env_name = data.get('environmentName', f'{project.name.lower().replace(" ", "-")}-prod')
-        start_result = mock_provider.start({
-            'environment_name': env_name,
-            'provider': 'AWS',
-            'region': data.get('region', 'us-east-1'),
-            'specs': data.get('specs', {}),
-        })
-        mock_provider.fail(
-            start_result['deployment_id'],
-            reason=f'Simulated quota exceeded. Cannot allocate resources for {repo_name}.',
-        )
-        record = DeploymentRecord.objects.create(
-            user=request.user,
-            environment_name=env_name,
-            provider='AWS',
-            monthly_cost=data.get('monthlyCost', 0),
-            specs=data.get('specs', {}),
-            region=data.get('region', 'us-east-1'),
-            status='FAILED',
-            ip_address=None,
-            endpoint_url=None,
-            logs=mock_provider.get_logs(start_result['deployment_id']),
-        )
-        response_data = DeploymentRecordSerializer(record).data
-        response_data['deployment_id'] = start_result['deployment_id']
-        response_data['simulated'] = True
-        return Response({'success': True, 'data': response_data}, status=status.HTTP_200_OK)
-
-    # ----------------------------------------------------------------
-    # REAL DEPLOYMENT — AWS EC2 (inside the USER's AWS account)
-    # ----------------------------------------------------------------
-    if provider_name.upper() == 'AWS':
-        aws_connection = AWSConnection.objects.filter(
-            user=request.user, status='active'
-        ).first()
-        if aws_connection is None:
-            return Response({
-                'success': False,
-                'status': 'BLOCKED',
-                'error': (
-                    'BLOCKED — AWS account not connected. '
-                    'Connect your AWS account (IAM role) to deploy to AWS EC2.'
-                ),
-                'required': ['AWS_ROLE_ARN'],
-                'connectUrl': '/connect-aws',
-            }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
-
-        env_name = data.get('environmentName') or f"{project.name.lower().replace(' ', '-')}-prod"
-
-        # ---- Step A: provision / reuse EC2 (Part 3) ----
-        try:
-            aws_provider = AwsEc2Provider(user=request.user, connection=aws_connection)
-            result = aws_provider.start({
-                'environment_name': env_name,
-                'provider': 'AWS',
-                'region': data.get('region') or aws_connection.region,
-                'instance_type': data.get('instanceType') or None,
-                'force_new_instance': bool(data.get('forceNewInstance', False)),
-                'specs': data.get('specs', {}),
-            })
-        except AwsEc2Error as exc:
-            record = DeploymentRecord.objects.create(
-                user=request.user,
-                environment_name=env_name,
-                provider='AWS',
-                monthly_cost=data.get('monthlyCost', 0),
-                specs=data.get('specs', {}),
-                region=data.get('region') or aws_connection.region,
-                status='FAILED',
-                ip_address=None,
-                endpoint_url=None,
-                logs=[{'timestamp': datetime.now().isoformat(), 'level': 'ERROR',
-                        'stage': 'DEPLOYING', 'message': str(exc)}],
-            )
-            return Response({
-                'success': False,
-                'error': str(exc),
-                'data': DeploymentRecordSerializer(record).data,
-            }, status=status.HTTP_502_BAD_GATEWAY)
-
-        instance_id = result.get('instance_id')
-        public_ip = result.get('public_ip') or ''
-        provision_logs = list(result.get('logs') or [])
-
-        # ---- Step B: upload files + docker compose (Part 4) ----
-        deploy_logs = []
-        endpoint_url = None
-        deploy_status = result.get('status', 'RUNNING')
-        try:
-            deploy_result = aws_provider.deploy({
-                'instance_id': instance_id,
-                'deployment_id': instance_id,
-                'files': deploy_files,
-                'env_vars': env_vars,
-                'project_id': str(project.pk),
-                'environment_name': env_name,
-                'port': app_port,
-                'region': data.get('region') or aws_connection.region,
-            })
-            deploy_logs = list(deploy_result.get('logs') or [])
-            endpoint_url = deploy_result.get('endpoint_url') or None
-            deploy_status = deploy_result.get('status') or 'RUNNING'
-        except AwsEc2Error as exc:
-            failed_logs = provision_logs + [{
-                'timestamp': datetime.now().isoformat(),
-                'level': 'ERROR',
-                'stage': 'FAILED',
-                'message': str(exc),
-            }]
-            record = DeploymentRecord.objects.create(
-                user=request.user,
-                environment_name=env_name,
-                provider='AWS',
-                provider_deployment_id=instance_id,
-                provider_project_id=result.get('security_group_id'),
-                monthly_cost=data.get('monthlyCost', 0),
-                specs={
-                    **(data.get('specs') or {}),
-                    'instanceId': instance_id,
-                    'instanceType': result.get('instance_type'),
-                    'reused': result.get('reused', False),
-                    'securityGroupId': result.get('security_group_id'),
-                    'amiId': result.get('ami_id'),
-                },
-                region=result.get('region', aws_connection.region),
-                status='FAILED',
-                ip_address=public_ip or None,
-                endpoint_url=None,
-                logs=failed_logs,
-            )
-            project.deployment = {
-                **(project.deployment or {}),
-                'provider': 'AWS',
-                'awsInstanceId': instance_id,
-                'provider_deployment_id': instance_id,
-                'status': 'FAILED',
-                'ipAddress': public_ip,
-            }
-            project.save(update_fields=['deployment'])
-            return Response({
-                'success': False,
-                'error': str(exc),
-                'data': DeploymentRecordSerializer(record).data,
-            }, status=status.HTTP_502_BAD_GATEWAY)
-
-        all_logs = provision_logs + deploy_logs
-        valid_statuses = (
-            'RUNNING', 'FAILED', 'BUILDING', 'DEPLOYING',
-            'HEALTH_CHECK', 'PREPARING', 'QUEUED',
-        )
-        record = DeploymentRecord.objects.create(
-            user=request.user,
-            environment_name=env_name,
-            provider='AWS',
-            provider_deployment_id=instance_id,
-            provider_project_id=result.get('security_group_id'),
-            monthly_cost=data.get('monthlyCost', 0),
-            specs={
-                **(data.get('specs') or {}),
-                'instanceId': instance_id,
-                'instanceType': result.get('instance_type'),
-                'reused': result.get('reused', False),
-                'securityGroupId': result.get('security_group_id'),
-                'amiId': result.get('ami_id'),
-                'appPort': app_port,
-            },
-            region=result.get('region', aws_connection.region),
-            status=deploy_status if deploy_status in valid_statuses else 'RUNNING',
-            ip_address=public_ip or None,
-            endpoint_url=endpoint_url,
-            logs=all_logs,
-        )
-
-        # Persist instance + live URL back to the project for reuse
-        project.deployment = {
-            **(project.deployment or {}),
-            'provider': 'AWS',
-            'awsInstanceId': instance_id,
-            'provider_deployment_id': instance_id,
-            'status': record.status,
-            'ipAddress': public_ip,
-            'endpointUrl': endpoint_url,
-            'appPort': app_port,
-        }
-        project.save(update_fields=['deployment'])
-
-        response_data = DeploymentRecordSerializer(record).data
-        response_data['deployment_id'] = instance_id
-        response_data['instanceId'] = instance_id
-        response_data['reused'] = result.get('reused', False)
-        response_data['securityGroupId'] = result.get('security_group_id')
-        response_data['endpoint_url'] = endpoint_url
-        response_data['appPort'] = app_port
-        response_data['detection'] = generated.get('detection')
-        response_data['deploymentPlan'] = deployment_plan
-        response_data['simulated'] = False
-        action = 'Reused existing' if result.get('reused') else 'Provisioned'
-        return Response({
-            'success': record.status != 'FAILED',
-            'message': (
-                f'{action} EC2 instance {instance_id} in '
-                f'{result.get("region", "")} (AWS account '
-                f'{aws_connection.account_id or "connected"}). '
-                + (
-                    f'Application live at {endpoint_url}.'
-                    if endpoint_url and record.status != 'FAILED'
-                    else 'Container deployment did not complete successfully.'
-                )
+    aws_connection = AWSConnection.objects.filter(
+        user=user, status='active'
+    ).first()
+    if aws_connection is None:
+        return None, None, Response({
+            'success': False,
+            'stage': 'AWS',
+            'status': 'BLOCKED',
+            'error': (
+                'BLOCKED — AWS account not connected. '
+                'Connect your AWS account (IAM role) to deploy to AWS EC2.'
             ),
-            'data': response_data,
-        }, status=status.HTTP_200_OK)
+            'required': ['AWS_ROLE_ARN'],
+            'connectUrl': '/connect-aws',
+        }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
+    payload = {
+        'project_id': str(project.pk),
+        'environment_name': str(
+            data.get('environmentName')
+            or f"{project.name.lower().replace(' ', '-')}-prod"
+        ),
+        'region': str(data.get('region') or aws_connection.region),
+        'instance_type': str(data.get('instanceType') or ''),
+        'force_new_instance': bool(data.get('forceNewInstance', False)),
+        'files': deploy_files,
+        'env_vars': env_vars,
+        'port': app_port,
+        'detection': detection,
+        'deployment_plan': deployment_plan,
+        'specs': dict(data.get('specs') or {}),
+        'monthly_cost': data.get('monthlyCost', 0),
+        'repository': repo_name,
+        'commit_sha': str(inspection.get('commitSha') or ''),
+        'project_type': _project_type_label(detection),
+        'aws_connection': aws_connection,
+        'github_connection': github_connection,
+    }
+    return payload, project, None
+
+
+@api_view(['POST'])
+@permission_classes([permissions.IsAuthenticated])
+def deploy_view(request):
+    """
+    Create a deployment of the user's GitHub repository into the same
+    user's AWS account.
+
+    Fast, actionable checks run synchronously (see
+    ``_prepare_repository_payload`` for the stage-tagged errors).
+    Provisioning, container deployment and health checks run on the
+    background pipeline (api.services.deployment.pipeline) and are
+    observed through:
+
+        GET  /api/deployments                      — list mine
+        GET  /api/deployments/<id>                 — full details
+        GET  /api/deployments/<id>/status          — live status
+        GET  /api/deployments/<id>/logs            — structured logs
+        POST /api/deployments/<id>/health          — real HTTP health check
+        POST /api/deployments/<id>/retry           — rerun a failed deploy
+        POST /api/deployments/<id>/terminate       — terminate my EC2 instance
+    """
+    data = request.data or {}
+    provider_name = str(data.get('provider', 'AWS')).strip()
+    project_id = str(data.get('projectId', '')).strip()
+
+    # Retired providers — AWS EC2 is the only active target.
+    if provider_name.upper() in ('VERCEL', 'RENDER'):
+        return Response({
+            'success': False,
+            'stage': 'PROJECT',
+            'status': 'RETIRED',
+            'error': (
+                f'{provider_name} deployments are retired. '
+                'CloudWise deploys to AWS EC2 only. '
+                'Connect your AWS account and redeploy there.'
+            ),
+            'required': ['AWS_ROLE_ARN'],
+            'connectUrl': '/connect-aws',
+            'supported': ['AWS'],
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    if provider_name.upper() != 'AWS':
+        return Response({
+            'success': False,
+            'stage': 'AWS',
+            'error': f'Unknown provider "{provider_name}". Supported: AWS.',
+            'supported': ['AWS'],
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    payload, project, error = _prepare_repository_payload(
+        request.user, project_id, data, data.get('envVars') or {},
+    )
+    if error is not None:
+        return error
+
+    aws_connection = payload.pop('aws_connection')
+    github_connection = payload.pop('github_connection')
+    commit_sha = payload['commit_sha']
+    commit_suffix = f' @ {commit_sha[:7]}' if commit_sha else ''
+
+    record = DeploymentRecord.objects.create(
+        user=request.user,
+        project=project,
+        github_connection=github_connection,
+        aws_connection=aws_connection,
+        environment_name=payload['environment_name'],
+        repository=payload['repository'],
+        commit_sha=commit_sha,
+        project_type=payload['project_type'],
+        provider='AWS',
+        aws_account_id=aws_connection.account_id or '',
+        region=payload['region'],
+        instance_id='',
+        instance_type=payload['instance_type'],
+        monthly_cost=payload['monthly_cost'],
+        specs=payload['specs'],
+        deployment_status=DeploymentStatus.QUEUED,
+        ip_address=None,
+        live_url=None,
+        logs=[{
+            'timestamp': timezone.now().isoformat(),
+            'level': 'INFO',
+            'stage': DeploymentStage.PREPARING,
+            'message': (
+                f'Queued deployment of {payload["repository"]}{commit_suffix} '
+                f'({payload["project_type"]}) to AWS account '
+                f'{aws_connection.account_id or "connected"} in '
+                f'{payload["region"]}.'
+            ),
+        }],
+    )
+
+    start_pipeline(record.id, payload)
+    record.refresh_from_db()
     return Response({
-        'success': False,
-        'error': f'Unknown provider "{provider_name}". Supported: AWS.',
-        'supported': ['AWS'],
-    }, status=status.HTTP_400_BAD_REQUEST)
+        'success': True,
+        'stage': 'QUEUED',
+        'message': (
+            f'Deployment {record.id} started for {payload["repository"]} '
+            f'in {payload["region"]}.'
+        ),
+        'deployment_id': record.id,
+        'data': DeploymentRecordSerializer(record).data,
+    }, status=status.HTTP_201_CREATED)
 
 
 @api_view(['POST'])
@@ -1107,44 +1147,106 @@ def waitlist_view(request):
 
 
 @api_view(['GET'])
-@permission_classes([permissions.AllowAny])
+@permission_classes([permissions.IsAuthenticated])
 def monitoring_view(request):
-    # Derive dynamic values from the latest deployment record
-    latest = DeploymentRecord.objects.order_by('-created_at').first()
+    """
+    Real telemetry for the *calling user's* most recent deployment.
 
-    if latest:
-        vcpu = latest.specs.get('vcpu', 8) if isinstance(latest.specs, dict) else 8
-        active_nodes = max(1, math.ceil(vcpu / 4))
-        # Compute uptime from created_at
-        delta = timezone.now() - latest.created_at
-        total_seconds = int(delta.total_seconds())
-        days = total_seconds // 86400
-        hours = (total_seconds % 86400) // 3600
-        minutes = (total_seconds % 3600) // 60
-        uptime_str = f"{days}d {hours:02d}h {minutes:02d}m"
-        ip_address = latest.ip_address or 'Not yet deployed'
-        endpoint_url = latest.endpoint_url or None
+    Every value is either measured or derived from this user's own
+    DeploymentRecord. CloudWise does not install a metrics agent on the
+    instance, so CPU / memory / storage are returned as ``null`` with
+    ``metricsCollected: false`` rather than being invented.
+    """
+    latest = (
+        DeploymentRecord.objects.filter(user=request.user)
+        .order_by('-created_at')
+        .first()
+    )
+
+    payload = {
+        'metricsCollected': False,
+        'cpuUsage': None,
+        'memoryUsage': None,
+        'storageUsage': None,
+        'networkInMB': None,
+        'networkOutMB': None,
+        'deploymentId': None,
+        'deploymentStatus': None,
+        'healthStatus': 'Not deployed',
+        'clusterUptime': '0d 00h 00m',
+        'activeNodes': 0,
+        'ipAddress': None,
+        'instanceId': None,
+        'instanceType': None,
+        'region': None,
+        'awsAccountId': None,
+        'endpointUrl': None,
+    }
+
+    if latest is None:
+        return Response({'success': True, 'data': payload}, status=status.HTTP_200_OK)
+
+    status_value = latest.deployment_status
+    payload.update({
+        'deploymentId': latest.pk,
+        'deploymentStatus': status_value,
+        'ipAddress': latest.ip_address or None,
+        'instanceId': latest.instance_id or None,
+        'instanceType': latest.instance_type or None,
+        'region': latest.region,
+        'awsAccountId': latest.aws_account_id or None,
+        'endpointUrl': latest.live_url or None,
+        'activeNodes': 1 if latest.instance_id else 0,
+    })
+
+    active_statuses = (
+        DeploymentStatus.QUEUED,
+        DeploymentStatus.PREPARING,
+        DeploymentStatus.BUILDING,
+        DeploymentStatus.DEPLOYING,
+        DeploymentStatus.HEALTH_CHECK,
+    )
+    if status_value in active_statuses:
+        payload['healthStatus'] = 'Deploying'
+    elif status_value == DeploymentStatus.FAILED:
+        payload['healthStatus'] = 'Failed'
+    elif status_value in (DeploymentStatus.RUNNING, 'deployed', 'RUNNING'):
+        payload['healthStatus'] = (
+            'Healthy' if latest.live_url else 'Running — awaiting live URL'
+        )
     else:
-        active_nodes = 3
-        uptime_str = '0d 00h 00m'
-        ip_address = 'Not yet deployed'
-        endpoint_url = None
+        payload['healthStatus'] = status_value
 
-    return Response({
-        'success': True,
-        'data': {
-            'cpuUsage': random.randint(28, 52),
-            'memoryUsage': random.randint(48, 72),
-            'storageUsage': random.randint(35, 55),
-            'networkInMB': round(random.uniform(8.0, 18.0), 1),
-            'networkOutMB': round(random.uniform(32.0, 68.0), 1),
-            'healthStatus': 'Healthy',
-            'clusterUptime': uptime_str,
-            'activeNodes': active_nodes,
-            'ipAddress': ip_address,
-            'endpointUrl': endpoint_url,
-        }
-    }, status=status.HTTP_200_OK)
+    if status_value in (DeploymentStatus.RUNNING, 'deployed', 'RUNNING'):
+        payload['clusterUptime'] = _format_uptime(latest.created_at)
+        if latest.live_url:
+            healthy, http_status = _probe_url(latest.live_url)
+            payload['healthStatus'] = 'Healthy' if healthy else 'Unhealthy'
+            payload['httpStatus'] = http_status
+
+    return Response({'success': True, 'data': payload}, status=status.HTTP_200_OK)
+
+
+def _format_uptime(since) -> str:
+    delta = timezone.now() - since
+    total = int(delta.total_seconds())
+    days = total // 86400
+    hours = (total % 86400) // 3600
+    minutes = (total % 3600) // 60
+    return f'{days}d {hours:02d}h {minutes:02d}m'
+
+
+def _probe_url(url: str, timeout: float = 5.0):
+    """Real HTTP GET against the live URL. Returns (healthy, http_status)."""
+    try:
+        req = urllib.request.Request(url, method='GET')
+        req.add_header('User-Agent', 'CloudWise-Monitoring/1.0')
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status < 500, resp.status
+    except urllib.error.HTTPError as exc:
+        return exc.code < 500, exc.code
+    except Exception:  # noqa: BLE001 — unreachable/timeout is the signal
+        return False, None
 
 
 @api_view(['GET'])
@@ -1158,34 +1260,136 @@ def health_view(request):
     }, status=status.HTTP_200_OK)
 
 
-@api_view(['GET'])
-@permission_classes([permissions.IsAuthenticated])
-def github_oauth_start_view(request):
+# -------------------------------------------------------------
+# GitHub OAuth — connect the *current* CloudWise user's GitHub account.
+#
+# Flow:
+#   React  --(JWT)-->  GET /api/github/oauth/start
+#        --> GitHub authorize page (signed `state` carries the CloudWise user id)
+#        --> GET /api/github/oauth/callback?code&state        (browser redirect)
+#        --> backend exchanges the code, stores an ENCRYPTED per-user token
+#        --> redirect back to the React app (?github=connected)
+#
+# The GitHub access token never leaves the backend.
+# -------------------------------------------------------------
+
+def _github_oauth_missing_config():
+    missing = []
     if not settings.GITHUB_CLIENT_ID:
+        missing.append('GITHUB_CLIENT_ID')
+    if not settings.GITHUB_CLIENT_SECRET:
+        missing.append('GITHUB_CLIENT_SECRET')
+    return missing
+
+
+def _github_oauth_state_payload(user_id):
+    """Signed, tamper-proof state binding the OAuth round-trip to one user."""
+    return signing.dumps(
+        {'uid': str(user_id), 'nonce': secrets.token_urlsafe(32)},
+        salt=GITHUB_OAUTH_STATE_SALT,
+    )
+
+
+def _github_oauth_load_state(state):
+    """Verify the state (CSRF check). Returns (payload, error_code)."""
+    try:
+        payload = signing.loads(
+            state or '',
+            max_age=getattr(settings, 'GITHUB_OAUTH_STATE_MAX_AGE', 600),
+            salt=GITHUB_OAUTH_STATE_SALT,
+        )
+    except signing.SignatureExpired:
+        return None, 'state_expired'
+    except signing.BadSignature:
+        return None, 'state_invalid'
+    if not isinstance(payload, dict) or not payload.get('uid'):
+        return None, 'state_invalid'
+    return payload, None
+
+
+def _map_github_token_error(github_error):
+    """Translate GitHub's OAuth error slug into a safe frontend error code."""
+    return {
+        'bad_verification_code': 'invalid_code',
+        'expired_code': 'invalid_code',
+        'redirect_uri_mismatch': 'redirect_uri_mismatch',
+        'incorrect_client_credentials': 'bad_client_credentials',
+        'invalid_client': 'bad_client_credentials',
+        'unauthorized_client': 'bad_client_credentials',
+        'access_denied': 'access_denied',
+        'unsupported_grant_type': 'exchange_failed',
+    }.get(github_error, 'exchange_failed')
+
+
+def _github_oauth_frontend_redirect(result, detail=None):
+    """Send the browser back to React with a safe, non-sensitive error code."""
+    params = {'github': result}
+    if detail:
+        params['github_detail'] = detail
+    return redirect(f'{settings.FRONTEND_URL}/generate?{urllib.parse.urlencode(params)}')
+
+
+@api_view(['GET'])
+@permission_classes([permissions.AllowAny])
+def github_oauth_start_view(request):
+    # The signed state carries the CloudWise user id, so we must know who is
+    # connecting. Always answer with the {success, error} envelope (never DRF's
+    # bare {"detail": ...}) so the React client can show the real reason.
+    if not request.user.is_authenticated:
         return Response({
             'success': False,
-            'error': 'GitHub OAuth is not configured on the server.'
+            'code': 'AUTH_REQUIRED',
+            'error': 'Please sign in to CloudWise before connecting your GitHub account.',
+        }, status=status.HTTP_401_UNAUTHORIZED)
+
+    missing = _github_oauth_missing_config()
+    if missing:
+        logger.error(
+            "GitHub OAuth start rejected: missing environment variable(s) %s. "
+            "Copy backend/.env.example to backend/.env and fill them in.",
+            ', '.join(missing),
+        )
+        return Response({
+            'success': False,
+            'code': 'GITHUB_OAUTH_NOT_CONFIGURED',
+            'error': (
+                'GitHub OAuth is not configured on the server. Set '
+                + ', '.join(missing)
+                + ' in backend/.env (see backend/.env.example), then restart the backend.'
+            ),
         }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
-    # Support both authenticated users and anonymous/token-based users
-    if request.user.is_authenticated:
-        user_id = str(request.user.id)
-    else:
-        user_id, _, _ = get_request_user_info(request)
+    if not settings.GITHUB_REDIRECT_URI.startswith(('http://', 'https://')):
+        logger.error(
+            "GitHub OAuth start rejected: GITHUB_REDIRECT_URI is not an absolute URL (%r).",
+            settings.GITHUB_REDIRECT_URI,
+        )
+        return Response({
+            'success': False,
+            'code': 'GITHUB_REDIRECT_URI_INVALID',
+            'error': 'GITHUB_REDIRECT_URI must be an absolute http(s) URL.',
+        }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
-    state = signing.dumps({
-        'user_id': user_id,
-        'nonce': secrets.token_urlsafe(32),
-    })
-    query = urllib.parse.urlencode({
+    state = _github_oauth_state_payload(request.user.pk)
+    authorization_url = 'https://github.com/login/oauth/authorize?' + urllib.parse.urlencode({
         'client_id': settings.GITHUB_CLIENT_ID,
         'redirect_uri': settings.GITHUB_REDIRECT_URI,
-        'scope': 'repo workflow',
+        'scope': settings.GITHUB_OAUTH_SCOPES,
+        'response_type': 'code',
         'state': state,
+        'allow_signup': 'true',
     })
+
+    logger.info(
+        "Starting GitHub OAuth for CloudWise user=%s (redirect_uri=%s, scope=%r).",
+        request.user.pk, settings.GITHUB_REDIRECT_URI, settings.GITHUB_OAUTH_SCOPES,
+    )
+
     return Response({
         'success': True,
-        'authorizationUrl': f'https://github.com/login/oauth/authorize?{query}'
+        'authorizationUrl': authorization_url,
+        'redirectUri': settings.GITHUB_REDIRECT_URI,
+        'scopes': settings.GITHUB_OAUTH_SCOPES,
     }, status=status.HTTP_200_OK)
 
 
@@ -1194,25 +1398,56 @@ def github_oauth_start_view(request):
 def github_oauth_callback_view(request):
     code = request.query_params.get('code')
     state = request.query_params.get('state')
-    try:
-        state_data = signing.loads(state or '', max_age=600)
-    except (signing.BadSignature, signing.SignatureExpired):
-        state_data = None
+    github_error = request.query_params.get('error')
+    github_error_description = request.query_params.get('error_description')
 
-    if not code or not state_data or not state_data.get('user_id'):
+    # 1. GitHub can bounce back with an error (user pressed Cancel,
+    #    redirect_uri mismatch, bad client credentials, ...).
+    if github_error:
+        logger.warning(
+            "GitHub OAuth returned error=%r description=%r (state present=%s).",
+            github_error, github_error_description, bool(state),
+        )
+        return _github_oauth_frontend_redirect('error', github_error)
+
+    # 2. Verify the signed state. This is the CSRF check and it also carries
+    #    the CloudWise user id that started the flow, so the GitHub token is
+    #    always stored against the right account.
+    state_data, state_error = _github_oauth_load_state(state)
+    if state_error or not code:
+        reason = state_error or 'missing_code'
+        logger.warning(
+            "GitHub OAuth callback rejected (%s): state valid=%s, code present=%s.",
+            reason, state_data is not None, bool(code),
+        )
         return Response({
             'success': False,
-            'error': 'Invalid GitHub OAuth callback state or authorization code.'
+            'code': reason.upper(),
+            'error': 'Invalid or expired GitHub authorization state. Please try authorizing again.',
         }, status=status.HTTP_400_BAD_REQUEST)
 
-    if not settings.GITHUB_CLIENT_ID or not settings.GITHUB_CLIENT_SECRET:
+    missing = _github_oauth_missing_config()
+    if missing:
+        logger.error(
+            "GitHub OAuth callback rejected: missing environment variable(s) %s.",
+            ', '.join(missing),
+        )
         return Response({
             'success': False,
-            'error': 'GitHub OAuth is not configured on the server.'
+            'code': 'GITHUB_OAUTH_NOT_CONFIGURED',
+            'error': (
+                'GitHub OAuth is not configured on the server. Set '
+                + ', '.join(missing) + ' in backend/.env (see backend/.env.example).'
+            ),
         }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
-    user_id = state_data['user_id']
+    user_id = state_data['uid']
+    user = User.objects.filter(pk=user_id).first()
+    if user is None:
+        logger.error("GitHub OAuth callback: CloudWise user %s no longer exists.", user_id)
+        return _github_oauth_frontend_redirect('error', 'cloudwise_user_missing')
 
+    # 3. Exchange the authorization code for an access token — server side only.
     try:
         token_payload = urllib.parse.urlencode({
             'client_id': settings.GITHUB_CLIENT_ID,
@@ -1223,16 +1458,42 @@ def github_oauth_callback_view(request):
         token_request = urllib.request.Request(
             'https://github.com/login/oauth/access_token',
             data=token_payload,
-            headers={'Accept': 'application/json'},
+            headers={'Accept': 'application/json', 'User-Agent': 'CloudWise'},
             method='POST',
         )
         with urllib.request.urlopen(token_request, timeout=15) as response:
             token_data = json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        details = exc.read().decode(errors='replace')
+        logger.error(
+            "GitHub token exchange failed with HTTP %s for CloudWise user %s: %s",
+            exc.code, user_id, details,
+        )
+        return _github_oauth_frontend_redirect('error', 'exchange_failed')
+    except (urllib.error.URLError, json.JSONDecodeError, OSError) as exc:
+        logger.error(
+            "GitHub token exchange failed for CloudWise user %s: %s", user_id, exc,
+        )
+        return _github_oauth_frontend_redirect('error', 'exchange_failed')
 
-        access_token = token_data.get('access_token')
-        if not access_token:
-            raise ValueError(token_data.get('error_description', 'GitHub did not return an access token.'))
+    access_token = token_data.get('access_token')
+    if not access_token:
+        github_error = token_data.get('error') or 'unknown_error'
+        logger.error(
+            "GitHub token exchange rejected for CloudWise user %s: error=%r "
+            "description=%r (client_id set=%s, redirect_uri=%s).",
+            user_id,
+            github_error,
+            token_data.get('error_description'),
+            bool(settings.GITHUB_CLIENT_ID),
+            settings.GITHUB_REDIRECT_URI,
+        )
+        return _github_oauth_frontend_redirect(
+            'error', _map_github_token_error(github_error),
+        )
 
+    # 4. Identify the GitHub account that was actually authorized.
+    try:
         profile_request = urllib.request.Request(
             'https://api.github.com/user',
             headers={
@@ -1243,65 +1504,76 @@ def github_oauth_callback_view(request):
         )
         with urllib.request.urlopen(profile_request, timeout=15) as response:
             profile = json.loads(response.read().decode())
-
-        user = User.objects.get(pk=user_id)
-        GitHubConnection.objects.update_or_create(
-            user=user,
-            defaults={
-                'access_token': access_token,
-                'github_user_id': str(profile['id']),
-                'github_login': profile.get('login', ''),
-            },
-        )
+        github_login = profile.get('login', '')
+        if not github_login:
+            raise ValueError('GitHub profile did not include a login.')
     except urllib.error.HTTPError as exc:
         details = exc.read().decode(errors='replace')
+        logger.error(
+            "GitHub /user lookup failed with HTTP %s for CloudWise user %s: %s",
+            exc.code, user_id, details,
+        )
+        return _github_oauth_frontend_redirect('error', 'profile_failed')
+    except (urllib.error.URLError, json.JSONDecodeError, OSError, ValueError, AttributeError) as exc:
+        logger.error(
+            "GitHub /user lookup failed for CloudWise user %s: %s", user_id, exc,
+        )
+        return _github_oauth_frontend_redirect('error', 'profile_failed')
 
-        return Response({
-            'success': False,
-            'error': 'GitHub OAuth exchange failed.',
-            'github_status': exc.code,
-            'github_response': details,
-        }, status=status.HTTP_502_BAD_GATEWAY)
+    # 5. Persist exactly one connection per CloudWise user, token encrypted.
+    try:
+        connection, _created = GitHubConnection.objects.get_or_create(user=user)
+        connection.set_token(access_token)
+        connection.github_user_id = str(profile.get('id', ''))
+        connection.github_login = github_login
+        connection.scopes = token_data.get('scope') or settings.GITHUB_OAUTH_SCOPES
+        connection.status = 'connected'
+        connection.save()
+    except Exception:
+        logger.exception(
+            "Failed to store the GitHub connection for CloudWise user %s.", user_id,
+        )
+        return _github_oauth_frontend_redirect('error', 'save_failed')
 
-    except (urllib.error.URLError, KeyError, ValueError, json.JSONDecodeError) as exc:
-        return Response({
-            'success': False,
-            'error': f'GitHub OAuth exchange failed: {exc}'
-        }, status=status.HTTP_502_BAD_GATEWAY)
-
+    logger.info(
+        "GitHub OAuth completed: CloudWise user=%s -> GitHub %s (id=%s), scopes=%r.",
+        user_id, connection.github_login, connection.github_user_id, connection.scopes,
+    )
     return redirect(f'{settings.FRONTEND_URL}/generate?github=connected')
+
 
 
 @api_view(['GET'])
 @permission_classes([permissions.AllowAny])
 def github_repositories_view(request):
-    # Resolve GitHub connection: prefer authenticated session, then token/user_id fallback
-    user_id, _, user_obj = get_request_user_info(request)
-    connection = None
-
-    if request.user.is_authenticated:
-        try:
-            connection = request.user.github_connection
-        except GitHubConnection.DoesNotExist:
-            pass
-    
-    if connection is None and user_obj:
-        try:
-            connection = user_obj.github_connection
-        except Exception:
-            pass
-
+    # Repositories are always resolved from the *authenticated* CloudWise
+    # user's own GitHub connection — never from a shared/global token.
+    unauthorized = require_cloudwise_user(request)
+    if unauthorized is not None:
+        return unauthorized
+    connection = get_user_github_connection(request.user)
     if connection is None:
         return Response({
             'success': False,
+            'code': 'GITHUB_NOT_CONNECTED',
             'error': 'Connect a GitHub account before retrieving repositories. Use "Authorize GitHub Account" first.'
         }, status=status.HTTP_400_BAD_REQUEST)
+
+    token = connection.get_token()
+    if not token:
+        connection.status = 'expired'
+        connection.save(update_fields=['status', 'updated_at'])
+        return Response({
+            'success': False,
+            'code': 'GITHUB_TOKEN_MISSING',
+            'error': 'No GitHub access token is stored for your account. Re-authorize your GitHub account.'
+        }, status=status.HTTP_401_UNAUTHORIZED)
 
     github_request = urllib.request.Request(
         'https://api.github.com/user/repos?sort=updated&per_page=100',
         headers={
             'Accept': 'application/vnd.github+json',
-            'Authorization': f'Bearer {connection.access_token}',
+            'Authorization': f'Bearer {token}',
             'User-Agent': 'CloudWise',
         },
     )
@@ -1309,30 +1581,64 @@ def github_repositories_view(request):
         with urllib.request.urlopen(github_request, timeout=15) as response:
             repositories = json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
+        details = exc.read().decode(errors='replace')
         if exc.code == 401:
+            connection.status = 'expired'
+            connection.save(update_fields=['status', 'updated_at'])
+            logger.warning(
+                "GitHub /user/repos returned 401 for CloudWise user %s (GitHub account %s).",
+                request.user.pk, connection.github_login,
+            )
             return Response({
                 'success': False,
+                'code': 'GITHUB_TOKEN_EXPIRED',
                 'error': 'GitHub token is invalid or expired. Re-authorize your GitHub account.'
             }, status=status.HTTP_401_UNAUTHORIZED)
         if exc.code == 403:
+            rate_limited = 'rate limit' in details.lower()
+            logger.warning(
+                "GitHub /user/repos returned 403 for CloudWise user %s: %s",
+                request.user.pk, details,
+            )
             return Response({
                 'success': False,
-                'error': 'GitHub API rate limit exceeded. Please wait and try again.'
+                'code': 'GITHUB_RATE_LIMITED' if rate_limited else 'GITHUB_FORBIDDEN',
+                'error': (
+                    'GitHub API rate limit exceeded. Please wait and try again.'
+                    if rate_limited else
+                    'GitHub denied access to your repositories. Re-authorize your GitHub account.'
+                )
             }, status=status.HTTP_403_FORBIDDEN)
         if exc.code == 404:
             return Response({
                 'success': False,
+                'code': 'GITHUB_REPO_NOT_FOUND',
                 'error': 'GitHub repository not found.'
             }, status=status.HTTP_404_NOT_FOUND)
-        details = exc.read().decode(errors='replace')
+        if exc.code == 429:
+            return Response({
+                'success': False,
+                'code': 'GITHUB_RATE_LIMITED',
+                'error': 'GitHub API rate limit exceeded. Please wait and try again.'
+            }, status=status.HTTP_429_TOO_MANY_REQUESTS)
+        logger.error(
+            "GitHub /user/repos returned HTTP %s for CloudWise user %s: %s",
+            exc.code, request.user.pk, details,
+        )
         return Response({
             'success': False,
-            'error': f'GitHub API returned HTTP {exc.code}: {details}'
+            'code': 'GITHUB_UPSTREAM_ERROR',
+            'error': f'GitHub API returned HTTP {exc.code}. Please try again later.'
         }, status=status.HTTP_502_BAD_GATEWAY)
     except (urllib.error.URLError, json.JSONDecodeError) as exc:
+        logger.error(
+            "GitHub /user/repos request failed for CloudWise user %s: %s",
+            request.user.pk, exc,
+        )
         return Response({
             'success': False,
-            'error': f'Unable to retrieve GitHub repositories: {exc}'
+            'code': 'GITHUB_UPSTREAM_ERROR',
+            'error': 'Unable to retrieve GitHub repositories: the GitHub API could not be reached.'
         }, status=status.HTTP_502_BAD_GATEWAY)
 
     return Response({
@@ -1384,6 +1690,18 @@ def generate_deployment_files_view(request):
     tree = request.data.get('tree')
     if not isinstance(tree, list):
         tree = None
+
+    if str(provider).upper() != 'AWS':
+        return Response({
+            'success': False,
+            'stage': 'PROJECT',
+            'status': 'RETIRED',
+            'error': (
+                f'{provider} deployments are retired. '
+                'CloudWise deploys to AWS EC2 only.'
+            ),
+            'supported': ['AWS'],
+        }, status=status.HTTP_400_BAD_REQUEST)
 
     if not isinstance(files, dict) or not files:
         return Response({
@@ -1506,18 +1824,60 @@ def aws_disconnect_view(request):
 
 
 # -------------------------------------------------------------
-# Deployment Management Endpoints (REAL provider status polling)
+# Deployment Management Endpoints
+#
+# Records are addressed by their own id (``dep_...``); the provider
+# deployment id (the EC2 instance id) is accepted as a fallback for
+# older links. Ownership is enforced on every read and every write: a
+# record owned by another user is reported as not found, so its
+# existence is never leaked.
 # -------------------------------------------------------------
+
+# Deterministic progress derived from the real deployment status.
+# There are no timers and no fabricated intermediate percentages.
+_STATUS_PROGRESS = {
+    DeploymentStatus.QUEUED: 5,
+    DeploymentStatus.PREPARING: 15,
+    DeploymentStatus.BUILDING: 45,
+    DeploymentStatus.DEPLOYING: 70,
+    DeploymentStatus.HEALTH_CHECK: 90,
+    DeploymentStatus.RUNNING: 100,
+    DeploymentStatus.FAILED: 60,
+    DeploymentStatus.ROLLING_BACK: 50,
+    DeploymentStatus.ROLLED_BACK: 100,
+    DeploymentStatus.TERMINATED: 100,
+    # legacy lowercase values from records created before migration 0007
+    'deployed': 100,
+    'deploying': 45,
+    'failed': 60,
+}
+
+_IN_FLIGHT = (
+    DeploymentStatus.QUEUED,
+    DeploymentStatus.PREPARING,
+    DeploymentStatus.BUILDING,
+    DeploymentStatus.DEPLOYING,
+    DeploymentStatus.HEALTH_CHECK,
+    DeploymentStatus.ROLLING_BACK,
+)
+
+_ALIVE = (DeploymentStatus.RUNNING, 'deployed')
+
 
 def _find_deployment_record(deployment_id, user=None):
     """
-    Look up a DeploymentRecord by its provider deployment ID.
+    Resolve a deployment by its own id, or by provider deployment id.
 
     When ``user`` is provided, ownership is enforced: a record owned by
     another user is treated as not found (no existence leak).
     """
-    queryset = DeploymentRecord.objects.filter(provider_deployment_id=deployment_id)
-    record = queryset.first()
+    if not deployment_id:
+        return None
+    record = DeploymentRecord.objects.filter(pk=deployment_id).first()
+    if record is None:
+        record = DeploymentRecord.objects.filter(
+            provider_deployment_id=deployment_id
+        ).first()
     if record is None:
         return None
     if user is not None and record.user_id is not None and record.user_id != user.id:
@@ -1525,13 +1885,93 @@ def _find_deployment_record(deployment_id, user=None):
     return record
 
 
+def _deployment_payload(record, include_logs=True):
+    """Serializer output plus derived progress and the openable live URL."""
+    data = DeploymentRecordSerializer(record).data
+    data['progress'] = _STATUS_PROGRESS.get(record.deployment_status, 0)
+    data['openUrl'] = record.live_url or ''
+    if not include_logs:
+        data['logCount'] = len(record.logs or [])
+        data.pop('logs', None)
+    return data
+
+
+def _stored_status_payload(record, message=None):
+    """Status payload for a deployment that is not (yet) queryable in AWS."""
+    return {
+        'deploymentId': record.pk,
+        'deploymentStatus': record.deployment_status,
+        'progress': _STATUS_PROGRESS.get(record.deployment_status, 0),
+        'providerType': record.provider,
+        'repository': record.repository,
+        'liveUrl': record.live_url or '',
+        'ipAddress': record.ip_address or None,
+        'instanceId': record.instance_id or None,
+        'instanceState': None,
+        'awsAccountId': record.aws_account_id or None,
+        'region': record.region,
+        'message': message or 'Stored deployment status.',
+    }
+
+
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated])
+def deployments_list_view(request):
+    """List the calling user's own deployments (newest first)."""
+    records = DeploymentRecord.objects.filter(
+        user=request.user
+    ).order_by('-created_at')
+
+    raw_limit = request.query_params.get('limit')
+    try:
+        limit = max(1, min(int(raw_limit), 100)) if raw_limit else 20
+    except (TypeError, ValueError):
+        limit = 20
+
+    items = [
+        _deployment_payload(record, include_logs=False)
+        for record in records[:limit]
+    ]
+    total = records.count()
+    return Response({
+        'success': True,
+        'count': len(items),
+        'total': total,
+        'data': items,
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated])
+def deployment_detail_view(request, deployment_id):
+    """
+    Full details for one deployment: repository, commit, project type,
+    AWS account/region, instance, status, logs, live URL and timestamps.
+    """
+    record = _find_deployment_record(deployment_id, user=request.user)
+    if record is None:
+        return Response({
+            'success': False,
+            'error': f'Deployment "{deployment_id}" not found.'
+        }, status=status.HTTP_404_NOT_FOUND)
+
+    return Response({
+        'success': True,
+        'data': _deployment_payload(record, include_logs=True),
+    }, status=status.HTTP_200_OK)
+
+
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated])
 def deployment_status_view(request, deployment_id):
     """
-    Return real deployment status from AWS (or stored Vercel/Render records).
+    Real deployment status.
 
-    Ownership: only the owning user may read a deployment record.
+    While the background pipeline is running, the record's own status is
+    reported (it is the source of truth — there is no instance to query
+    yet, or the application is still being deployed). Once the
+    deployment is live, the EC2 instance state is queried in the user's
+    AWS account via the user's own assumed role.
     """
     record = _find_deployment_record(deployment_id, user=request.user)
     if record is None:
@@ -1542,250 +1982,119 @@ def deployment_status_view(request, deployment_id):
 
     provider = (record.provider or '').upper()
 
-    if provider == 'VERCEL':
-        vercel_token = settings.VERCEL_TOKEN
-        if not vercel_token:
-            return Response({
-                'success': True,
-                'data': {
-                    'deployment_id': deployment_id,
-                    'status': record.status,
-                    'progress': 100 if record.status == 'RUNNING' else 45,
-                    'provider_type': 'VERCEL',
-                    'endpoint_url': record.endpoint_url,
-                    'ip_address': record.ip_address,
-                    'message': 'Vercel credentials not configured; returning stored status.',
-                }
-            }, status=status.HTTP_200_OK)
-        try:
-            svc = VercelDeploymentService(vercel_token, settings.VERCEL_TEAM_ID or None)
-            raw = svc.get_deployment_status(deployment_id)
-            ready_state = (raw.get('readyState') or raw.get('state', '')).upper()
-            url = raw.get('url')
-            if url and not url.startswith('http'):
-                url = f'https://{url}'
-            status_map = {
-                'QUEUED': 'QUEUED',
-                'BUILDING': 'BUILDING',
-                'ASSIGNING': 'BUILDING',
-                'INITIALIZING': 'PREPARING',
-                'READY': 'RUNNING',
-                'ERROR': 'FAILED',
-                'CANCELED': 'FAILED',
-            }
-            mapped = status_map.get(ready_state, 'BUILDING')
-            progress = 100 if mapped == 'RUNNING' else 45 if mapped == 'FAILED' else 50
+    if record.deployment_status in _IN_FLIGHT:
+        payload = _stored_status_payload(
+            record,
+            message=(
+                f'Deployment pipeline is running '
+                f'({record.deployment_status}). Follow the logs for live '
+                'progress.'
+            ),
+        )
+        payload['pipelineInFlight'] = True
+        return Response({'success': True, 'data': payload}, status=status.HTTP_200_OK)
 
-            # Include error details when Vercel deployment failed
-            error_detail = None
-            if ready_state == 'ERROR':
-                error_detail = {
-                    'errorCode': raw.get('errorCode'),
-                    'errorMessage': raw.get('errorMessage'),
-                    'errorStep': raw.get('errorStep'),
-                }
+    if provider != 'AWS':
+        return Response({
+            'success': True,
+            'data': _stored_status_payload(
+                record,
+                message=f'Returning stored status for provider {provider}.',
+            ),
+        }, status=status.HTTP_200_OK)
 
-            # Persist terminal status to DB so page refresh shows correct state
-            update_fields = []
-            if mapped in ('RUNNING', 'FAILED') and record.status != mapped:
-                record.status = mapped
-                update_fields.append('status')
-            if url and url != record.endpoint_url:
-                record.endpoint_url = url
-                update_fields.append('endpoint_url')
-            if mapped == 'FAILED' and error_detail:
-                existing_logs = record.logs or []
-                error_log = {
-                    'timestamp': datetime.now().isoformat(),
-                    'level': 'ERROR',
-                    'stage': 'BUILDING',
-                    'message': f"{error_detail.get('errorCode', 'UNKNOWN')} -- {error_detail.get('errorMessage', '')}",
-                }
-                record.logs = existing_logs + [error_log]
-                update_fields.append('logs')
-            if update_fields:
-                record.save(update_fields=update_fields)
+    if not record.instance_id:
+        return Response({
+            'success': True,
+            'data': _stored_status_payload(
+                record,
+                message='No EC2 instance recorded for this deployment.',
+            ),
+        }, status=status.HTTP_200_OK)
 
-            response_payload = {
-                'deployment_id': deployment_id,
-                'status': mapped,
-                'progress': progress,
-                'provider_type': 'VERCEL',
-                'endpoint_url': url or record.endpoint_url,
-                'ip_address': None,
-                'message': f'Vercel readyState: {ready_state}',
-            }
-            if error_detail:
-                response_payload['error'] = error_detail
+    if record.deployment_status == DeploymentStatus.FAILED:
+        return Response({
+            'success': True,
+            'data': _stored_status_payload(
+                record,
+                message='Deployment failed. Retry it or inspect the logs.',
+            ),
+        }, status=status.HTTP_200_OK)
 
-            return Response({
-                'success': True,
-                'data': response_payload,
-            }, status=status.HTTP_200_OK)
-        except VercelApiError as exc:
-            return Response({
-                'success': True,
-                'data': {
-                    'deployment_id': deployment_id,
-                    'status': record.status,
-                    'progress': 100 if record.status == 'RUNNING' else 45,
-                    'provider_type': 'VERCEL',
-                    'endpoint_url': record.endpoint_url,
-                    'ip_address': None,
-                    'message': f'Vercel API error: {exc}',
-                }
-            }, status=status.HTTP_200_OK)
+    aws_connection = AWSConnection.objects.filter(
+        user_id=record.user_id, status='active'
+    ).first()
+    if aws_connection is None:
+        return Response({
+            'success': True,
+            'data': _stored_status_payload(
+                record,
+                message=(
+                    'AWS account connection not found; returning stored '
+                    'status.'
+                ),
+            ),
+        }, status=status.HTTP_200_OK)
 
-    elif provider == 'RENDER':
-        render_api_key = settings.RENDER_API_KEY
-        if not render_api_key:
-            return Response({
-                'success': True,
-                'data': {
-                    'deployment_id': deployment_id,
-                    'status': record.status,
-                    'progress': 100 if record.status == 'RUNNING' else 45,
-                    'provider_type': 'RENDER',
-                    'endpoint_url': record.endpoint_url,
-                    'ip_address': None,
-                    'message': 'Render credentials not configured; returning stored status.',
-                }
-            }, status=status.HTTP_200_OK)
-        service_id = record.provider_project_id
-        if not service_id:
-            return Response({
-                'success': True,
-                'data': {
-                    'deployment_id': deployment_id,
-                    'status': record.status,
-                    'progress': 100 if record.status == 'RUNNING' else 45,
-                    'provider_type': 'RENDER',
-                    'endpoint_url': record.endpoint_url,
-                    'ip_address': None,
-                    'message': 'Render service ID not stored; returning stored status.',
-                }
-            }, status=status.HTTP_200_OK)
-        try:
-            svc = RenderDeploymentService(render_api_key, settings.RENDER_OWNER_ID)
-            raw = svc.get_deploy_status(service_id, deployment_id)
-            render_status = (raw.get('status') or '').lower()
-            status_map = {
-                'live': 'RUNNING',
-                'succeeded': 'RUNNING',
-                'failed': 'FAILED',
-                'canceled': 'FAILED',
-                'deactivated': 'FAILED',
-            }
-            mapped = status_map.get(render_status, 'BUILDING')
-            progress = 100 if mapped == 'RUNNING' else 45 if mapped == 'FAILED' else 50
-            return Response({
-                'success': True,
-                'data': {
-                    'deployment_id': deployment_id,
-                    'status': mapped,
-                    'progress': progress,
-                    'provider_type': 'RENDER',
-                    'endpoint_url': record.endpoint_url,
-                    'ip_address': None,
-                    'message': f'Render deploy status: {render_status}',
-                }
-            }, status=status.HTTP_200_OK)
-        except RenderApiError as exc:
-            return Response({
-                'success': True,
-                'data': {
-                    'deployment_id': deployment_id,
-                    'status': record.status,
-                    'progress': 100 if record.status == 'RUNNING' else 45,
-                    'provider_type': 'RENDER',
-                    'endpoint_url': record.endpoint_url,
-                    'ip_address': None,
-                    'message': f'Render API error: {exc}',
-                }
-            }, status=status.HTTP_200_OK)
+    try:
+        aws_provider = AwsEc2Provider(user=record.user, connection=aws_connection)
+        live = aws_provider.get_status(record.instance_id)
+    except AwsEc2Error as exc:
+        return Response({
+            'success': True,
+            'data': _stored_status_payload(
+                record,
+                message=f'AWS EC2 error: {exc}',
+            ),
+        }, status=status.HTTP_200_OK)
 
-    elif provider == 'AWS':
-        aws_connection = None
-        if record.user_id:
-            aws_connection = AWSConnection.objects.filter(
-                user_id=record.user_id, status='active'
-            ).first()
-        if aws_connection is None:
-            return Response({
-                'success': True,
-                'data': {
-                    'deployment_id': deployment_id,
-                    'status': record.status,
-                    'progress': 100 if record.status == 'RUNNING' else 45,
-                    'provider_type': 'AWS',
-                    'endpoint_url': record.endpoint_url,
-                    'ip_address': record.ip_address,
-                    'message': 'AWS account connection not found; returning stored status.',
-                }
-            }, status=status.HTTP_200_OK)
-        try:
-            aws_provider = AwsEc2Provider(user=record.user, connection=aws_connection)
-            live = aws_provider.get_status(deployment_id)
-            update_fields = []
-            mapped = live.get('status')
-            if mapped in ('RUNNING', 'FAILED') and record.status != mapped:
-                record.status = mapped
-                update_fields.append('status')
-            if live.get('ip_address') and live.get('ip_address') != record.ip_address:
-                record.ip_address = live.get('ip_address')
-                update_fields.append('ip_address')
-            if update_fields:
-                record.save(update_fields=update_fields)
-            return Response({
-                'success': True,
-                'data': {
-                    'deployment_id': deployment_id,
-                    'status': mapped,
-                    'progress': live.get('progress', 0),
-                    'provider_type': 'AWS',
-                    'endpoint_url': record.endpoint_url,
-                    'ip_address': live.get('ip_address') or record.ip_address,
-                    'instance_state': live.get('instance_state'),
-                    'region': live.get('region'),
-                    'message': live.get('message', ''),
-                }
-            }, status=status.HTTP_200_OK)
-        except AwsEc2Error as exc:
-            return Response({
-                'success': True,
-                'data': {
-                    'deployment_id': deployment_id,
-                    'status': record.status,
-                    'progress': 100 if record.status == 'RUNNING' else 45,
-                    'provider_type': 'AWS',
-                    'endpoint_url': record.endpoint_url,
-                    'ip_address': record.ip_address,
-                    'message': f'AWS EC2 error: {exc}',
-                }
-            }, status=status.HTTP_200_OK)
+    instance_state = str(live.get('instance_state') or '')
+    public_ip = live.get('ip_address') or record.ip_address
+    deployment_status = record.deployment_status
+
+    if instance_state in ('terminated', 'shutting-down'):
+        deployment_status = DeploymentStatus.TERMINATED
+    elif instance_state not in ('running', 'pending', 'stopped'):
+        deployment_status = DeploymentStatus.FAILED
+    elif record.deployment_status in _ALIVE and instance_state == 'running':
+        deployment_status = DeploymentStatus.RUNNING
+
+    update_fields = []
+    if deployment_status != record.deployment_status:
+        record.deployment_status = deployment_status
+        update_fields.append('deployment_status')
+    if public_ip and public_ip != record.ip_address:
+        record.ip_address = public_ip
+        update_fields.append('ip_address')
+    if update_fields:
+        DeploymentRecord.objects.filter(pk=record.pk).update(
+            **{f: getattr(record, f) for f in update_fields},
+            updated_at=timezone.now(),
+        )
 
     return Response({
         'success': True,
         'data': {
-            'deployment_id': deployment_id,
-            'status': record.status,
-            'progress': 100 if record.status == 'RUNNING' else 45,
-            'provider_type': provider,
-            'endpoint_url': record.endpoint_url,
-            'ip_address': record.ip_address,
-            'message': f'Returning stored status for provider {provider}.',
-        }
+            'deploymentId': record.pk,
+            'deploymentStatus': deployment_status,
+            'progress': _STATUS_PROGRESS.get(deployment_status, 0),
+            'providerType': record.provider,
+            'repository': record.repository,
+            'liveUrl': record.live_url or '',
+            'ipAddress': public_ip or None,
+            'instanceId': record.instance_id or None,
+            'instanceState': instance_state or None,
+            'awsAccountId': record.aws_account_id or None,
+            'region': live.get('region') or record.region,
+            'message': live.get('message', ''),
+        },
     }, status=status.HTTP_200_OK)
 
 
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated])
 def deployment_logs_view(request, deployment_id):
-    """
-    Return real deployment logs.
-
-    Ownership: only the owning user may read deployment logs.
-    """
+    """Structured logs for a deployment. Ownership enforced."""
     record = _find_deployment_record(deployment_id, user=request.user)
     if record is None:
         return Response({
@@ -1793,50 +2102,9 @@ def deployment_logs_view(request, deployment_id):
             'error': f'Deployment "{deployment_id}" not found.'
         }, status=status.HTTP_404_NOT_FOUND)
 
-    logs = record.logs or []
-    provider = (record.provider or '').upper()
-
-    # Fetch live build logs from Vercel if deployment is still building
-    if provider == 'VERCEL' and record.status not in ('RUNNING', 'FAILED'):
-        vercel_token = settings.VERCEL_TOKEN
-        if vercel_token:
-            try:
-                svc = VercelDeploymentService(vercel_token, settings.VERCEL_TEAM_ID or None)
-                events = svc.get_deployment_events(deployment_id)
-                live_logs = []
-                for ev in events:
-                    payload = ev.get('payload', {}) or {}
-                    text = payload.get('text', '') or payload.get('message', '') or ''
-                    ev_type = ev.get('type', '')
-                    ts = ev.get('createdAt', '')
-                    if text:
-                        level = 'ERROR' if 'error' in ev_type.lower() or 'error' in text.lower() else 'INFO'
-                        live_logs.append({
-                            'timestamp': ts,
-                            'level': level,
-                            'stage': ev_type,
-                            'message': text[:500],
-                        })
-                if live_logs:
-                    logs = live_logs
-                    # Persist fetched logs to DB for future requests
-                    record.logs = live_logs
-                    record.save(update_fields=['logs'])
-            except Exception:
-                pass  # non-fatal, fall back to stored logs
-
-    if not logs:
-        logs = [{
-            'timestamp': record.created_at.isoformat() if record.created_at else '',
-            'level': 'INFO',
-            'stage': 'COMPLETED',
-            'message': f'Deployment record exists for {provider}. '
-                       f'Full build logs are available in the {provider} dashboard.',
-        }]
-
     return Response({
         'success': True,
-        'data': logs
+        'data': list(record.logs or []),
     }, status=status.HTTP_200_OK)
 
 
@@ -1844,11 +2112,10 @@ def deployment_logs_view(request, deployment_id):
 @permission_classes([permissions.IsAuthenticated])
 def deployment_health_view(request, deployment_id):
     """
-    Perform a real HTTP health check against the deployed service URL.
+    Real HTTP health check against the stored live URL.
 
-    Uses the endpoint_url stored in the DeploymentRecord. Makes a real
-    HTTP GET request and returns the actual HTTP status.
-    Ownership: only the owning user may trigger a health check.
+    Makes an actual GET request and returns the actual HTTP status and
+    latency. Ownership enforced.
     """
     record = _find_deployment_record(deployment_id, user=request.user)
     if record is None:
@@ -1857,16 +2124,16 @@ def deployment_health_view(request, deployment_id):
             'error': f'Deployment "{deployment_id}" not found.'
         }, status=status.HTTP_404_NOT_FOUND)
 
-    endpoint_url = record.endpoint_url
+    endpoint_url = record.live_url
     if not endpoint_url:
         return Response({
             'success': True,
             'data': {
-                'deployment_id': deployment_id,
+                'deploymentId': record.pk,
                 'healthy': False,
-                'provider_type': record.provider,
-                'message': 'No endpoint URL stored for this deployment.',
-                'detail': {'http_status': None, 'latency_ms': None},
+                'providerType': record.provider,
+                'message': 'No live URL stored for this deployment yet.',
+                'detail': {'httpStatus': None, 'latencyMs': None},
             }
         }, status=status.HTTP_200_OK)
 
@@ -1882,29 +2149,46 @@ def deployment_health_view(request, deployment_id):
             return Response({
                 'success': True,
                 'data': {
-                    'deployment_id': deployment_id,
+                    'deploymentId': record.pk,
                     'healthy': healthy,
-                    'provider_type': record.provider,
+                    'providerType': record.provider,
                     'message': f'HTTP {http_status} from {endpoint_url}',
                     'detail': {
-                        'http_status': http_status,
-                        'latency_ms': elapsed_ms,
+                        'httpStatus': http_status,
+                        'latencyMs': elapsed_ms,
                         'url': endpoint_url,
                     },
                 }
             }, status=status.HTTP_200_OK)
+    except urllib.error.HTTPError as exc:
+        elapsed_ms = round((_time.monotonic() - start_time) * 1000)
+        return Response({
+            'success': True,
+            'data': {
+                'deploymentId': record.pk,
+                'healthy': False,
+                'providerType': record.provider,
+                'message': f'HTTP {exc.code} from {endpoint_url}',
+                'detail': {
+                    'httpStatus': exc.code,
+                    'latencyMs': elapsed_ms,
+                    'url': endpoint_url,
+                    'error': str(exc),
+                },
+            }
+        }, status=status.HTTP_200_OK)
     except Exception as exc:
         elapsed_ms = round((_time.monotonic() - start_time) * 1000)
         return Response({
             'success': True,
             'data': {
-                'deployment_id': deployment_id,
+                'deploymentId': record.pk,
                 'healthy': False,
-                'provider_type': record.provider,
+                'providerType': record.provider,
                 'message': f'Health check failed for {endpoint_url}: {exc}',
                 'detail': {
-                    'http_status': None,
-                    'latency_ms': elapsed_ms,
+                    'httpStatus': None,
+                    'latencyMs': elapsed_ms,
                     'url': endpoint_url,
                     'error': str(exc),
                 },
@@ -1914,11 +2198,14 @@ def deployment_health_view(request, deployment_id):
 
 @api_view(['POST'])
 @permission_classes([permissions.IsAuthenticated])
-def deployment_fail_view(request, deployment_id):
+def deployment_retry_view(request, deployment_id):
     """
-    Test endpoint: force a deployment record into FAILED state.
-    Used only for testing the failure UI path.
-    Ownership: only the owning user may mutate a deployment record.
+    Re-run a failed deployment from scratch.
+
+    Re-inspects the repository, regenerates the deployment files,
+    re-validates the environment variables and restarts the pipeline on
+    the same record. Environment variables must be supplied again in the
+    request body — CloudWise never stores secret values.
     """
     record = _find_deployment_record(deployment_id, user=request.user)
     if record is None:
@@ -1927,24 +2214,151 @@ def deployment_fail_view(request, deployment_id):
             'error': f'Deployment "{deployment_id}" not found.'
         }, status=status.HTTP_404_NOT_FOUND)
 
-    reason = request.data.get('reason', 'Test failure triggered.')
-    record.status = 'FAILED'
-    record.logs = (record.logs or []) + [{
-        'timestamp': datetime.now().isoformat(),
-        'level': 'ERROR',
-        'stage': 'FAILED',
-        'message': reason,
-    }]
-    record.save(update_fields=['status', 'logs'])
+    if record.deployment_status not in (
+        DeploymentStatus.FAILED,
+        DeploymentStatus.ROLLED_BACK,
+        'failed',
+    ):
+        return Response({
+            'success': False,
+            'stage': 'PROJECT',
+            'error': (
+                f'Only a failed deployment can be retried '
+                f'(current status: {record.deployment_status}).'
+            ),
+            'currentStatus': record.deployment_status,
+        }, status=status.HTTP_409_CONFLICT)
+
+    data = request.data or {}
+    retry_data = {
+        'environmentName': record.environment_name,
+        'region': record.region,
+        'instanceType': record.instance_type,
+        'monthlyCost': float(record.monthly_cost or 0),
+        'specs': dict(record.specs or {}),
+    }
+    retry_data.update({k: v for k, v in data.items() if v is not None})
+
+    payload, project, error = _prepare_repository_payload(
+        record.user,
+        str(record.project_id or ''),
+        retry_data,
+        data.get('envVars') or {},
+    )
+    if error is not None:
+        return error
+
+    aws_connection = payload.pop('aws_connection')
+    github_connection = payload.pop('github_connection')
+    commit_sha = payload['commit_sha']
+    commit_suffix = f' @ {commit_sha[:7]}' if commit_sha else ''
+
+    logs = list(record.logs or [])
+    logs.append({
+        'timestamp': timezone.now().isoformat(),
+        'level': 'INFO',
+        'stage': DeploymentStage.PREPARING,
+        'message': (
+            f'Retry requested for {payload["repository"]}{commit_suffix} '
+            f'after status {record.deployment_status}. Restarting the '
+            'pipeline.'
+        ),
+    })
+
+    record.project = project
+    record.github_connection = github_connection
+    record.aws_connection = aws_connection
+    record.environment_name = payload['environment_name']
+    record.repository = payload['repository']
+    record.commit_sha = commit_sha
+    record.project_type = payload['project_type']
+    record.aws_account_id = aws_connection.account_id or ''
+    record.region = payload['region']
+    record.instance_type = payload['instance_type']
+    record.monthly_cost = payload['monthly_cost']
+    record.specs = payload['specs']
+    record.deployment_status = DeploymentStatus.QUEUED
+    record.live_url = None
+    record.logs = logs
+    record.save()
+
+    start_pipeline(record.id, payload)
+    record.refresh_from_db()
+    return Response({
+        'success': True,
+        'stage': 'QUEUED',
+        'message': f'Deployment {record.id} restarted for {record.repository}.',
+        'deployment_id': record.id,
+        'data': _deployment_payload(record),
+    }, status=status.HTTP_202_ACCEPTED)
+
+
+@api_view(['POST'])
+@permission_classes([permissions.IsAuthenticated])
+def deployment_terminate_view(request, deployment_id):
+    """
+    Terminate the EC2 instance backing this deployment — always inside
+    the owning user's own AWS account, and only for instances tagged
+    ``ManagedBy=CloudWise``.
+    """
+    record = _find_deployment_record(deployment_id, user=request.user)
+    if record is None:
+        return Response({
+            'success': False,
+            'error': f'Deployment "{deployment_id}" not found.'
+        }, status=status.HTTP_404_NOT_FOUND)
+
+    if not record.instance_id:
+        return Response({
+            'success': False,
+            'stage': 'AWS',
+            'error': 'No EC2 instance recorded for this deployment.',
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    if record.deployment_status == DeploymentStatus.TERMINATED:
+        return Response({
+            'success': False,
+            'stage': 'AWS',
+            'error': f'Instance {record.instance_id} is already terminated.',
+            'currentStatus': record.deployment_status,
+        }, status=status.HTTP_409_CONFLICT)
+
+    aws_connection = AWSConnection.objects.filter(
+        user_id=record.user_id, status='active'
+    ).first()
+    if aws_connection is None:
+        return Response({
+            'success': False,
+            'stage': 'AWS',
+            'error': 'AWS account connection not found.',
+            'connectUrl': '/connect-aws',
+        }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+    try:
+        aws_provider = AwsEc2Provider(user=record.user, connection=aws_connection)
+        result = aws_provider.terminate_instance(record.instance_id)
+    except AwsEc2Error as exc:
+        return Response({
+            'success': False,
+            'stage': 'AWS',
+            'error': f'Terminate failed: {exc}',
+        }, status=status.HTTP_502_BAD_GATEWAY)
+
+    logs = list(record.logs or []) + list(result.get('logs') or [])
+    record.deployment_status = DeploymentStatus.TERMINATED
+    record.logs = logs
+    record.save(update_fields=['deployment_status', 'logs', 'updated_at'])
 
     return Response({
         'success': True,
         'data': {
-            'deployment_id': deployment_id,
-            'status': 'FAILED',
-            'provider_type': record.provider,
-            'message': reason,
-        }
+            'deploymentId': record.pk,
+            'deploymentStatus': record.deployment_status,
+            'instanceId': record.instance_id,
+            'region': result.get('region') or record.region,
+            'message': result.get('message', ''),
+            'logs': logs,
+        },
     }, status=status.HTTP_200_OK)
 
 
@@ -1952,9 +2366,10 @@ def deployment_fail_view(request, deployment_id):
 @permission_classes([permissions.IsAuthenticated])
 def deployment_rollback_view(request, deployment_id):
     """
-    Trigger a redeploy of the last successful deployment via the provider API.
-    For real providers, this creates a new deployment from the same source.
-    Ownership: only the owning user may trigger a rollback.
+    Roll back the last deployment: stop the application containers on
+    the instance (the instance itself is retained).
+
+    AWS EC2 is the only supported target. Ownership enforced.
     """
     record = _find_deployment_record(deployment_id, user=request.user)
     if record is None:
@@ -1964,126 +2379,48 @@ def deployment_rollback_view(request, deployment_id):
         }, status=status.HTTP_404_NOT_FOUND)
 
     provider = (record.provider or '').upper()
-
-    if provider == 'VERCEL':
-        vercel_token = settings.VERCEL_TOKEN
-        if not vercel_token:
-            return Response({
-                'success': False,
-                'error': 'Vercel credentials not configured. Cannot trigger rollback.'
-            }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
-        try:
-            svc = VercelDeploymentService(vercel_token, settings.VERCEL_TEAM_ID or None)
-            project_id = record.provider_project_id
-            if not project_id:
-                return Response({
-                    'success': False,
-                    'error': 'Vercel project ID not stored. Cannot trigger rollback.'
-                }, status=status.HTTP_400_BAD_REQUEST)
-            raw = svc._create_deployment(
-                project_id=project_id,
-                repo_full_name='',
-                branch='main',
-            )
-            new_deploy_id = raw.get('id', deployment_id)
-            record.provider_deployment_id = new_deploy_id
-            record.status = 'QUEUED'
-            record.logs = (record.logs or []) + [{
-                'timestamp': datetime.now().isoformat(),
-                'level': 'INFO',
-                'stage': 'PREPARING',
-                'message': f'Rollback triggered: new Vercel deployment {new_deploy_id}',
-            }]
-            record.save(update_fields=['provider_deployment_id', 'status', 'logs'])
-            return Response({
-                'success': True,
-                'data': {
-                    'deployment_id': new_deploy_id,
-                    'status': 'QUEUED',
-                    'provider_type': 'VERCEL',
-                    'message': f'New Vercel deployment {new_deploy_id} triggered for rollback.',
-                }
-            }, status=status.HTTP_200_OK)
-        except VercelApiError as exc:
-            return Response({
-                'success': False,
-                'error': f'Vercel rollback failed: {exc}'
-            }, status=status.HTTP_502_BAD_GATEWAY)
-
-    elif provider == 'RENDER':
-        render_api_key = settings.RENDER_API_KEY
-        if not render_api_key:
-            return Response({
-                'success': False,
-                'error': 'Render credentials not configured. Cannot trigger rollback.'
-            }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
-        service_id = record.provider_project_id
-        if not service_id:
-            return Response({
-                'success': False,
-                'error': 'Render service ID not stored. Cannot trigger rollback.'
-            }, status=status.HTTP_400_BAD_REQUEST)
-        try:
-            svc = RenderDeploymentService(render_api_key, settings.RENDER_OWNER_ID)
-            raw = svc._trigger_deploy(service_id)
-            new_deploy_id = raw.get('id', deployment_id)
-            record.provider_deployment_id = new_deploy_id
-            record.status = 'QUEUED'
-            record.logs = (record.logs or []) + [{
-                'timestamp': datetime.now().isoformat(),
-                'level': 'INFO',
-                'stage': 'PREPARING',
-                'message': f'Rollback triggered: new Render deploy {new_deploy_id}',
-            }]
-            record.save(update_fields=['provider_deployment_id', 'status', 'logs'])
-            return Response({
-                'success': True,
-                'data': {
-                    'deployment_id': new_deploy_id,
-                    'status': 'QUEUED',
-                    'provider_type': 'RENDER',
-                    'message': f'New Render deploy {new_deploy_id} triggered for rollback.',
-                }
-            }, status=status.HTTP_200_OK)
-        except RenderApiError as exc:
-            return Response({
-                'success': False,
-                'error': f'Render rollback failed: {exc}'
-            }, status=status.HTTP_502_BAD_GATEWAY)
-
-    elif provider == 'AWS':
-        aws_connection = None
-        if record.user_id:
-            aws_connection = AWSConnection.objects.filter(
-                user_id=record.user_id, status='active'
-            ).first()
-        if aws_connection is None:
-            return Response({
-                'success': False,
-                'error': 'AWS account connection not found. Cannot trigger rollback.',
-            }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
-        try:
-            aws_provider = AwsEc2Provider(user=record.user, connection=aws_connection)
-            result = aws_provider.rollback(deployment_id)
-        except AwsEc2Error as exc:
-            return Response({
-                'success': False,
-                'error': f'AWS rollback failed: {exc}',
-            }, status=status.HTTP_502_BAD_GATEWAY)
-        record.status = result['status']
-        record.logs = (record.logs or []) + result.get('logs', [])
-        record.save(update_fields=['status', 'logs'])
+    if provider != 'AWS':
         return Response({
-            'success': True,
-            'data': {
-                'deployment_id': deployment_id,
-                'status': result['status'],
-                'provider_type': 'AWS',
-                'message': result['message'],
-            }
-        }, status=status.HTTP_200_OK)
+            'success': False,
+            'error': f'Rollback not supported for provider "{provider}".',
+            'supported': ['AWS'],
+        }, status=status.HTTP_400_BAD_REQUEST)
 
+    aws_connection = AWSConnection.objects.filter(
+        user_id=record.user_id, status='active'
+    ).first()
+    if aws_connection is None:
+        return Response({
+            'success': False,
+            'error': 'AWS account connection not found. Cannot trigger rollback.',
+            'connectUrl': '/connect-aws',
+        }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+    if not record.instance_id:
+        return Response({
+            'success': False,
+            'error': 'No EC2 instance recorded for this deployment.',
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        aws_provider = AwsEc2Provider(user=record.user, connection=aws_connection)
+        result = aws_provider.rollback(record.instance_id)
+    except AwsEc2Error as exc:
+        return Response({
+            'success': False,
+            'error': f'AWS rollback failed: {exc}',
+        }, status=status.HTTP_502_BAD_GATEWAY)
+
+    record.deployment_status = result['status']
+    record.logs = (record.logs or []) + list(result.get('logs') or [])
+    record.save(update_fields=['deployment_status', 'logs', 'updated_at'])
     return Response({
-        'success': False,
-        'error': f'Rollback not supported for provider "{provider}".'
-    }, status=status.HTTP_400_BAD_REQUEST)
+        'success': True,
+        'data': {
+            'deploymentId': record.pk,
+            'deploymentStatus': record.deployment_status,
+            'instanceId': record.instance_id,
+            'message': result['message'],
+            'logs': record.logs,
+        },
+    }, status=status.HTTP_200_OK)

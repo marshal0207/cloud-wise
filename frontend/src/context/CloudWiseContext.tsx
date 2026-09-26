@@ -85,16 +85,27 @@ export interface OptimizationItem {
 }
 
 export interface MonitoringData {
-  cpuUsage: number;
-  memoryUsage: number;
-  storageUsage: number;
-  networkInMB: number;
-  networkOutMB: number;
+  // CPU / memory / storage are only present when a metrics agent is
+  // actually installed. CloudWise does not install one, so the backend
+  // reports them as null with metricsCollected === false.
+  metricsCollected: boolean;
+  cpuUsage: number | null;
+  memoryUsage: number | null;
+  storageUsage: number | null;
+  networkInMB: number | null;
+  networkOutMB: number | null;
+  deploymentId: string | null;
+  deploymentStatus: string | null;
   healthStatus: string;
   clusterUptime: string;
   activeNodes: number;
-  ipAddress: string;
+  ipAddress: string | null;
+  instanceId: string | null;
+  instanceType: string | null;
+  region: string | null;
+  awsAccountId: string | null;
   endpointUrl: string | null;
+  httpStatus?: number | null;
 }
 
 export interface Project {
@@ -193,7 +204,7 @@ export const buildRecommendations = (est: EstimationData): RecommendationOption[
   const vcpu = est.vcpu;
   const ram = est.ram;
   const storage = est.storage;
-  const region = est.region;
+  const region = String(est.region ?? '');
   const regionMult = region.toLowerCase().includes('gujarat') ? 0.92
     : region.toLowerCase().includes('bengaluru') ? 1.05
     : region.toLowerCase().includes('kolkata') ? 0.96 : 1.0;
@@ -280,7 +291,7 @@ interface CloudWiseContextType {
   availableRecommendations: RecommendationOption[];
   
   githubRepo?: { name: string; connectedAt: string; synced: boolean };
-  connectGitHub: (repoName: string) => Promise<boolean>;
+  connectGitHub: (repoName: string) => Promise<{ projectId: string | null; error: string | null }>;
 
   deployment: DeploymentDetails;
   rollbackDeployment: () => void;
@@ -292,6 +303,7 @@ interface CloudWiseContextType {
   effectiveMonthlyCost: number;
 
   monitoringData: MonitoringData;
+  refreshMonitoring: () => Promise<void>;
 
   toasts: ToastMessage[];
   showToast: (message: string, type?: 'success' | 'error' | 'info') => void;
@@ -595,7 +607,14 @@ export const CloudWiseProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   };
 
   // Helper bindings to Active Project
-  const estimation = activeProject?.estimation || defaultEstimation;
+  const estimation: EstimationData = {
+    ...defaultEstimation,
+    ...(activeProject?.estimation ?? {}),
+    calculatedResult: {
+      ...defaultEstimation.calculatedResult,
+      ...(activeProject?.estimation?.calculatedResult ?? {}),
+    },
+  };
   const setEstimation: React.Dispatch<React.SetStateAction<EstimationData>> = (action) => {
     const newEst = typeof action === 'function' ? action(estimation) : action;
     updateActiveProject({ estimation: newEst });
@@ -605,7 +624,7 @@ export const CloudWiseProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const vcpu = data.vcpu ?? estimation.vcpu;
     const ram = data.ram ?? estimation.ram;
     const storage = data.storage ?? estimation.storage;
-    const selectedRegion = (data.region ?? estimation.region).toLowerCase();
+    const selectedRegion = String(data.region ?? estimation.region ?? '').toLowerCase();
     
     let regionMultiplier = 1.0;
     if (selectedRegion.includes('gujarat')) regionMultiplier = 0.92;
@@ -646,37 +665,82 @@ export const CloudWiseProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     showToast(`Selected ${rec.provider} plan: ${rec.title}`, 'success');
   };
 
-  const connectGitHub = async (repoName: string): Promise<boolean> => {
+  const connectGitHub = async (
+    repoName: string
+  ): Promise<{ projectId: string | null; error: string | null }> => {
+    const fail = (error: string) => ({ projectId: null, error });
+
+    const token = localStorage.getItem('cloudwise_token');
+    if (!token) {
+      return fail('Please sign in to CloudWise before connecting a GitHub repository.');
+    }
+    const headers = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    };
+
+    const role = activeProject?.userRole || user?.role || 'owner';
+    if (role === 'viewer') {
+      const message = 'Access Denied (RBAC): Viewer role cannot link GitHub repository.';
+      showToast(message, 'error');
+      return fail(message);
+    }
+
     const githubRepo = {
       name: repoName,
       connectedAt: new Date().toLocaleTimeString() + ' ' + new Date().toLocaleDateString(),
       synced: true
     };
 
-    let targetProjectId: string;
+    let targetProjectId: string | null = activeProject?.id ?? null;
 
-    if (activeProject) {
-      // Active project exists — update it directly in state
-      if (activeProject.userRole === 'viewer') {
-        showToast('Access Denied (RBAC): Viewer role cannot link GitHub repository.', 'error');
-        return false;
+    // The repository scan runs on the backend, so the project has to exist
+    // there with a real id. Local-only ids are replaced by server ids.
+    if (targetProjectId) {
+      try {
+        const check = await fetch(`/api/projects/${encodeURIComponent(targetProjectId)}`, {
+          headers,
+        });
+        if (check.status === 404 || check.status === 403) {
+          targetProjectId = null;
+        } else if (!check.ok) {
+          const body = await check.json().catch(() => null);
+          return fail(body?.error || body?.detail || 'Unable to verify the project on the CloudWise backend.');
+        }
+      } catch {
+        return fail('Unable to reach the CloudWise backend. Make sure it is running on port 8000.');
       }
-      targetProjectId = activeProject.id;
-      setProjects((prev) =>
-        prev.map((p) =>
-          p.id === targetProjectId
-            ? { ...p, githubRepo, currentStep: 'generate' as const, updatedAt: new Date().toISOString() }
-            : p
-        )
-      );
-    } else {
-      // No active project — create one locally (no backend wait)
+    }
+
+    if (!targetProjectId) {
       const projName = repoName.includes('/') ? repoName.split('/')[1] : repoName;
+      const description = `Deployment project for GitHub repository ${repoName}`;
+
+      let createdId: string;
+      try {
+        const createRes = await fetch('/api/projects', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            name: projName,
+            description,
+            environment: 'Production',
+          }),
+        });
+        const createData = await createRes.json().catch(() => null);
+        createdId = createData?.data?.id;
+        if (!createRes.ok || !createData?.success || !createdId) {
+          return fail(createData?.error || createData?.detail || 'Unable to create a project on the CloudWise backend.');
+        }
+      } catch {
+        return fail('Unable to reach the CloudWise backend. Make sure it is running on port 8000.');
+      }
+
       const newProject: Project = {
-        id: `proj_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
+        id: createdId,
         userId: user?.id || 'default_user',
         name: projName,
-        description: `Deployment project for GitHub repository ${repoName}`,
+        description,
         environment: 'Production',
         userRole: user?.role || 'owner',
         currentStep: 'generate',
@@ -696,37 +760,37 @@ export const CloudWiseProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       };
-      targetProjectId = newProject.id;
+      targetProjectId = createdId;
       setProjects((prev) => [newProject, ...prev]);
-      setActiveProjectId(newProject.id);
-
-      // Attempt to persist to backend (fire-and-forget, don't block UI)
-      const token = localStorage.getItem('cloudwise_token');
-      fetch('/api/projects', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': token ? `Bearer ${token}` : '',
-          'x-user-role': newProject.userRole,
-          'x-user-id': user?.id || 'default_user'
-        },
-        body: JSON.stringify({ name: projName, description: newProject.description, environment: 'Production' })
-      }).catch((err) => console.warn('Backend project create skipped', err));
+      setActiveProjectId(createdId);
+    } else {
+      const existingId = targetProjectId;
+      setProjects((prev) =>
+        prev.map((p) =>
+          p.id === existingId
+            ? { ...p, githubRepo, currentStep: 'generate' as const, updatedAt: new Date().toISOString() }
+            : p
+        )
+      );
     }
 
-    // Sync github_repo to backend (fire-and-forget, don't block UI)
-    const token = localStorage.getItem('cloudwise_token');
-    fetch(`/api/projects/${targetProjectId}/github`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': token ? `Bearer ${token}` : '',
-      },
-      body: JSON.stringify({ repoName })
-    }).catch((err) => console.warn('Backend GitHub connect skipped', err));
+    // Persist the repository link — this is what the scan reads from.
+    try {
+      const linkRes = await fetch(`/api/projects/${encodeURIComponent(targetProjectId)}/github`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ repoName }),
+      });
+      const linkData = await linkRes.json().catch(() => null);
+      if (!linkRes.ok || !linkData?.success) {
+        return fail(linkData?.error || linkData?.detail || 'Unable to link the GitHub repository on the CloudWise backend.');
+      }
+    } catch {
+      return fail('Unable to reach the CloudWise backend. Make sure it is running on port 8000.');
+    }
 
     showToast(`GitHub repository "${repoName}" connected & synced!`, 'success');
-    return true;
+    return { projectId: targetProjectId, error: null };
   };
 
   const deployment = activeProject?.deployment || {
@@ -795,45 +859,68 @@ export const CloudWiseProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const effectiveMonthlyCost = Math.max(0, selectedRecommendation.monthlyCost - totalMonthlySavings);
 
-  // Monitoring data — fetched from backend, derived from estimation as fallback
+  // Monitoring data — always fetched from the backend for the calling
+  // user. Nothing here is invented: the first paint is an explicit
+  // "not measured" state until the response arrives.
   const [monitoringData, setMonitoringData] = useState<MonitoringData>({
-    cpuUsage: 38,
-    memoryUsage: 62,
-    storageUsage: 41,
-    networkInMB: 12.4,
-    networkOutMB: 48.7,
-    healthStatus: 'Healthy',
+    metricsCollected: false,
+    cpuUsage: null,
+    memoryUsage: null,
+    storageUsage: null,
+    networkInMB: null,
+    networkOutMB: null,
+    deploymentId: null,
+    deploymentStatus: null,
+    healthStatus: 'Loading…',
     clusterUptime: '0d 00h 00m',
-    activeNodes: 1,
-    ipAddress: 'Not yet deployed',
+    activeNodes: 0,
+    ipAddress: null,
+    instanceId: null,
+    instanceType: null,
+    region: null,
+    awsAccountId: null,
     endpointUrl: null,
+    httpStatus: null,
   });
 
-  useEffect(() => {
-    const fetchMonitoring = async () => {
-      try {
-        const res = await fetch('/api/monitoring');
-        const data = await res.json();
-        if (res.ok && data.success) {
-          setMonitoringData({
-            cpuUsage: data.data.cpuUsage,
-            memoryUsage: data.data.memoryUsage,
-            storageUsage: data.data.storageUsage,
-            networkInMB: data.data.networkInMB,
-            networkOutMB: data.data.networkOutMB,
-            healthStatus: data.data.healthStatus,
-            clusterUptime: data.data.clusterUptime,
-            activeNodes: data.data.activeNodes,
-            ipAddress: data.data.ipAddress ?? 'Not yet deployed',
-            endpointUrl: data.data.endpointUrl ?? null,
-          });
-        }
-      } catch {
-        // keep fallback
+  const fetchMonitoring = React.useCallback(async () => {
+    try {
+      const token = localStorage.getItem('cloudwise_token');
+      const res = await fetch('/api/monitoring', {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      const data = await res.json().catch(() => null);
+      if (res.ok && data?.success && data.data) {
+        const d = data.data;
+        setMonitoringData({
+          metricsCollected: Boolean(d.metricsCollected),
+          cpuUsage: d.cpuUsage ?? null,
+          memoryUsage: d.memoryUsage ?? null,
+          storageUsage: d.storageUsage ?? null,
+          networkInMB: d.networkInMB ?? null,
+          networkOutMB: d.networkOutMB ?? null,
+          deploymentId: d.deploymentId ?? null,
+          deploymentStatus: d.deploymentStatus ?? null,
+          healthStatus: d.healthStatus ?? 'Not deployed',
+          clusterUptime: d.clusterUptime ?? '0d 00h 00m',
+          activeNodes: Number(d.activeNodes ?? 0),
+          ipAddress: d.ipAddress ?? null,
+          instanceId: d.instanceId ?? null,
+          instanceType: d.instanceType ?? null,
+          region: d.region ?? null,
+          awsAccountId: d.awsAccountId ?? null,
+          endpointUrl: d.endpointUrl ?? null,
+          httpStatus: d.httpStatus ?? null,
+        });
       }
-    };
-    fetchMonitoring();
+    } catch {
+      // keep the "not measured" state — never fabricate values
+    }
   }, []);
+
+  useEffect(() => {
+    void fetchMonitoring();
+  }, [fetchMonitoring]);
 
   return (
     <CloudWiseContext.Provider
@@ -866,6 +953,7 @@ export const CloudWiseProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         totalMonthlySavings,
         effectiveMonthlyCost,
         monitoringData,
+        refreshMonitoring: fetchMonitoring,
         toasts,
         showToast,
         dismissToast
