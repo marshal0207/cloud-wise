@@ -164,6 +164,13 @@ class DeploymentRecordSerializer(serializers.ModelSerializer):
     createdAt = serializers.DateTimeField(source='created_at', read_only=True)
     updatedAt = serializers.DateTimeField(source='updated_at', read_only=True)
     failureStage = serializers.CharField(source='failure_stage', read_only=True)
+    # State machine fields (Part 11)
+    currentStage = serializers.CharField(source='current_stage', read_only=True)
+    statusMessage = serializers.CharField(source='status_message', read_only=True)
+    errorCode = serializers.CharField(source='error_code', read_only=True)
+    errorMessage = serializers.CharField(source='error_message', read_only=True)
+    startedAt = serializers.DateTimeField(source='started_at', read_only=True)
+    finishedAt = serializers.DateTimeField(source='finished_at', read_only=True)
 
     class Meta:
         model = DeploymentRecord
@@ -188,6 +195,12 @@ class DeploymentRecordSerializer(serializers.ModelSerializer):
             'liveUrl',
             'logs',
             'failureStage',
+            'currentStage',
+            'statusMessage',
+            'errorCode',
+            'errorMessage',
+            'startedAt',
+            'finishedAt',
             'createdAt',
             'updatedAt',
         ]

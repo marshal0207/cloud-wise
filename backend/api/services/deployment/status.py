@@ -74,11 +74,32 @@ class DeploymentStage:
 # ---------------------------------------------------------------------------
 
 _VALID_TRANSITIONS: dict[str, set[str]] = {
-    DeploymentStatus.QUEUED: {DeploymentStatus.PREPARING, DeploymentStatus.FAILED},
-    DeploymentStatus.PREPARING: {DeploymentStatus.BUILDING, DeploymentStatus.FAILED},
-    DeploymentStatus.BUILDING: {DeploymentStatus.DEPLOYING, DeploymentStatus.FAILED},
-    DeploymentStatus.DEPLOYING: {DeploymentStatus.HEALTH_CHECK, DeploymentStatus.FAILED},
-    DeploymentStatus.HEALTH_CHECK: {DeploymentStatus.RUNNING, DeploymentStatus.FAILED},
+    # Every non-terminal state may be stopped by the user (Part 14).
+    DeploymentStatus.QUEUED: {
+        DeploymentStatus.PREPARING,
+        DeploymentStatus.FAILED,
+        DeploymentStatus.TERMINATED,
+    },
+    DeploymentStatus.PREPARING: {
+        DeploymentStatus.BUILDING,
+        DeploymentStatus.FAILED,
+        DeploymentStatus.TERMINATED,
+    },
+    DeploymentStatus.BUILDING: {
+        DeploymentStatus.DEPLOYING,
+        DeploymentStatus.FAILED,
+        DeploymentStatus.TERMINATED,
+    },
+    DeploymentStatus.DEPLOYING: {
+        DeploymentStatus.HEALTH_CHECK,
+        DeploymentStatus.FAILED,
+        DeploymentStatus.TERMINATED,
+    },
+    DeploymentStatus.HEALTH_CHECK: {
+        DeploymentStatus.RUNNING,
+        DeploymentStatus.FAILED,
+        DeploymentStatus.TERMINATED,
+    },
     DeploymentStatus.RUNNING: {
         DeploymentStatus.ROLLING_BACK,
         DeploymentStatus.FAILED,
@@ -86,10 +107,16 @@ _VALID_TRANSITIONS: dict[str, set[str]] = {
     },
     DeploymentStatus.FAILED: {
         DeploymentStatus.ROLLING_BACK,
+        DeploymentStatus.QUEUED,  # retry restarts the pipeline on the record
         DeploymentStatus.TERMINATED,
     },
-    DeploymentStatus.ROLLING_BACK: {DeploymentStatus.ROLLED_BACK, DeploymentStatus.FAILED},
+    DeploymentStatus.ROLLING_BACK: {
+        DeploymentStatus.ROLLED_BACK,
+        DeploymentStatus.FAILED,
+        DeploymentStatus.TERMINATED,
+    },
     DeploymentStatus.ROLLED_BACK: {
+        DeploymentStatus.QUEUED,  # retry after a rollback
         DeploymentStatus.TERMINATED,
     },
     DeploymentStatus.TERMINATED: set(),  # terminal state
@@ -114,3 +141,91 @@ def is_valid_transition(from_status: str, to_status: str) -> bool:
 def get_allowed_transitions(status: str) -> frozenset[str]:
     """Return all statuses reachable from the given status."""
     return frozenset(_VALID_TRANSITIONS.get(status, set()))
+
+
+class InvalidTransition(Exception):
+    """Raised when a caller attempts a status change that is not allowed."""
+
+    def __init__(self, from_status: str, to_status: str):
+        self.from_status = from_status
+        self.to_status = to_status
+        allowed = ", ".join(sorted(_VALID_TRANSITIONS.get(from_status, set()))) or "none"
+        super().__init__(
+            f"Invalid deployment transition {from_status} → {to_status}. "
+            f"Allowed from {from_status}: {allowed}."
+        )
+
+
+def transition_to(from_status: str, to_status: str) -> str:
+    """
+    Validate and return the target status.
+
+    Raises InvalidTransition when the change is not permitted by the
+    state machine, so no code path can silently jump QUEUED → RUNNING.
+    """
+    if not is_valid_transition(from_status, to_status):
+        raise InvalidTransition(from_status, to_status)
+    return to_status
+
+
+# ---------------------------------------------------------------------------
+# Derived values — one place for progress/stage so the API, the pipeline
+# and the frontend can never disagree about what a status means.
+# ---------------------------------------------------------------------------
+
+# Deterministic progress derived from the real status. There are no timers
+# and no fabricated intermediate percentages.
+STATUS_PROGRESS: dict[str, int] = {
+    DeploymentStatus.QUEUED: 5,
+    DeploymentStatus.PREPARING: 15,
+    DeploymentStatus.BUILDING: 45,
+    DeploymentStatus.DEPLOYING: 70,
+    DeploymentStatus.HEALTH_CHECK: 90,
+    DeploymentStatus.RUNNING: 100,
+    DeploymentStatus.FAILED: 60,
+    DeploymentStatus.ROLLING_BACK: 50,
+    DeploymentStatus.ROLLED_BACK: 100,
+    DeploymentStatus.TERMINATED: 100,
+    # legacy lowercase records created before migration 0007
+    "deployed": 100,
+    "deploying": 45,
+    "failed": 60,
+}
+
+# Statuses owned by a running pipeline (or an in-progress rollback).
+IN_FLIGHT: tuple[str, ...] = (
+    DeploymentStatus.QUEUED,
+    DeploymentStatus.PREPARING,
+    DeploymentStatus.BUILDING,
+    DeploymentStatus.DEPLOYING,
+    DeploymentStatus.HEALTH_CHECK,
+    DeploymentStatus.ROLLING_BACK,
+)
+
+# Statuses no pipeline is running for.
+SETTLED: tuple[str, ...] = (
+    DeploymentStatus.RUNNING,
+    DeploymentStatus.FAILED,
+    DeploymentStatus.ROLLED_BACK,
+    DeploymentStatus.TERMINATED,
+)
+
+
+def is_in_flight(status: str) -> bool:
+    """True while a background pipeline still owns this deployment."""
+    return status in IN_FLIGHT
+
+
+def is_settled(status: str) -> bool:
+    """True when no pipeline work is outstanding for this status."""
+    return status in SETTLED
+
+
+def progress_for(status: str) -> int:
+    """Deterministic 0–100 progress for a deployment status."""
+    return STATUS_PROGRESS.get(status, 0)
+
+
+def default_error_code(status: str) -> str:
+    """Stable machine-readable code for a failed deployment."""
+    return f"DEPLOYMENT_{status}" if status else "DEPLOYMENT_FAILED"

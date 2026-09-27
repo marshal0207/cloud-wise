@@ -17,6 +17,7 @@ from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 
 from api.models import AWSConnection, DeploymentRecord, EC2Instance, Project, GitHubConnection
+from api.services.deployment.aws_connection_service import AwsConnectionError
 from api.services.deployment.aws_ec2_provider import AwsEc2Error
 
 User = get_user_model()
@@ -38,6 +39,7 @@ class ConnectAwsEndpointTests(TestCase):
         for method, url in (
             ("get", "/api/aws/connect-info"),
             ("get", "/api/aws/connection"),
+            ("post", "/api/aws/verify"),
             ("post", "/api/aws/connect"),
             ("post", "/api/aws/disconnect"),
         ):
@@ -152,6 +154,177 @@ class ConnectAwsEndpointTests(TestCase):
         self.assertFalse(
             AWSConnection.objects.filter(user=self.user).exists()
         )
+
+
+class AwsVerifyEndpointTests(TestCase):
+    """
+    POST /api/aws/verify — one real AWS operation per request.
+
+    Each request backs exactly one line of the beginner verification
+    checklist, so the UI can only light up a step that really ran.
+    A partial verification must never claim the account is connected.
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.user = User.objects.create_user(
+            username="verifyuser",
+            password="pass1234",
+            email="verify@example.com",
+        )
+        self.client.force_authenticate(user=self.user)
+        self.role_arn = "arn:aws:iam::999988887777:role/CloudWiseDeployRole"
+
+    def test_invalid_role_arn_is_reported_as_a_format_problem(self):
+        response = self.client.post(
+            "/api/aws/verify",
+            {"roleArn": "not-an-arn", "scope": "identity"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(response.data["success"])
+        self.assertIn("Invalid IAM Role ARN", response.data["error"])
+        self.assertEqual(response.data["errorKind"], "format")
+
+    @patch(
+        "api.services.deployment.aws_connection_service.get_session"
+    )
+    def test_identity_scope_reports_account_but_keeps_connection_pending(
+        self, mock_get_session
+    ):
+        mock_sts = MagicMock()
+        mock_sts.get_caller_identity.return_value = {
+            "Account": "999988887777",
+            "Arn": "arn:aws:sts::999988887777:assumed-role/CloudWiseDeployRole/x",
+        }
+        mock_session = MagicMock()
+        mock_session.client.return_value = mock_sts
+        mock_get_session.return_value = mock_session
+
+        response = self.client.post(
+            "/api/aws/verify",
+            {"roleArn": self.role_arn, "region": "ap-south-1", "scope": "identity"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.data["data"]
+        self.assertEqual(data["scope"], "identity")
+        self.assertEqual(data["accountId"], "999988887777")
+        self.assertTrue(data["externalId"])
+
+        connection = AWSConnection.objects.get(user=self.user)
+        self.assertEqual(connection.status, "pending")
+        self.assertEqual(connection.role_arn, self.role_arn)
+
+    @patch(
+        "api.services.deployment.preflight.verify_permissions"
+    )
+    @patch(
+        "api.services.deployment.aws_connection_service.assume_role_credentials"
+    )
+    def test_permissions_scope_returns_real_check_results(
+        self, mock_assume, mock_verify
+    ):
+        mock_assume.return_value = {"aws_access_key_id": "ASIATESTKEYID"}
+        mock_verify.return_value = [
+            {
+                "key": "run_instances",
+                "label": "Launch EC2 instances (DryRun)",
+                "action": "ec2:RunInstances",
+                "ok": False,
+                "critical": True,
+                "detail": "ec2:RunInstances: Not authorized",
+                "remedy": "Attach the CloudWise permissions policy.",
+            }
+        ]
+
+        response = self.client.post(
+            "/api/aws/verify",
+            {"roleArn": self.role_arn, "region": "ap-south-1", "scope": "permissions"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.data["data"]
+        self.assertFalse(data["ready"])
+        self.assertIn("ec2:RunInstances", data["missing"])
+        self.assertEqual(data["total"], 1)
+
+    @patch(
+        "api.services.deployment.aws_connection_service.get_session"
+    )
+    def test_region_scope_confirms_the_selected_region(self, mock_get_session):
+        mock_ec2 = MagicMock()
+        mock_ec2.describe_availability_zones.return_value = {
+            "AvailabilityZones": [
+                {"ZoneName": "ap-south-1a"},
+                {"ZoneName": "ap-south-1b"},
+            ]
+        }
+        mock_ec2.describe_instances.return_value = {}
+        mock_session = MagicMock()
+        mock_session.client.return_value = mock_ec2
+        mock_get_session.return_value = mock_session
+
+        response = self.client.post(
+            "/api/aws/verify",
+            {"roleArn": self.role_arn, "region": "ap-south-1", "scope": "region"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.data["data"]
+        self.assertEqual(data["scope"], "region")
+        self.assertEqual(data["region"], "ap-south-1")
+        self.assertEqual(data["availabilityZones"], 2)
+
+    def test_unknown_scope_falls_back_to_identity(self):
+        with patch(
+            "api.services.deployment.aws_connection_service.get_session"
+        ) as mock_get_session:
+            mock_sts = MagicMock()
+            mock_sts.get_caller_identity.return_value = {
+                "Account": "999988887777",
+                "Arn": "arn:aws:sts::999988887777:assumed-role/CloudWiseDeployRole/x",
+            }
+            mock_session = MagicMock()
+            mock_session.client.return_value = mock_sts
+            mock_get_session.return_value = mock_session
+
+            response = self.client.post(
+                "/api/aws/verify",
+                {"roleArn": self.role_arn, "scope": "something-else"},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["data"]["scope"], "identity")
+
+    def test_raw_aws_errors_are_never_returned_as_the_primary_message(self):
+        with patch(
+            "api.services.deployment.aws_connection_service.get_session",
+            side_effect=AwsConnectionError(
+                "CloudWise could not assume the role. The role's trust policy "
+                "may not contain the CloudWise account ID or the correct "
+                "External ID.",
+                technical=(
+                    "botocore.exceptions.ClientError: An error occurred "
+                    "(AccessDenied) when calling the AssumeRole operation"
+                ),
+            ),
+        ):
+            response = self.client.post(
+                "/api/aws/verify",
+                {"roleArn": self.role_arn, "scope": "identity"},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertNotIn("botocore", response.data["error"])
+        self.assertNotIn("ClientError", response.data["error"])
+        self.assertEqual(response.data["errorKind"], "trust")
+        self.assertIn("botocore", response.data["technical"])
 
 
 class DeployAwsFlowTests(TestCase):

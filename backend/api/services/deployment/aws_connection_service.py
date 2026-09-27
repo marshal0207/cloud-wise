@@ -18,6 +18,8 @@ Architecture
 
 Endpoints served by views.aws_*_view:
   GET  /api/aws/connect-info   → policies + external id to create the role
+  POST /api/aws/verify         → one real verification phase (identity /
+                                 permissions / region) for the checklist
   POST /api/aws/connect        → validate role ARN via AssumeRole
   GET  /api/aws/connection     → connection status (no secrets)
   POST /api/aws/disconnect     → remove the connection
@@ -35,85 +37,28 @@ from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
 from django.conf import settings
 
 from ...models import AWSConnection
+from .aws_permissions import (
+    generate_external_id,
+    get_cloudwise_trust_policy,
+    get_cloudwise_permissions_policy,
+    get_required_permissions,
+)
 
 ROLE_ARN_RE = re.compile(r"^arn:aws[a-zA-Z-]*:iam::\d{12}:role/.+$")
 
-# Least-privilege deployment permissions — EC2 describe/create/reuse,
-# security-group configuration, instance metadata and required tagging.
-# Explicitly NOT AdministratorAccess.
-LEAST_PRIVILEGE_STATEMENTS: list[dict] = [
-    {
-        "Sid": "CloudWiseEC2Describe",
-        "Effect": "Allow",
-        "Action": [
-            "ec2:DescribeInstances",
-            "ec2:DescribeInstanceStatus",
-            "ec2:DescribeImages",
-            "ec2:DescribeSecurityGroups",
-            "ec2:DescribeVpcs",
-            "ec2:DescribeSubnets",
-            "ec2:DescribeKeyPairs",
-            "ec2:DescribeAvailabilityZones",
-            "ec2:DescribeTags",
-            "ec2:DescribeVolumes",
-        ],
-        "Resource": "*",
-    },
-    {
-        "Sid": "CloudWiseEC2Provision",
-        "Effect": "Allow",
-        "Action": [
-            "ec2:RunInstances",
-            "ec2:StartInstances",
-            "ec2:StopInstances",
-            "ec2:RebootInstances",
-            "ec2:TerminateInstances",
-            "ec2:CreateTags",
-        ],
-        "Resource": "*",
-    },
-    {
-        "Sid": "CloudWiseSecurityGroupConfig",
-        "Effect": "Allow",
-        "Action": [
-            "ec2:CreateSecurityGroup",
-            "ec2:AuthorizeSecurityGroupIngress",
-            "ec2:AuthorizeSecurityGroupEgress",
-            "ec2:RevokeSecurityGroupIngress",
-            "ec2:ModifyInstanceAttribute",
-        ],
-        "Resource": "*",
-    },
-    {
-        "Sid": "CloudWisePassInstanceRole",
-        "Effect": "Allow",
-        "Action": "iam:PassRole",
-        "Resource": "arn:aws:iam::*:role/cloudwise-ec2-*",
-        "Condition": {"StringEquals": {"iam:PassedToService": "ec2.amazonaws.com"}},
-    },
-    {
-        "Sid": "CloudWiseReadPublicAmiParameter",
-        "Effect": "Allow",
-        "Action": ["ssm:GetParameter", "ssm:GetParameters"],
-        "Resource": "arn:aws:ssm:*:aws:parameter/aws/service/ami-amazon-linux-latest/*",
-    },
-    {
-        "Sid": "CloudWiseSsmContainerDeploy",
-        "Effect": "Allow",
-        "Action": [
-            "ssm:SendCommand",
-            "ssm:GetCommandInvocation",
-            "ssm:ListCommands",
-            "ssm:DescribeInstanceInformation",
-            "ssm:DescribeInstanceAssociations",
-        ],
-        "Resource": "*",
-    },
-]
-
 
 class AwsConnectionError(Exception):
-    """Raised when AWS authorization / connection validation fails."""
+    """
+    Raised when AWS authorization / connection validation fails.
+
+    ``message`` is always beginner-friendly and safe to show in the UI.
+    ``technical`` (optional) carries the raw AWS/boto3 error and is only
+    ever returned inside an explicit "technical details" payload.
+    """
+
+    def __init__(self, message: str, technical: str = ""):
+        super().__init__(message)
+        self.technical = technical
 
 
 def generate_external_id(user) -> str:
@@ -142,13 +87,17 @@ def get_platform_session() -> boto3.Session:
             aws_secret_access_key=settings.AWS_DEPLOYER_SECRET_ACCESS_KEY,
             region_name=settings.AWS_DEPLOYER_REGION,
         )
-    return boto3.Session(region_name=settings.AWS_DEPLOYER_REGION)
+
+    return boto3.Session(
+        region_name=settings.AWS_DEPLOYER_REGION
+    )
 
 
 def get_platform_account_id() -> str:
     """Resolve CloudWise's AWS account id (setting first, then STS)."""
     if settings.AWS_TRUSTED_ACCOUNT_ID:
         return settings.AWS_TRUSTED_ACCOUNT_ID
+
     try:
         sts = get_platform_session().client("sts")
         return str(sts.get_caller_identity().get("Account", ""))
@@ -156,25 +105,53 @@ def get_platform_account_id() -> str:
         return ""
 
 
-def _friendly_sts_error(exc: Exception) -> str:
+def _friendly_sts_error(exc: Exception) -> tuple[str, str]:
+    """
+    Map a raw boto3/sts failure to (beginner message, raw technical text).
+
+    The beginner message never contains botocore type names, stack traces
+    or AWS error codes — those live only in the second element, which the
+    API returns as an opt-in "technical" field for debugging.
+    """
+    technical = f"{exc.__class__.__name__}: {exc}"
+
     if isinstance(exc, NoCredentialsError):
         return (
-            "CloudWise platform AWS credentials are not configured. "
-            "Set AWS_DEPLOYER_ACCESS_KEY_ID / AWS_DEPLOYER_SECRET_ACCESS_KEY "
-            "in backend/.env so CloudWise can assume your IAM role."
+            "CloudWise could not assume the role because the CloudWise "
+            "server is missing its own platform credentials. This is a "
+            "server configuration issue, not a problem with your AWS "
+            "account.",
+            technical,
         )
+
     code = ""
+
     if isinstance(exc, ClientError):
-        code = str(exc.response.get("Error", {}).get("Code", ""))
+        code = str(
+            exc.response.get("Error", {}).get("Code", "")
+        )
+
     if code in ("AccessDenied", "AccessDeniedException"):
         return (
-            "Access denied assuming the IAM role. Verify the role trust "
-            "policy allows CloudWise's account and matches this "
-            "connection's External ID."
+            "CloudWise could not assume the role. The role's trust policy "
+            "may not contain the CloudWise account ID or the correct "
+            "External ID.",
+            technical,
         )
+
     if code in ("MalformedPolicyDocument", "InvalidParameterValue"):
-        return f"Invalid IAM role configuration: {exc}"
-    return f"Failed to assume IAM role: {exc}"
+        return (
+            "The trust policy on your role is not valid. Re-copy the trust "
+            "policy CloudWise generated for this connection and save it on "
+            "the role.",
+            technical,
+        )
+
+    return (
+        "CloudWise could not assume the role. The role's trust policy may "
+        "not contain the CloudWise account ID or the correct External ID.",
+        technical,
+    )
 
 
 def assume_role_credentials(connection: AWSConnection) -> dict:
@@ -184,8 +161,12 @@ def assume_role_credentials(connection: AWSConnection) -> dict:
     never be persisted or logged.
     """
     if not connection.role_arn:
-        raise AwsConnectionError("No IAM role ARN stored for this AWS connection.")
+        raise AwsConnectionError(
+            "No IAM role ARN stored for this AWS connection."
+        )
+
     sts = get_platform_session().client("sts")
+
     try:
         response = sts.assume_role(
             RoleArn=connection.role_arn,
@@ -196,8 +177,14 @@ def assume_role_credentials(connection: AWSConnection) -> dict:
             DurationSeconds=settings.AWS_ROLE_DURATION_SECONDS,
         )
     except (ClientError, BotoCoreError, NoCredentialsError) as exc:
-        raise AwsConnectionError(_friendly_sts_error(exc)) from exc
+        message, technical = _friendly_sts_error(exc)
+        raise AwsConnectionError(
+            message,
+            technical=technical,
+        ) from exc
+
     creds = response["Credentials"]
+
     return {
         "aws_access_key_id": creds["AccessKeyId"],
         "aws_secret_access_key": creds["SecretAccessKey"],
@@ -208,6 +195,7 @@ def assume_role_credentials(connection: AWSConnection) -> dict:
 def get_session(connection: AWSConnection) -> boto3.Session:
     """boto3 session bound to temporary credentials for the user's account."""
     credentials = assume_role_credentials(connection)
+
     return boto3.Session(
         **credentials,
         region_name=connection.region or settings.AWS_DEFAULT_REGION,
@@ -215,39 +203,40 @@ def get_session(connection: AWSConnection) -> boto3.Session:
 
 
 def build_policies(
-    external_id: str, trusted_account_id: str | None = None
+    external_id: str,
+    trusted_account_id: str | None = None,
 ) -> dict:
     """
     Build the trust + least-privilege permissions policies the user pastes
     into AWS IAM when creating their deployment role.
+
+    Uses the canonical policy generator (aws_permissions) as the single
+    source of truth. The frontend receives the policy from this backend
+    API — never duplicate the policy manually in React.
     """
     account = trusted_account_id or get_platform_account_id()
-    if not account:
-        account = "<CLOUDWISE_AWS_ACCOUNT_ID>"
 
-    trust_policy = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Sid": "CloudWiseAssumeRoleWithExternalId",
-                "Effect": "Allow",
-                "Principal": {"AWS": f"arn:aws:iam::{account}:root"},
-                "Action": "sts:AssumeRole",
-                "Condition": {
-                    "StringEquals": {"sts:ExternalId": external_id}
-                },
-            }
-        ],
-    }
-    permissions_policy = {
-        "Version": "2012-10-17",
-        "Statement": LEAST_PRIVILEGE_STATEMENTS,
-    }
+    if not account:
+        account = "038658707850"
+
+    trust_policy = get_cloudwise_trust_policy(
+        external_id,
+        account,
+    )
+
+    permissions_policy = get_cloudwise_permissions_policy()
+
     return {
         "externalId": external_id,
         "trustedAccountId": account,
-        "trustPolicy": json.dumps(trust_policy, indent=2),
-        "permissionsPolicy": json.dumps(permissions_policy, indent=2),
+        "trustPolicy": json.dumps(
+            trust_policy,
+            indent=2,
+        ),
+        "permissionsPolicy": json.dumps(
+            permissions_policy,
+            indent=2,
+        ),
         "instructions": [
             "Open the AWS console → IAM → Roles → Create role.",
             "Trusted entity type: AWS account → Another AWS account.",
@@ -271,20 +260,33 @@ def ensure_pending_connection(user) -> AWSConnection:
             "region": settings.AWS_DEFAULT_REGION,
         },
     )
+
     if not connection.external_id:
         connection.external_id = generate_external_id(user)
-        connection.save(update_fields=["external_id"])
+
+        connection.save(
+            update_fields=["external_id"]
+        )
+
     return connection
 
 
-def connect(user, role_arn: str, region: str | None = None) -> AWSConnection:
+def connect(
+    user,
+    role_arn: str,
+    region: str | None = None,
+) -> AWSConnection:
     """
     Validate and activate an AWS connection.
 
     Validates by assuming the role with temporary credentials and calling
     sts:GetCallerIdentity. Stores only role ARN + external id + account id.
+
+    After validation, also verifies the selected region is available and
+    that the credentials can perform minimum required EC2 operations.
     """
     role_arn = (role_arn or "").strip()
+
     if not ROLE_ARN_RE.match(role_arn):
         raise AwsConnectionError(
             "Invalid IAM Role ARN. Expected format: "
@@ -292,28 +294,297 @@ def connect(user, role_arn: str, region: str | None = None) -> AWSConnection:
         )
 
     connection = ensure_pending_connection(user)
+
     connection.role_arn = role_arn
+
     if region:
         connection.region = region.strip()
-    connection.save(update_fields=["role_arn", "region", "updated_at"])
+
+    connection.save(
+        update_fields=[
+            "role_arn",
+            "region",
+            "updated_at",
+        ]
+    )
 
     # Validate: temporary credentials must work and resolve an account id.
     session = get_session(connection)
+
     identity = session.client("sts").get_caller_identity()
-    connection.account_id = str(identity.get("Account", ""))
+
+    connection.account_id = str(
+        identity.get("Account", "")
+    )
+
+    # --- Validate selected AWS region is available ---
+    try:
+        ec2 = session.client(
+            "ec2",
+            region_name=connection.region,
+        )
+
+        az_response = ec2.describe_availability_zones()
+
+        if not az_response.get("AvailabilityZones"):
+            raise AwsConnectionError(
+                f"Selected AWS region '{connection.region}' "
+                "is unavailable or returned no availability zones."
+            )
+
+    except (ClientError, BotoCoreError) as exc:
+        raise AwsConnectionError(
+            f"Selected AWS region '{connection.region}' is unavailable.",
+            technical=f"{exc.__class__.__name__}: {exc}",
+        ) from exc
+
+    # --- Validate that credentials can describe instances ---
+    try:
+        # AWS requires a value greater than 5 for this request.
+        ec2.describe_instances(MaxResults=5)
+
+    except (ClientError, BotoCoreError) as exc:
+        code = str(
+            (exc.response.get("Error") or {}).get("Code", "")
+        )
+
+        if code in (
+            "AccessDenied",
+            "AccessDeniedException",
+        ):
+            raise AwsConnectionError(
+                "The CloudWise role is missing required deployment "
+                "permissions. Update the permissions policy on your role "
+                "and click Verify Again.",
+                technical=f"{code}: {exc}",
+            )
+
+        raise AwsConnectionError(
+            f"Cannot describe instances in region {connection.region}.",
+            technical=f"{exc.__class__.__name__}: {exc}",
+        ) from exc
+
     connection.status = "active"
-    connection.save(update_fields=["account_id", "status", "updated_at"])
+
+    connection.save(
+        update_fields=[
+            "account_id",
+            "status",
+            "updated_at",
+        ]
+    )
+
     return connection
 
 
 def get_active_connection(user) -> AWSConnection | None:
-    return AWSConnection.objects.filter(user=user, status="active").first()
+    return AWSConnection.objects.filter(
+        user=user,
+        status="active",
+    ).first()
 
 
-def connection_public_dict(connection: AWSConnection | None) -> dict:
+VERIFY_SCOPES = (
+    "identity",
+    "permissions",
+    "region",
+)
+
+
+def verify(
+    user,
+    role_arn: str,
+    region: str | None = None,
+    scope: str = "identity",
+) -> dict:
+    """
+    One phase of the beginner-facing verification checklist.
+
+    Each scope is a single real AWS operation, so the UI can light up a
+    check only when that check actually ran (no simulated progress):
+
+      identity     — sts:AssumeRole + sts:GetCallerIdentity (role, account)
+      permissions  — the Part 22 permission self-check (DryRun probes)
+      region       — describe availability zones + read the EC2 inventory
+
+    The connection stays ``pending`` until ``connect()`` succeeds, so a
+    partial verification never claims the account is connected.
+    """
+    role_arn = (role_arn or "").strip()
+
+    if not ROLE_ARN_RE.match(role_arn):
+        raise AwsConnectionError(
+            "Invalid IAM Role ARN. Expected format: "
+            "arn:aws:iam::123456789012:role/CloudWiseDeployRole"
+        )
+
+    connection = ensure_pending_connection(user)
+
+    connection.role_arn = role_arn
+
+    if region:
+        connection.region = region.strip()
+
+    connection.save(
+        update_fields=[
+            "role_arn",
+            "region",
+            "updated_at",
+        ]
+    )
+
+    # ---------------------------------------------------------------
+    # 1. Identity verification
+    # ---------------------------------------------------------------
+    if scope == "identity":
+        session = get_session(connection)
+
+        identity = session.client(
+            "sts"
+        ).get_caller_identity()
+
+        account = str(
+            identity.get("Account", "")
+        )
+
+        connection.account_id = account
+
+        connection.save(
+            update_fields=[
+                "account_id",
+                "updated_at",
+            ]
+        )
+
+        return {
+            "scope": "identity",
+            "accountId": account,
+            "roleArn": role_arn,
+            "assumedRoleArn": str(
+                identity.get("Arn", "")
+            ),
+            "externalId": connection.external_id,
+            "region": connection.region,
+        }
+
+    # ---------------------------------------------------------------
+    # 2. Permission verification
+    # ---------------------------------------------------------------
+    if scope == "permissions":
+        from .preflight import (
+            summarize,
+            verify_permissions,
+        )
+
+        credentials = assume_role_credentials(
+            connection
+        )
+
+        checks = verify_permissions(
+            connection,
+            credentials=credentials,
+            region=connection.region,
+        )
+
+        ready, missing = summarize(
+            checks
+        )
+
+        passed = sum(
+            1
+            for c in checks
+            if c.get("ok") is True
+        )
+
+        return {
+            "scope": "permissions",
+            "checks": checks,
+            "ready": ready,
+            "missing": missing,
+            "passed": passed,
+            "total": len(checks),
+            "region": connection.region,
+        }
+
+    # ---------------------------------------------------------------
+    # 3. Region verification
+    # ---------------------------------------------------------------
+    if scope == "region":
+        session = get_session(connection)
+
+        ec2 = session.client(
+            "ec2",
+            region_name=connection.region,
+        )
+
+        try:
+            zones = (
+                ec2.describe_availability_zones()
+                .get("AvailabilityZones")
+                or []
+            )
+
+        except (ClientError, BotoCoreError) as exc:
+            raise AwsConnectionError(
+                f"AWS region '{connection.region}' is unavailable.",
+                technical=f"{exc.__class__.__name__}: {exc}",
+            ) from exc
+
+        if not zones:
+            raise AwsConnectionError(
+                f"AWS region '{connection.region}' is unavailable."
+            )
+
+        try:
+            # IMPORTANT:
+            # Do not use MaxResults=1.
+            # AWS rejects values <= 5 for this request.
+            ec2.describe_instances(
+                MaxResults=5
+            )
+
+        except (ClientError, BotoCoreError) as exc:
+            code = str(
+                (exc.response.get("Error") or {}).get("Code", "")
+            )
+
+            if code in (
+                "AccessDenied",
+                "AccessDeniedException",
+            ):
+                raise AwsConnectionError(
+                    "The CloudWise role is missing required deployment "
+                    "permissions. Update the permissions policy on your "
+                    "role and click Verify Again.",
+                    technical=f"{code}: {exc}",
+                ) from exc
+
+            raise AwsConnectionError(
+                f"Cannot read EC2 in region {connection.region}.",
+                technical=f"{exc.__class__.__name__}: {exc}",
+            ) from exc
+
+        return {
+            "scope": "region",
+            "region": connection.region,
+            "availabilityZones": len(zones),
+        }
+
+    raise AwsConnectionError(
+        f"Unknown verification step: {scope}"
+    )
+
+
+def connection_public_dict(
+    connection: AWSConnection | None,
+) -> dict:
     """Safe JSON view of a connection — contains no secrets by design."""
+
     if connection is None:
-        return {"connected": False}
+        return {
+            "connected": False
+        }
+
     return {
         "connected": connection.status == "active",
         "status": connection.status,
@@ -321,13 +592,19 @@ def connection_public_dict(connection: AWSConnection | None) -> dict:
         "roleArn": connection.role_arn,
         "externalId": connection.external_id,
         "region": connection.region,
-        "connectedAt": connection.connected_at.isoformat()
-        if connection.connected_at
-        else None,
+        "connectedAt": (
+            connection.connected_at.isoformat()
+            if connection.connected_at
+            else None
+        ),
     }
 
 
 def disconnect(user) -> bool:
     """Remove the user's AWS connection (no cloud-side changes needed)."""
-    deleted, _ = AWSConnection.objects.filter(user=user).delete()
+
+    deleted, _ = AWSConnection.objects.filter(
+        user=user
+    ).delete()
+
     return deleted > 0

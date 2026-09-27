@@ -59,15 +59,23 @@ from .services.deployment.pipeline import (
     fail_deployment,
     start_pipeline,
 )
-from .services.deployment.status import DeploymentStage, DeploymentStatus
+from .services.deployment.status import (
+    DeploymentStage,
+    DeploymentStatus,
+    IN_FLIGHT,
+    STATUS_PROGRESS,
+    progress_for,
+)
 from .services.deployment.aws_connection_service import (
     AwsConnectionError,
+    VERIFY_SCOPES,
     build_policies,
     connect as aws_connect,
     connection_public_dict,
     disconnect as aws_disconnect,
     ensure_pending_connection,
     platform_credentials_configured,
+    verify as aws_verify,
 )
 from .services.deployment.aws_ec2_provider import AwsEc2Error, AwsEc2Provider
 
@@ -1120,6 +1128,46 @@ def deploy_view(request):
 
 
 @api_view(['POST'])
+@permission_classes([permissions.IsAuthenticated])
+def deploy_preflight_view(request):
+    """
+    Part 21 — pre-deployment preflight.
+
+    Runs every check a deployment needs *before* anything is created:
+    GitHub connection, AWS connection, STS AssumeRole, region
+    availability and the Part 22 permission self-check against the
+    user's own IAM role. Nothing is provisioned and no record is
+    written — this endpoint only answers "is it ready?".
+    """
+    from .services.deployment.preflight import run_preflight
+
+    data = request.data or {}
+    project_id = str(data.get('projectId') or '').strip()
+    repo_name = str(data.get('repoName') or '').strip()
+
+    if project_id:
+        project = Project.objects.filter(pk=project_id, user=request.user).first()
+        if project is None:
+            return Response({
+                'success': False,
+                'stage': 'PROJECT',
+                'error': f'Project "{project_id}" not found.',
+            }, status=status.HTTP_404_NOT_FOUND)
+        if not repo_name:
+            repo_name = str((project.github_repo or {}).get('name') or '')
+
+    include_repository = bool(repo_name) and bool(
+        data.get('includeRepository', True)
+    )
+    result = run_preflight(
+        request.user,
+        repo_name=repo_name,
+        include_repository=include_repository,
+    )
+    return Response(result, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
 @permission_classes([permissions.AllowAny])
 def waitlist_view(request):
     email = request.data.get('email', '').strip().lower()
@@ -1744,6 +1792,60 @@ def aws_pricing_view(request):
 # AWS account connection (Part 3 — IAM role + temporary credentials)
 # -------------------------------------------------------------
 
+def aws_error_kind(message: str) -> str:
+    """
+    Classify a beginner-facing connection error so the UI can jump the
+    user straight to the card that fixes it. Never returns raw AWS text.
+    """
+    text = (message or "").lower()
+    if "invalid iam role arn" in text:
+        return "format"
+    if "platform" in text or "aws_deployer" in text:
+        return "platform"
+    if "permission" in text or "lacks" in text or "not authorized" in text:
+        return "permissions"
+    if "region" in text:
+        return "region"
+    return "trust"
+
+
+def aws_error_payload(exc: AwsConnectionError) -> dict:
+    """Beginner error + opt-in raw technical details for debugging."""
+    message = str(exc)
+    return {
+        "success": False,
+        "error": message,
+        "errorKind": aws_error_kind(message),
+        "technical": getattr(exc, "technical", "") or "",
+    }
+
+
+@api_view(['POST'])
+@permission_classes([permissions.IsAuthenticated])
+def aws_verify_view(request):
+    """
+    One real verification phase of the connect checklist.
+
+    POST {roleArn, region, scope} where scope is one of:
+      identity     — sts:AssumeRole + sts:GetCallerIdentity
+      permissions  — permission self-check (DryRun probes, no resources)
+      region       — availability zones + EC2 inventory read
+
+    The connection stays pending; only aws/connect activates it.
+    """
+    role_arn = request.data.get('roleArn', '')
+    region = request.data.get('region', '')
+    scope = str(request.data.get('scope') or 'identity')
+    if scope not in VERIFY_SCOPES:
+        scope = 'identity'
+    try:
+        data = aws_verify(
+            request.user, role_arn, region=region or None, scope=scope
+        )
+    except AwsConnectionError as exc:
+        return Response(aws_error_payload(exc), status=status.HTTP_400_BAD_REQUEST)
+    return Response({'success': True, 'data': data}, status=status.HTTP_200_OK)
+
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated])
 def aws_connect_info_view(request):
@@ -1786,10 +1888,7 @@ def aws_connect_view(request):
             request.user, role_arn, region=region or None
         )
     except AwsConnectionError as exc:
-        return Response({
-            'success': False,
-            'error': str(exc),
-        }, status=status.HTTP_400_BAD_REQUEST)
+        return Response(aws_error_payload(exc), status=status.HTTP_400_BAD_REQUEST)
     return Response({
         'success': True,
         'message': (
@@ -1833,33 +1932,12 @@ def aws_disconnect_view(request):
 # existence is never leaked.
 # -------------------------------------------------------------
 
-# Deterministic progress derived from the real deployment status.
-# There are no timers and no fabricated intermediate percentages.
-_STATUS_PROGRESS = {
-    DeploymentStatus.QUEUED: 5,
-    DeploymentStatus.PREPARING: 15,
-    DeploymentStatus.BUILDING: 45,
-    DeploymentStatus.DEPLOYING: 70,
-    DeploymentStatus.HEALTH_CHECK: 90,
-    DeploymentStatus.RUNNING: 100,
-    DeploymentStatus.FAILED: 60,
-    DeploymentStatus.ROLLING_BACK: 50,
-    DeploymentStatus.ROLLED_BACK: 100,
-    DeploymentStatus.TERMINATED: 100,
-    # legacy lowercase values from records created before migration 0007
-    'deployed': 100,
-    'deploying': 45,
-    'failed': 60,
-}
+# Deterministic progress derived from the real deployment status —
+# imported from the state machine module so the API, the pipeline and
+# the frontend can never disagree (Part 11).
+_STATUS_PROGRESS = STATUS_PROGRESS
 
-_IN_FLIGHT = (
-    DeploymentStatus.QUEUED,
-    DeploymentStatus.PREPARING,
-    DeploymentStatus.BUILDING,
-    DeploymentStatus.DEPLOYING,
-    DeploymentStatus.HEALTH_CHECK,
-    DeploymentStatus.ROLLING_BACK,
-)
+_IN_FLIGHT = IN_FLIGHT
 
 _ALIVE = (DeploymentStatus.RUNNING, 'deployed')
 
@@ -1888,8 +1966,14 @@ def _find_deployment_record(deployment_id, user=None):
 def _deployment_payload(record, include_logs=True):
     """Serializer output plus derived progress and the openable live URL."""
     data = DeploymentRecordSerializer(record).data
-    data['progress'] = _STATUS_PROGRESS.get(record.deployment_status, 0)
+    data['progress'] = progress_for(record.deployment_status)
     data['openUrl'] = record.live_url or ''
+    data['currentStage'] = record.current_stage or ''
+    data['statusMessage'] = record.status_message or ''
+    data['errorCode'] = record.error_code or ''
+    data['errorMessage'] = record.error_message or ''
+    data['startedAt'] = record.started_at.isoformat() if record.started_at else None
+    data['finishedAt'] = record.finished_at.isoformat() if record.finished_at else None
     if not include_logs:
         data['logCount'] = len(record.logs or [])
         data.pop('logs', None)
@@ -1901,7 +1985,7 @@ def _stored_status_payload(record, message=None):
     return {
         'deploymentId': record.pk,
         'deploymentStatus': record.deployment_status,
-        'progress': _STATUS_PROGRESS.get(record.deployment_status, 0),
+        'progress': progress_for(record.deployment_status),
         'providerType': record.provider,
         'repository': record.repository,
         'liveUrl': record.live_url or '',
@@ -1910,7 +1994,10 @@ def _stored_status_payload(record, message=None):
         'instanceState': None,
         'awsAccountId': record.aws_account_id or None,
         'region': record.region,
-        'message': message or 'Stored deployment status.',
+        'currentStage': record.current_stage or '',
+        'errorCode': record.error_code or '',
+        'errorMessage': record.error_message or '',
+        'message': message or record.status_message or 'Stored deployment status.',
     }
 
 
@@ -2077,7 +2164,7 @@ def deployment_status_view(request, deployment_id):
         'data': {
             'deploymentId': record.pk,
             'deploymentStatus': deployment_status,
-            'progress': _STATUS_PROGRESS.get(deployment_status, 0),
+            'progress': progress_for(deployment_status),
             'providerType': record.provider,
             'repository': record.repository,
             'liveUrl': record.live_url or '',
@@ -2086,7 +2173,9 @@ def deployment_status_view(request, deployment_id):
             'instanceState': instance_state or None,
             'awsAccountId': record.aws_account_id or None,
             'region': live.get('region') or record.region,
-            'message': live.get('message', ''),
+            'currentStage': record.current_stage or '',
+            'errorCode': record.error_code or '',
+            'message': live.get('message', '') or record.status_message,
         },
     }, status=status.HTTP_200_OK)
 
@@ -2358,6 +2447,118 @@ def deployment_terminate_view(request, deployment_id):
             'region': result.get('region') or record.region,
             'message': result.get('message', ''),
             'logs': logs,
+        },
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+@permission_classes([permissions.IsAuthenticated])
+def deployment_stop_view(request, deployment_id):
+    """
+    Part 14 — stop/cancel a deployment.
+
+    * In flight (pipeline running): the stop request is recorded, the
+      pipeline aborts at its next checkpoint and the record settles on
+      TERMINATED (a stop always wins over a late FAILED/RUNNING write).
+    * Live (instance running): the EC2 instance is terminated — only
+      instances tagged ``ManagedBy=CloudWise`` are ever touched.
+    """
+    from .services.deployment.log_service import make_log_entry
+    from .services.deployment.status import progress_for
+
+    record = _find_deployment_record(deployment_id, user=request.user)
+    if record is None:
+        return Response({
+            'success': False,
+            'error': f'Deployment "{deployment_id}" not found.',
+        }, status=status.HTTP_404_NOT_FOUND)
+
+    if record.deployment_status == DeploymentStatus.TERMINATED:
+        return Response({
+            'success': False,
+            'stage': 'AWS',
+            'error': f'Deployment {record.pk} is already stopped.',
+            'currentStatus': record.deployment_status,
+        }, status=status.HTTP_409_CONFLICT)
+
+    stage = (
+        record.current_stage
+        if record.current_stage in DeploymentStage.ALL
+        else DeploymentStage.PREPARING
+    )
+    message = (
+        f'Stop requested for deployment {record.pk} by the user '
+        f'(was {record.deployment_status}).'
+    )
+    DeploymentRecord.objects.filter(pk=record.pk).update(
+        cancel_requested=True,
+        updated_at=timezone.now(),
+        logs=list(record.logs or []) + [
+            make_log_entry(stage, message, level='WARNING')
+        ],
+    )
+
+    instance_id = record.instance_id
+    instance_terminated = False
+    if instance_id:
+        aws_connection = AWSConnection.objects.filter(
+            user_id=record.user_id, status='active'
+        ).first()
+        if aws_connection is None:
+            return Response({
+                'success': False,
+                'stage': 'AWS',
+                'error': (
+                    f'AWS connection is required to release instance '
+                    f'{instance_id}. Connect your AWS account and stop again.'
+                ),
+                'connectUrl': '/connect-aws',
+                'stopRequested': True,
+            }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        try:
+            aws_provider = AwsEc2Provider(
+                user=record.user, connection=aws_connection
+            )
+            result = aws_provider.terminate_instance(instance_id)
+        except AwsEc2Error as exc:
+            return Response({
+                'success': False,
+                'stage': 'AWS',
+                'error': f'Could not terminate instance {instance_id}: {exc}',
+                'stopRequested': True,
+            }, status=status.HTTP_502_BAD_GATEWAY)
+
+        instance_terminated = True
+        record.logs = list(record.logs or []) + list(result.get('logs') or [])
+
+    # Settle the record on TERMINATED through the state machine.
+    terminal_message = (
+        f'Deployment stopped. Instance {instance_id} terminated.'
+        if instance_terminated
+        else 'Deployment stopped before an instance was created.'
+    )
+    values = {
+        'cancel_requested': True,
+        'deployment_status': DeploymentStatus.TERMINATED,
+        'current_stage': stage,
+        'progress': progress_for(DeploymentStatus.TERMINATED),
+        'status_message': terminal_message,
+        'finished_at': timezone.now(),
+        'updated_at': timezone.now(),
+        'logs': list(record.logs or []),
+    }
+    DeploymentRecord.objects.filter(pk=record.pk).update(**values)
+
+    return Response({
+        'success': True,
+        'data': {
+            'deploymentId': record.pk,
+            'deploymentStatus': DeploymentStatus.TERMINATED,
+            'instanceId': instance_id or None,
+            'instanceTerminated': instance_terminated,
+            'message': terminal_message,
+            'logs': values['logs'],
         },
     }, status=status.HTTP_200_OK)
 

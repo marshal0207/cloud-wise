@@ -29,9 +29,154 @@ from django.utils import timezone
 from ...models import AWSConnection, DeploymentRecord, Project
 from .aws_connection_service import AwsConnectionError, assume_role_credentials
 from .aws_ec2_provider import AwsEc2Error, AwsEc2Provider
-from .status import DeploymentStage, DeploymentStatus
+from .log_service import make_log_entry, sanitize_message
+from .status import (
+    DeploymentStage,
+    DeploymentStatus,
+    is_valid_transition,
+    progress_for,
+)
 
 logger = logging.getLogger(__name__)
+
+# Statuses that end a deployment run (no further pipeline work).
+_TERMINAL_STATUSES = (
+    DeploymentStatus.RUNNING,
+    DeploymentStatus.FAILED,
+    DeploymentStatus.ROLLED_BACK,
+    DeploymentStatus.TERMINATED,
+)
+
+# The happy path in order. Used to walk a deployment forward when a
+# status jump would otherwise be illegal (for example a mocked provider
+# that reports RUNNING straight from DEPLOYING).
+_LADDER: tuple[str, ...] = (
+    DeploymentStatus.QUEUED,
+    DeploymentStatus.PREPARING,
+    DeploymentStatus.BUILDING,
+    DeploymentStatus.DEPLOYING,
+    DeploymentStatus.HEALTH_CHECK,
+    DeploymentStatus.RUNNING,
+)
+
+
+def resolve_transition(current: str, target: str) -> list[str] | None:
+    """
+    Return the statuses to walk through to reach ``target`` from
+    ``current``, or None when the change is not permitted at all.
+    """
+    if current == target:
+        return [target]
+    if is_valid_transition(current, target):
+        return [target]
+    if current in _LADDER and target in _LADDER:
+        start, end = _LADDER.index(current), _LADDER.index(target)
+        if end > start:
+            return list(_LADDER[start + 1 : end + 1])
+    return None
+
+
+def _status_fields(
+    record: DeploymentRecord,
+    to_status: str,
+    message: str,
+    stage: str | None = None,
+    error_code: str = "",
+    error_message: str = "",
+) -> dict:
+    """
+    Field changes implied by moving ``record`` to ``to_status``.
+
+    Part 11: status, stage, progress, message, timestamps and error
+    details always move together, so the UI never sees a status without
+    the stage/progress that explains it.
+    """
+    now = timezone.now()
+    fields: dict = {
+        "deployment_status": to_status,
+        "progress": progress_for(to_status),
+        "status_message": sanitize_message(message or "")[:500],
+        "updated_at": now,
+    }
+    if stage:
+        fields["current_stage"] = stage
+    if record.started_at is None and to_status != DeploymentStatus.QUEUED:
+        fields["started_at"] = now
+    if to_status in _TERMINAL_STATUSES:
+        fields["finished_at"] = now
+    if to_status == DeploymentStatus.FAILED:
+        fields["error_code"] = error_code or record.error_code or "DEPLOYMENT_FAILED"
+        fields["error_message"] = (error_message or message or "")[:1000]
+    elif to_status in (DeploymentStatus.QUEUED, DeploymentStatus.RUNNING):
+        fields["error_code"] = ""
+        fields["error_message"] = ""
+    return fields
+
+
+def set_status(
+    deployment_id: str,
+    to_status: str,
+    stage: str | None = None,
+    message: str = "",
+    level: str = "INFO",
+    error_code: str = "",
+    error_message: str = "",
+    append_entry: bool = True,
+) -> bool:
+    """
+    Move a deployment to ``to_status`` through the state machine.
+
+    Returns True when the transition was applied. An illegal transition
+    (for example writing FAILED onto a deployment the user already
+    stopped) is refused and logged instead of being forced.
+    """
+    record = DeploymentRecord.objects.filter(pk=deployment_id).first()
+    if record is None:
+        return False
+
+    values: dict = {"updated_at": timezone.now()}
+    if append_entry:
+        entry = make_log_entry(
+            stage or record.current_stage or DeploymentStage.PREPARING,
+            message,
+            level=level,  # type: ignore[arg-type]
+        )
+        values["logs"] = list(record.logs or []) + [entry]
+
+    if record.deployment_status != to_status:
+        path = resolve_transition(record.deployment_status, to_status)
+        if path is None:
+            logger.warning(
+                "Refused deployment %s transition %s → %s: %s",
+                deployment_id,
+                record.deployment_status,
+                to_status,
+                message,
+            )
+            # A stopped deployment is frozen: no further status or log
+            # writes from a pipeline that is winding down.
+            if record.deployment_status != DeploymentStatus.TERMINATED:
+                DeploymentRecord.objects.filter(pk=deployment_id).update(**values)
+            return False
+        values.update(_status_fields(record, to_status, message, stage, error_code, error_message))
+    else:
+        if stage:
+            values["current_stage"] = stage
+        if message:
+            values["status_message"] = sanitize_message(message)[:500]
+
+    DeploymentRecord.objects.filter(pk=deployment_id).update(**values)
+    return True
+
+
+def stop_requested(deployment_id: str) -> bool:
+    """True when the user asked to stop this deployment (Part 14)."""
+    from django.db.models import Q
+
+    return DeploymentRecord.objects.filter(pk=deployment_id).filter(
+        Q(cancel_requested=True)
+        | Q(deployment_status=DeploymentStatus.TERMINATED)
+    ).exists()
 
 
 def _prepare_stage_status() -> dict[str, str]:
@@ -100,12 +245,41 @@ class RecordLogStream:
         record = DeploymentRecord.objects.filter(pk=self.deployment_id).first()
         if record is None:
             return
+        if record.deployment_status == DeploymentStatus.TERMINATED:
+            # Frozen by a user stop — a winding-down pipeline must not
+            # keep appending progress to a stopped deployment.
+            return
+        safe_entry = dict(entry)
+        safe_entry["message"] = sanitize_message(str(entry.get("message") or ""))
         logs = list(record.logs or [])
-        logs.append(entry)
+        logs.append(safe_entry)
         values: dict = {"logs": logs, "updated_at": timezone.now()}
-        new_status = self.stage_status.get(str(entry.get("stage") or ""))
-        if new_status and new_status != record.deployment_status:
-            values["deployment_status"] = new_status
+
+        stage = str(safe_entry.get("stage") or "")
+        if stage:
+            values["current_stage"] = stage
+        values["status_message"] = safe_entry["message"][:500]
+
+        hint = self.stage_status.get(stage)
+        if hint and hint != record.deployment_status:
+            if resolve_transition(record.deployment_status, hint) is not None:
+                values.update(
+                    _status_fields(
+                        record,
+                        hint,
+                        safe_entry["message"],
+                        stage,
+                    )
+                )
+                values["logs"] = logs  # _status_fields never touches logs
+            else:
+                logger.warning(
+                    "Deployment %s stage %s wanted %s from %s — ignored.",
+                    self.deployment_id,
+                    stage,
+                    hint,
+                    record.deployment_status,
+                )
         DeploymentRecord.objects.filter(pk=self.deployment_id).update(**values)
 
 
@@ -119,38 +293,75 @@ def append_log(
     record = DeploymentRecord.objects.filter(pk=deployment_id).first()
     if record is None:
         return
+    if record.deployment_status == DeploymentStatus.TERMINATED:
+        return
+    message = sanitize_message(message)
     logs = list(record.logs or [])
     if logs:
         last = logs[-1]
         if last.get("level") == level and last.get("message") == message:
             return
-    from .log_service import make_log_entry
 
     logs.append(make_log_entry(stage, message, level=level))
     DeploymentRecord.objects.filter(pk=deployment_id).update(
-        logs=logs, updated_at=timezone.now()
+        logs=logs,
+        status_message=message[:500],
+        updated_at=timezone.now(),
     )
 
 
-def fail_deployment(deployment_id: str, stage: str, message: str) -> None:
-    """Record a terminal failure with an understandable, stage-tagged message."""
+def fail_deployment(
+    deployment_id: str,
+    stage: str,
+    message: str,
+    error_code: str = "",
+) -> None:
+    """
+    Record a terminal failure with an understandable, stage-tagged message.
+
+    A deployment the user already stopped (TERMINATED) is never
+    overwritten with FAILED — the stop wins (Part 14).
+    """
     record = DeploymentRecord.objects.filter(pk=deployment_id).first()
     if record is None:
         return
+    message = sanitize_message(message)
     logs = list(record.logs or [])
-    from .log_service import make_log_entry
-
     if not (
         logs
         and logs[-1].get("level") == "ERROR"
         and logs[-1].get("message") == message
     ):
         logs.append(make_log_entry(stage, message, level="ERROR"))
-    DeploymentRecord.objects.filter(pk=deployment_id).update(
-        logs=logs,
-        deployment_status=DeploymentStatus.FAILED,
-        updated_at=timezone.now(),
+
+    if record.deployment_status == DeploymentStatus.TERMINATED:
+        DeploymentRecord.objects.filter(pk=deployment_id).update(
+            logs=logs, updated_at=timezone.now()
+        )
+        return
+
+    values = dict(
+        _status_fields(
+            record,
+            DeploymentStatus.FAILED,
+            message,
+            stage,
+            error_code=error_code or f"FAILED_{stage}",
+            error_message=message,
+        )
     )
+    values["logs"] = logs  # _status_fields never touches logs
+    if not is_valid_transition(record.deployment_status, DeploymentStatus.FAILED):
+        for key in (
+            "deployment_status",
+            "progress",
+            "error_code",
+            "error_message",
+            "finished_at",
+            "started_at",
+        ):
+            values.pop(key, None)
+    DeploymentRecord.objects.filter(pk=deployment_id).update(**values)
 
 
 def start_pipeline(deployment_id: str, payload: dict) -> None:
@@ -173,6 +384,25 @@ def run_pipeline(deployment_id: str, payload: dict) -> None:
         logger.warning("Deployment %s disappeared before the pipeline ran.", deployment_id)
         return
 
+    # Part 11: the run always starts on the state machine's first edge.
+    if stop_requested(deployment_id):
+        set_status(
+            deployment_id,
+            DeploymentStatus.TERMINATED,
+            stage=DeploymentStage.PREPARING,
+            message="Deployment was stopped before the pipeline started.",
+        )
+        return
+    set_status(
+        deployment_id,
+        DeploymentStatus.PREPARING,
+        stage=DeploymentStage.PREPARING,
+        message=(
+            f"Preparing deployment of {record.repository or 'the repository'} "
+            f"to AWS ({payload.get('region') or record.region})."
+        ),
+    )
+
     stream = RecordLogStream(deployment_id, phase="prepare")
 
     # ------------------------------------------------------------------
@@ -194,6 +424,7 @@ def run_pipeline(deployment_id: str, payload: dict) -> None:
             DeploymentStage.PREPARING,
             "AWS: no active AWS connection for this account. "
             "Connect your AWS account (IAM role) and try again.",
+            error_code="AWS_NOT_CONNECTED",
         )
         return
 
@@ -206,10 +437,58 @@ def run_pipeline(deployment_id: str, payload: dict) -> None:
         f"in {region}.",
     )
     try:
-        assume_role_credentials(connection)
+        credentials = assume_role_credentials(connection)
     except AwsConnectionError as exc:
-        fail_deployment(deployment_id, DeploymentStage.PREPARING, f"AWS: {exc}")
+        fail_deployment(
+            deployment_id,
+            DeploymentStage.PREPARING,
+            f"AWS: {exc}",
+            error_code="STS_ASSUME_ROLE_FAILED",
+        )
         return
+
+    # ------------------------------------------------------------------
+    # Step 1b — permission self-check (Part 22)
+    #
+    # Probes the exact APIs this pipeline is about to call, so a role
+    # missing ec2:RunInstances / ssm:SendCommand fails here with the
+    # missing action named instead of minutes later.
+    # ------------------------------------------------------------------
+    from .preflight import summarize, verify_permissions
+
+    try:
+        permission_checks = verify_permissions(
+            connection, credentials=credentials, region=region
+        )
+    except Exception as exc:  # noqa: BLE001 — a self-check never breaks a deploy
+        logger.warning("Permission self-check failed to run for %s: %s", deployment_id, exc)
+        permission_checks = []
+
+    if permission_checks:
+        for check in permission_checks:
+            level = "INFO" if check.get("ok") else "WARNING"
+            if check.get("ok") is None:
+                level = "INFO"
+            append_log(
+                deployment_id,
+                level,
+                DeploymentStage.PREPARING,
+                f"Permission check [{check.get('action')}] "
+                f"{check.get('label')}: "
+                f"{'OK' if check.get('ok') else check.get('detail')}",
+            )
+        ready, missing = summarize(permission_checks)
+        if not ready:
+            fail_deployment(
+                deployment_id,
+                DeploymentStage.PREPARING,
+                "AWS: your CloudWiseDeployRole is missing permission(s): "
+                + ", ".join(missing)
+                + ". Attach the CloudWise permissions policy to the role "
+                "and retry.",
+                error_code="AWS_PERMISSION_DENIED",
+            )
+            return
 
     aws_account_id = connection.account_id or ""
     values: dict = {"updated_at": timezone.now()}
@@ -223,8 +502,18 @@ def run_pipeline(deployment_id: str, payload: dict) -> None:
         "INFO",
         DeploymentStage.PREPARING,
         f"AWS: account {aws_account_id or 'connected'} validated via "
-        f"AssumeRole in {connection.region}.",
+        f"AssumeRole in {connection.region}. "
+        f"Permission self-check passed for {len(permission_checks)} API(s).",
     )
+
+    if stop_requested(deployment_id):
+        set_status(
+            deployment_id,
+            DeploymentStatus.TERMINATED,
+            stage=DeploymentStage.PREPARING,
+            message="Deployment stopped by user before provisioning.",
+        )
+        return
 
     # ------------------------------------------------------------------
     # Step 2 — provision (or reuse) EC2 in the user's AWS account
@@ -235,13 +524,15 @@ def run_pipeline(deployment_id: str, payload: dict) -> None:
     stream.set_phase("provision")
     env_name = str(payload.get("environment_name") or record.environment_name)
     instance_type = payload.get("instance_type") or None
-    append_log(
+    set_status(
         deployment_id,
-        "INFO",
-        DeploymentStage.BUILDING,
-        f"Provisioning EC2 capacity in {connection.region} "
-        f"(instance type {instance_type or 'default'}, "
-        f"environment {env_name}).",
+        DeploymentStatus.BUILDING,
+        stage=DeploymentStage.BUILDING,
+        message=(
+            f"Provisioning EC2 capacity in {connection.region} "
+            f"(instance type {instance_type or 'default'}, "
+            f"environment {env_name})."
+        ),
     )
     try:
         provision_result = provider.start(
@@ -255,7 +546,12 @@ def run_pipeline(deployment_id: str, payload: dict) -> None:
             }
         )
     except AwsEc2Error as exc:
-        fail_deployment(deployment_id, DeploymentStage.BUILDING, f"EC2: {exc}")
+        fail_deployment(
+            deployment_id,
+            DeploymentStage.BUILDING,
+            f"EC2: {exc}",
+            error_code="EC2_PROVISION_FAILED",
+        )
         return
 
     instance_id = str(provision_result.get("instance_id") or "")
@@ -270,16 +566,32 @@ def run_pipeline(deployment_id: str, payload: dict) -> None:
         updated_at=timezone.now(),
     )
 
+    if stop_requested(deployment_id):
+        set_status(
+            deployment_id,
+            DeploymentStatus.TERMINATED,
+            stage=DeploymentStage.DEPLOYING,
+            message=(
+                f"Deployment stopped by user after instance {instance_id} "
+                "was provisioned."
+            ),
+        )
+        return
+
     # ------------------------------------------------------------------
     # Step 3 — upload files, build, start containers, health check
     # ------------------------------------------------------------------
     stream.set_phase("deploy")
-    append_log(
+    files = payload.get("files") or {}
+    set_status(
         deployment_id,
-        "INFO",
-        DeploymentStage.DEPLOYING,
-        f"Deploying application to instance {instance_id} "
-        f"({len(payload.get('files') or {})} file(s)).",
+        DeploymentStatus.DEPLOYING,
+        stage=DeploymentStage.DEPLOYING,
+        message=(
+            f"Deploying application to instance {instance_id} "
+            f"({len(files)} file(s), {len(payload.get('env_vars') or {})} "
+            "environment variable(s))."
+        ),
     )
     try:
         deploy_result = provider.deploy(
@@ -297,11 +609,21 @@ def run_pipeline(deployment_id: str, payload: dict) -> None:
             }
         )
     except AwsEc2Error as exc:
-        fail_deployment(deployment_id, DeploymentStage.DEPLOYING, f"Deploy: {exc}")
+        fail_deployment(
+            deployment_id,
+            DeploymentStage.DEPLOYING,
+            f"Deploy: {exc}",
+            error_code="DEPLOY_FAILED",
+        )
         return
     except Exception as exc:  # noqa: BLE001 — never leave a record stuck
         logger.exception("Unexpected deployment failure for %s", deployment_id)
-        fail_deployment(deployment_id, DeploymentStage.DEPLOYING, f"Deploy: {exc}")
+        fail_deployment(
+            deployment_id,
+            DeploymentStage.DEPLOYING,
+            f"Deploy: {exc}",
+            error_code="DEPLOY_UNEXPECTED_ERROR",
+        )
         return
 
     live_url = str(deploy_result.get("endpoint_url") or "")
@@ -323,7 +645,6 @@ def run_pipeline(deployment_id: str, payload: dict) -> None:
         }
     )
     DeploymentRecord.objects.filter(pk=deployment_id).update(
-        deployment_status=final_status,
         live_url=live_url or None,
         ip_address=endpoint_ip or public_ip or None,
         instance_id=instance_id,
@@ -331,15 +652,39 @@ def run_pipeline(deployment_id: str, payload: dict) -> None:
         specs=specs,
         updated_at=timezone.now(),
     )
-    append_log(
+
+    final_message = (
+        f"Deployment {final_status}: application live at {live_url}."
+        if live_url
+        else f"Deployment {final_status} on instance {instance_id}."
+    )
+    # A stop that landed while the containers were starting wins: the
+    # record stays TERMINATED and is never flipped back to RUNNING.
+    if stop_requested(deployment_id):
+        set_status(
+            deployment_id,
+            DeploymentStatus.TERMINATED,
+            stage=DeploymentStage.COMPLETED,
+            message=(
+                f"Deployment stopped by user. Instance {instance_id} is "
+                "managed separately (stop it from the deployment page)."
+            ),
+        )
+        _persist_to_project(deployment_id)
+        return
+
+    set_status(
         deployment_id,
-        "INFO",
-        DeploymentStage.COMPLETED,
-        (
-            f"Deployment {final_status}: application live at {live_url}."
-            if live_url
-            else f"Deployment {final_status} on instance {instance_id}."
+        final_status,
+        stage=(
+            DeploymentStage.COMPLETED
+            if final_status == DeploymentStatus.RUNNING
+            else DeploymentStage.FAILED
         ),
+        message=final_message,
+        level="INFO" if final_status == DeploymentStatus.RUNNING else "ERROR",
+        error_code="" if final_status == DeploymentStatus.RUNNING else "DEPLOY_FAILED",
+        error_message="" if final_status == DeploymentStatus.RUNNING else final_message,
     )
 
     _persist_to_project(deployment_id)

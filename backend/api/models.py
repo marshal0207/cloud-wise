@@ -152,6 +152,19 @@ class DeploymentRecord(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    # --- state machine (Part 11) ------------------------------------
+    # Every status change the pipeline makes is mirrored here so the UI
+    # can show exactly where a deployment is without parsing logs.
+    current_stage = models.CharField(max_length=50, blank=True, default='')
+    progress = models.PositiveSmallIntegerField(default=0)
+    status_message = models.CharField(max_length=500, blank=True, default='')
+    error_code = models.CharField(max_length=100, blank=True, default='')
+    error_message = models.CharField(max_length=1000, blank=True, default='')
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    # Cooperative stop (Part 14): checked by the pipeline between steps.
+    cancel_requested = models.BooleanField(default=False)
+
     # ------------------------------------------------------------------
     # Compatibility aliases — the canonical columns are
     # ``deployment_status`` and ``live_url``.

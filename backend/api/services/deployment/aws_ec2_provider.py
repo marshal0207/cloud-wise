@@ -420,11 +420,14 @@ class AwsEc2Provider(DeploymentProvider):
             key_name = str(
                 self.config.get("key_name") or settings.AWS_EC2_KEY_NAME or ""
             )
+            # SSM is mandatory for CloudWise deployments. Never allow an
+            # empty instance-profile setting to launch an instance without
+            # the CloudWise SSM profile.
             instance_profile = str(
                 self.config.get("instance_profile")
-                or settings.AWS_EC2_INSTANCE_PROFILE
-                or ""
-            )
+                or getattr(settings, "AWS_EC2_INSTANCE_PROFILE", "")
+                or "cloudwise-ec2-ssm"
+            ).strip() or "cloudwise-ec2-ssm"
             log.info(
                 DeploymentStage.PREPARING,
                 f"Configuration: region={region}, "
@@ -518,6 +521,86 @@ class AwsEc2Provider(DeploymentProvider):
                 ),
             )
             instance = self._wait_until_running(ec2, instance_id) or instance
+
+            # SSM is the only remote-execution channel used by CloudWise.
+            # Verify/repair the profile after the instance is running as a
+            # second line of defence for both new and reused instances.
+            self._ensure_instance_profile(
+                ec2, instance_id, instance_profile, log
+            )
+
+            # A reused instance may have been created before CloudWise had
+            # the SSM bootstrap/profile logic. There is no safe remote
+            # channel available until SSM itself is online, so automatically
+            # replace a CloudWise-managed stale instance once (instead of
+            # asking the customer to SSH/restart the agent manually).
+            try:
+                ssm = self.get_session().client("ssm", region_name=region)
+                self._ensure_ssm_managed(ssm, instance_id, log)
+            except AwsEc2Error as ssm_exc:
+                auto_recover = bool(
+                    self.config.get("auto_recover_ssm", True)
+                )
+                already_recovered = bool(
+                    self.config.get("_ssm_recovery_attempted", False)
+                )
+                if not reused or not auto_recover or already_recovered:
+                    raise
+
+                log.warning(
+                    DeploymentStage.DEPLOYING,
+                    f"SSM is unavailable on reused instance {instance_id}. "
+                    "CloudWise will replace this CloudWise-managed instance "
+                    "once with a fresh EC2 instance that starts with the "
+                    "SSM profile already attached. Original reason: "
+                    f"{ssm_exc}",
+                )
+                self.config["_ssm_recovery_attempted"] = True
+
+                self._terminate_for_ssm_recovery(ec2, instance_id, log)
+
+                instance = self._run_instances(
+                    ec2,
+                    image=image,
+                    instance_type=instance_type,
+                    sg_id=sg_id,
+                    key_name=key_name,
+                    instance_profile=instance_profile,
+                    env_name=env_name,
+                )
+                instance_id = instance["InstanceId"]
+                reused = False
+                state = (instance.get("State") or {}).get("Name", "pending")
+
+                log.info(
+                    DeploymentStage.BUILDING,
+                    f"Launched replacement EC2 instance {instance_id} "
+                    f"({instance_type}) for automatic SSM recovery.",
+                )
+
+                self._sync_instance_row(
+                    instance_id,
+                    state=state,
+                    region=region,
+                    instance_type=instance_type,
+                    ami_id=image.get("ImageId", ""),
+                    sg_id=sg_id,
+                    sg_name=sg_name,
+                    env_name=env_name,
+                )
+
+                log.info(
+                    DeploymentStage.DEPLOYING,
+                    "Waiting for the replacement EC2 instance to reach "
+                    "running state...",
+                )
+                instance = self._wait_until_running(ec2, instance_id) or instance
+                self._ensure_instance_profile(
+                    ec2, instance_id, instance_profile, log
+                )
+                ssm = self.get_session().client("ssm", region_name=region)
+                self._ensure_ssm_managed(ssm, instance_id, log)
+
             public_ip = (instance or {}).get("PublicIpAddress") or ""
             private_ip = (instance or {}).get("PrivateIpAddress") or ""
             state = ((instance or {}).get("State") or {}).get("Name", "pending")
@@ -709,6 +792,12 @@ class AwsEc2Provider(DeploymentProvider):
 
             self._ensure_ssm_managed(ssm, instance_id, log)
 
+            if has_docker:
+                # Part 9 — verify (and repair) the Docker bootstrap before
+                # building, so a reused instance provisioned at another
+                # time never fails halfway through `docker compose up`.
+                self._ensure_docker(ssm, instance_id, log)
+
             # ---- BUILDING: upload files + write .env via SSM ----
             advance(
                 DeploymentStatus.BUILDING,
@@ -781,6 +870,38 @@ class AwsEc2Provider(DeploymentProvider):
                     "Container build/start command completed on the instance.",
                 )
 
+                # Diagnostics only: do not change the existing deployment
+                # commands, health-check logic, ports, networking, or state
+                # transitions. If the application later fails its health
+                # check, these diagnostics make the real container failure
+                # visible in CloudWise logs.
+                diagnostic_commands = self._build_compose_diagnostic_commands(
+                    remote_dir
+                )
+                try:
+                    diagnostic_output = self._run_ssm_commands(
+                        ssm,
+                        instance_id,
+                        diagnostic_commands,
+                        log,
+                        stage_message="container diagnostics",
+                        timeout_seconds=120,
+                    )
+                    if diagnostic_output:
+                        log.info(
+                            DeploymentStage.DEPLOYING,
+                            "Container diagnostics collected after compose start.",
+                        )
+                except Exception as diagnostic_exc:  # noqa: BLE001
+                    # Diagnostics must never make an otherwise successful
+                    # deployment fail. The existing health check remains the
+                    # source of truth.
+                    log.warning(
+                        DeploymentStage.DEPLOYING,
+                        f"Container diagnostics could not be collected: "
+                        f"{diagnostic_exc}",
+                    )
+
             # ---- HEALTH_CHECK ----
             app_port = self._detect_app_port()
             advance(
@@ -812,7 +933,41 @@ class AwsEc2Provider(DeploymentProvider):
                         f"is not reachable yet ({pub_msg}). Security group "
                         f"ports: {settings.AWS_SECURITY_GROUP_PORTS}.",
                     )
+            if healthy:
+                # Part 17 — record the real probe result (SSM curl +
+                # public URL) so the log shows the HTTP status seen.
+                log.info(
+                    DeploymentStage.HEALTH_CHECK,
+                    f"Health check passed on instance {instance_id}: "
+                    f"{health_message}.",
+                )
             if not healthy:
+                # The compose-start step is intentionally tolerant of
+                # post-start container state. If the app is not reachable,
+                # collect the container state/logs now so the user sees the
+                # actual application error (nginx config, frontend build,
+                # backend crash, port binding, etc.) in CloudWise.
+                if has_docker:
+                    try:
+                        failure_diagnostics = self._run_ssm_commands(
+                            ssm,
+                            instance_id,
+                            self._build_compose_diagnostic_commands(remote_dir),
+                            log,
+                            stage_message="health-check diagnostics",
+                            timeout_seconds=120,
+                        )
+                    except Exception as diagnostic_exc:  # noqa: BLE001
+                        failure_diagnostics = (
+                            f"Diagnostic collection failed: {diagnostic_exc}"
+                        )
+                    if failure_diagnostics:
+                        log.error(
+                            DeploymentStage.FAILED,
+                            "Health-check diagnostics:\n"
+                            + failure_diagnostics[-6000:],
+                        )
+
                 tail = ""
                 if has_docker and isinstance(compose_output, str) and compose_output.strip():
                     tail = (
@@ -1039,6 +1194,9 @@ class AwsEc2Provider(DeploymentProvider):
         # ---- Health check ----
         healthy = False
         message = f"Deployed {technology} application on port {app_port}."
+        ssm_probe_timeout = max(
+            10, int(settings.AWS_HEALTH_CHECK_TIMEOUT_SECONDS) + 5
+        )
 
         # Check via SSM first (works even when ports aren't publicly exposed)
         health_retries = max(1, settings.AWS_HEALTH_CHECK_RETRIES)
@@ -1054,11 +1212,11 @@ class AwsEc2Provider(DeploymentProvider):
                     InstanceIds=[instance_id],
                     DocumentName="AWS-RunShellScript",
                     Parameters={"commands": [curl_cmd]},
-                    TimeoutSeconds=30,
+                    TimeoutSeconds=ssm_probe_timeout,
                 )
                 command_id = (response.get("Command") or {}).get("CommandId", "")
                 if isinstance(command_id, str) and command_id:
-                    deadline = time.monotonic() + 30
+                    deadline = time.monotonic() + ssm_probe_timeout
                     while time.monotonic() < deadline:
                         try:
                             inv = ssm.get_command_invocation(
@@ -1270,11 +1428,19 @@ class AwsEc2Provider(DeploymentProvider):
         Used because the security group intentionally exposes only
         80/443/22 — app ports may not be publicly reachable.
         """
-        retries = max(1, settings.AWS_HEALTH_CHECK_RETRIES)
+        # Keep the in-instance health probe bounded. A failed/unresponsive
+        # application must not make each retry wait the full SSM command timeout.
+        retries = min(max(1, settings.AWS_HEALTH_CHECK_RETRIES), 12)
         interval = max(0.1, settings.AWS_HEALTH_CHECK_INTERVAL_SECONDS)
+        probe_timeout = min(
+            max(1, int(settings.AWS_HEALTH_CHECK_TIMEOUT_SECONDS)),
+            5,
+        )
+        ssm_probe_timeout = max(10, probe_timeout + 5)
         curl_cmd = (
             f"code=$(curl -s -o /dev/null -w '%{{http_code}}' "
-            f"--max-time 5 http://127.0.0.1:{port}/ || echo 000); "
+            f"--connect-timeout 3 --max-time {probe_timeout} "
+            f"http://127.0.0.1:{port}/ || echo 000); "
             f"echo \"HEALTH:$code\""
         )
         last_message = "no attempts made"
@@ -1340,24 +1506,26 @@ class AwsEc2Provider(DeploymentProvider):
         instance_id: str,
         log: DeploymentLogService,
         *,
-        poll_timeout: int = 150,
+        poll_timeout: int = 180,
         poll_interval: int = 10,
     ) -> None:
         """
-        Poll SSM until the instance appears as registered.
+        Wait until the EC2 instance is registered and ONLINE in SSM.
 
-        After attaching an instance profile, the SSM agent needs time to
-        phone home (typically 30–90 s). We poll up to *poll_timeout* seconds
-        before raising, so a fresh profile association never causes a false
-        failure.
+        CloudWise uses SSM instead of SSH. A successful EC2 launch is not
+        enough: the instance must have the cloudwise-ec2-ssm instance
+        profile and a working SSM agent/network path before deployment can
+        continue.
         """
         log.info(
             DeploymentStage.PREPARING,
             f"Waiting for {instance_id} to register with SSM "
             f"(timeout {poll_timeout}s)…",
         )
-        deadline = time.monotonic() + poll_timeout
-        last_error: str = ""
+
+        deadline = time.monotonic() + max(30, poll_timeout)
+        last_error = ""
+
         while time.monotonic() < deadline:
             try:
                 response = ssm.describe_instance_information(
@@ -1368,41 +1536,130 @@ class AwsEc2Provider(DeploymentProvider):
                         }
                     ]
                 )
+                infos = response.get("InstanceInformationList") or []
+
+                if infos:
+                    info = infos[0] or {}
+                    ping = str(info.get("PingStatus") or "").strip()
+
+                    if ping == "Online":
+                        log.info(
+                            DeploymentStage.PREPARING,
+                            f"SSM agent online for {instance_id} "
+                            f"(PingStatus=Online).",
+                        )
+                        return
+
+                    log.info(
+                        DeploymentStage.PREPARING,
+                        f"SSM: {instance_id} is registered but not online "
+                        f"yet (PingStatus={ping or 'unknown'}), "
+                        f"retrying in {poll_interval}s…",
+                    )
+                else:
+                    elapsed = int(
+                        max(
+                            0,
+                            poll_timeout - max(0, deadline - time.monotonic()),
+                        )
+                    )
+                    log.info(
+                        DeploymentStage.PREPARING,
+                        f"SSM: {instance_id} not yet registered "
+                        f"({elapsed}s elapsed, retrying in "
+                        f"{poll_interval}s)…",
+                    )
+
+            except (ClientError, BotoCoreError) as exc:
+                last_error = str(exc)
+                log.warning(
+                    DeploymentStage.PREPARING,
+                    f"SSM registration check temporarily failed for "
+                    f"{instance_id}: {exc}. Retrying in "
+                    f"{poll_interval}s…",
+                )
             except Exception as exc:  # noqa: BLE001
                 last_error = str(exc)
-                time.sleep(poll_interval)
-                continue
-
-            infos = response.get("InstanceInformationList") or []
-            if infos:
-                info = infos[0] or {}
-                ping = info.get("PingStatus", "") or ""
-                if ping not in ("Online", "ConnectionLost"):
-                    log.warning(
-                        DeploymentStage.PREPARING,
-                        f"SSM PingStatus is {ping or 'unknown'} — continuing.",
-                    )
-                log.info(
+                log.warning(
                     DeploymentStage.PREPARING,
-                    f"SSM agent online for {instance_id} "
-                    f"(PingStatus={ping or 'unknown'}).",
+                    f"Unexpected SSM registration error for "
+                    f"{instance_id}: {exc}. Retrying in "
+                    f"{poll_interval}s…",
                 )
-                return  # success
 
-            elapsed = int(poll_timeout - (deadline - time.monotonic()))
-            log.info(
-                DeploymentStage.PREPARING,
-                f"SSM: {instance_id} not yet registered "
-                f"({elapsed}s elapsed, retrying in {poll_interval}s)…",
-            )
-            time.sleep(poll_interval)
+            time.sleep(max(1, poll_interval))
 
-        detail = f" Last error: {last_error}" if last_error else ""
+        detail = f" Last AWS error: {last_error}" if last_error else ""
         raise AwsEc2Error(
             f"EC2 instance {instance_id} did not register with SSM within "
-            f"{poll_timeout}s. Verify that the instance profile "
-            "(cloudwise-ec2-ssm) has AmazonSSMManagedInstanceCore attached "
-            f"and that the SSM agent is running on the instance.{detail}"
+            f"{poll_timeout} seconds. CloudWise requires the "
+            f"'cloudwise-ec2-ssm' instance profile with "
+            f"AmazonSSMManagedInstanceCore and a running SSM agent with "
+            f"outbound access to AWS Systems Manager.{detail}"
+        )
+
+    def _terminate_for_ssm_recovery(
+        self,
+        ec2,
+        instance_id: str,
+        log: DeploymentLogService,
+    ) -> None:
+        """Replace a stale CloudWise-managed instance when SSM cannot start.
+
+        This is intentionally limited to instances tagged ManagedBy=CloudWise.
+        It is used only during an automatic one-time SSM recovery, so the user
+        never needs SSH/EC2 Instance Connect just to restart an agent.
+        """
+        instance = self._describe_instance(ec2, instance_id)
+        if instance is None:
+            return
+
+        tags = {
+            t.get("Key"): t.get("Value")
+            for t in (instance.get("Tags") or [])
+        }
+        if tags.get("ManagedBy") != "CloudWise":
+            raise AwsEc2Error(
+                f"Refusing automatic SSM recovery for {instance_id}: "
+                """the instance is not tagged ManagedBy=CloudWise."""
+            )
+
+        state = (instance.get("State") or {}).get("Name", "")
+        if state in ("terminated", "shutting-down"):
+            return
+
+        log.warning(
+            DeploymentStage.DEPLOYING,
+            f"Terminating stale CloudWise-managed instance {instance_id} "
+            f"(state: {state or 'unknown'}) for automatic SSM recovery.",
+        )
+        try:
+            ec2.terminate_instances(InstanceIds=[instance_id])
+            waiter = ec2.get_waiter("instance_terminated")
+            try:
+                waiter.wait(
+                    InstanceIds=[instance_id],
+                    WaiterConfig={"Delay": 5, "MaxAttempts": 24},
+                )
+            except WaiterError:
+                # The next RunInstances call will surface any remaining
+                # capacity/termination issue with a useful AWS error.
+                pass
+        except (ClientError, BotoCoreError) as exc:
+            raise AwsEc2Error(
+                f"CloudWise could not replace stale instance {instance_id} "
+                f"during automatic SSM recovery. ({exc})"
+            ) from exc
+
+        row = EC2Instance.objects.filter(instance_id=instance_id).first()
+        if row is not None:
+            row.status = "terminated"
+            row.save(update_fields=["status", "updated_at"])
+
+        log.info(
+            DeploymentStage.DEPLOYING,
+            f"Stale instance {instance_id} terminated. Launching a fresh "
+            "instance with the SSM profile attached at boot.",
         )
 
     def _ensure_instance_profile(
@@ -1413,79 +1670,141 @@ class AwsEc2Provider(DeploymentProvider):
         log: DeploymentLogService,
     ) -> None:
         """
-        Attach *instance_profile* to *instance_id* when it is not already
-        associated.
+        Ensure the required IAM instance profile is attached to the EC2
+        instance.
 
-        Safety: only CloudWise-managed instances (ManagedBy=CloudWise tag)
-        are ever modified.
+        CloudWise deployments require SSM, so an empty profile is never
+        accepted. Existing CloudWise-managed instances are repaired when
+        they have no profile or the wrong profile.
         """
-        profile_name = instance_profile or "cloudwise-ec2-ssm"
+        profile_name = (
+            str(instance_profile or "").strip()
+            or getattr(settings, "AWS_EC2_INSTANCE_PROFILE", "")
+            or "cloudwise-ec2-ssm"
+        ).strip() or "cloudwise-ec2-ssm"
 
-        # Verify ManagedBy=CloudWise tag before touching the instance.
         instance = self._describe_instance(ec2, instance_id)
         if instance is None:
-            return
-        tags = {t.get("Key"): t.get("Value") for t in (instance.get("Tags") or [])}
-        if tags.get("ManagedBy") != "CloudWise":
-            log.warning(
-                DeploymentStage.PREPARING,
-                f"Instance {instance_id} is not tagged ManagedBy=CloudWise — "
-                "skipping instance-profile association.",
+            raise AwsEc2Error(
+                f'EC2 instance "{instance_id}" was not found while ensuring '
+                f"the SSM instance profile."
             )
-            return
+
+        tags = {
+            t.get("Key"): t.get("Value")
+            for t in (instance.get("Tags") or [])
+        }
+
+        if tags.get("ManagedBy") != "CloudWise":
+            raise AwsEc2Error(
+                f"Refusing to change IAM instance profile on {instance_id}: "
+                "the instance is not tagged ManagedBy=CloudWise."
+            )
 
         try:
             assoc_resp = ec2.describe_iam_instance_profile_associations(
                 Filters=[{"Name": "instance-id", "Values": [instance_id]}]
             )
         except (ClientError, BotoCoreError) as exc:
-            log.warning(
-                DeploymentStage.PREPARING,
-                f"Could not query instance profile associations: {exc}",
-            )
-            return
+            raise AwsEc2Error(
+                f"CloudWise could not inspect the IAM instance profile "
+                f"association for {instance_id}. Ensure the deployment role "
+                f"has ec2:DescribeIamInstanceProfileAssociations. ({exc})"
+            ) from exc
 
-        associations = assoc_resp.get("IamInstanceProfileAssociations") or []
+        associations = (
+            assoc_resp.get("IamInstanceProfileAssociations") or []
+        )
+
+        # AWS instance-profile ARNs are formatted as:
+        # arn:aws:iam::<account-id>:instance-profile/<profile-name>
+        # (there is no extra "/instance-profile/" path component after the
+        # account ARN delimiter). Compare the actual profile name rather
+        # than relying on the incorrect path suffix used previously.
+        expected_profile_name = profile_name.rsplit("/", 1)[-1].strip()
+        active_assoc = None
+
         for assoc in associations:
-            state = assoc.get("State", "")
-            profile = (assoc.get("IamInstanceProfile") or {}).get("Arn", "")
+            state = str(assoc.get("State") or "")
             if state in ("associated", "associating"):
+                active_assoc = assoc
+                break
+
+        if active_assoc is not None:
+            current_arn = str(
+                (active_assoc.get("IamInstanceProfile") or {}).get("Arn")
+                or ""
+            )
+
+            current_profile_name = current_arn.rsplit("/", 1)[-1].strip()
+            if current_profile_name == expected_profile_name:
                 log.info(
                     DeploymentStage.PREPARING,
-                    f"Instance {instance_id} already has an instance profile "
-                    f"({profile}) — skipping association.",
+                    f"EC2 instance {instance_id} already has required "
+                    f"instance profile '{expected_profile_name}'.",
                 )
                 return
 
-        # No live association — attach the required profile.
+            # A different profile is attached. Replace it because CloudWise
+            # cannot use an arbitrary instance role for SSM deployment.
+            association_id = str(active_assoc.get("AssociationId") or "")
+            if not association_id:
+                raise AwsEc2Error(
+                    f"EC2 instance {instance_id} has an existing IAM "
+                    "instance-profile association, but AWS did not return "
+                    "its AssociationId."
+                )
+
+            log.info(
+                DeploymentStage.PREPARING,
+                f"Replacing instance profile on {instance_id}: "
+                f"current={current_arn or 'unknown'}, "
+                f"required={profile_name}.",
+            )
+
+            try:
+                ec2.replace_iam_instance_profile_association(
+                    IamInstanceProfile={"Name": profile_name},
+                    AssociationId=association_id,
+                )
+            except (ClientError, BotoCoreError) as exc:
+                raise AwsEc2Error(
+                    f"Failed to replace the IAM instance profile on "
+                    f"{instance_id} with '{profile_name}'. "
+                    f"Ensure the deployment role has "
+                    f"ec2:ReplaceIamInstanceProfileAssociation and "
+                    f"iam:PassRole for the EC2 profile role. ({exc})"
+                ) from exc
+
+            log.info(
+                DeploymentStage.PREPARING,
+                f"Required instance profile '{profile_name}' replacement "
+                f"requested for {instance_id}.",
+            )
+            return
+
+        # No active association: attach the required profile.
         log.info(
             DeploymentStage.PREPARING,
-            f"Attaching instance profile '{profile_name}' to "
-            f"{instance_id} (required for SSM).",
+            f"Attaching required instance profile '{profile_name}' to "
+            f"{instance_id} for SSM deployment.",
         )
+
         try:
             ec2.associate_iam_instance_profile(
                 IamInstanceProfile={"Name": profile_name},
                 InstanceId=instance_id,
             )
-        except ClientError as exc:
-            code = str((exc.response.get("Error") or {}).get("Code", ""))
-            if code == "IncorrectInstanceState":
-                log.warning(
-                    DeploymentStage.PREPARING,
-                    f"Cannot attach instance profile while instance is not "
-                    f"in running state ({code}) — the SSM check may fail.",
-                )
-            else:
-                raise AwsEc2Error(
-                    f"Failed to attach instance profile '{profile_name}' "
-                    f"to {instance_id}: {exc}"
-                ) from exc
-        except (BotoCoreError, Exception) as exc:  # noqa: BLE001
+        except (ClientError, BotoCoreError) as exc:
             raise AwsEc2Error(
-                f"Failed to attach instance profile '{profile_name}' "
-                f"to {instance_id}: {exc}"
+                f"Failed to attach required instance profile "
+                f"'{profile_name}' to {instance_id}. "
+                f"Ensure the profile exists in the user's AWS account, "
+                f"contains AmazonSSMManagedInstanceCore, and the CloudWise "
+                f"deployment role has ec2:AssociateIamInstanceProfile and "
+                f"iam:PassRole permissions. ({exc})"
             ) from exc
+
         log.info(
             DeploymentStage.PREPARING,
             f"Instance profile '{profile_name}' association requested for "
@@ -1545,21 +1864,175 @@ class AwsEc2Provider(DeploymentProvider):
 
         return commands
 
+    def _ensure_docker(self, ssm, instance_id: str, log: DeploymentLogService) -> str:
+        """
+        Part 9 — automatic Docker / bootstrap verification and upgrade.
+
+        EC2 user data installs Docker at first boot, but a reused
+        instance may have been provisioned earlier (or by an image that
+        lacked Docker). This repairs the bootstrap over SSM and reports
+        the installed version, so `docker compose up` never fails on a
+        missing binary.
+
+        Returns the Docker version string reported by the instance.
+        """
+        commands = [
+            "if ! command -v docker >/dev/null 2>&1; then "
+            "(dnf install -y docker || yum install -y docker || "
+            "(apt-get update -y && apt-get install -y docker.io)) "
+            ">/var/log/cloudwise-docker-install.log 2>&1; fi",
+            "systemctl enable --now docker >/dev/null 2>&1 || true",
+            (
+                "if ! docker compose version >/dev/null 2>&1 && "
+                "! command -v docker-compose >/dev/null 2>&1; then "
+                "curl -fsSL https://github.com/docker/compose/releases/latest/"
+                "download/docker-compose-linux-x86_64 "
+                "-o /usr/local/bin/docker-compose && "
+                "chmod +x /usr/local/bin/docker-compose && "
+                "mkdir -p /usr/local/lib/docker/cli-plugins && "
+                "ln -sf /usr/local/bin/docker-compose "
+                "/usr/local/lib/docker/cli-plugins/docker-compose; fi"
+            ),
+            (
+                "set -e; "
+                "mkdir -p /usr/local/lib/docker/cli-plugins; "
+                "min_buildx=0.17.0; "
+                "buildx_version=$(docker buildx version 2>/dev/null | "
+                "sed -n 's/.*v\\([0-9][0-9.]*\\).*/\\1/p' | head -n 1 || true); "
+                "if [ -z \"$buildx_version\" ] || "
+                "[ \"$(printf '%s\\n' \"$buildx_version\" \"$min_buildx\" | "
+                "sort -V | head -n 1)\" != \"$min_buildx\" ]; then "
+                "echo \"[CloudWise] Installing Docker Buildx $min_buildx "
+                "(current: ${buildx_version:-missing})\"; "
+                "curl -fL "
+                "https://github.com/docker/buildx/releases/download/"
+                "v0.17.0/buildx-v0.17.0.linux-amd64 "
+                "-o /usr/local/lib/docker/cli-plugins/docker-buildx; "
+                "chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx; "
+                "fi; "
+                "docker buildx version"
+            ),
+            (
+                "set -e; "
+                "docker --version; "
+                "if docker compose version >/dev/null 2>&1; then "
+                "docker compose version; "
+                "elif command -v docker-compose >/dev/null 2>&1; then "
+                "docker-compose version; "
+                "else echo 'CLOUDWISE_DOCKER_COMPOSE_MISSING' >&2; exit 1; fi"
+            ),
+            (
+                "if command -v docker >/dev/null 2>&1; then docker --version; "
+                "else echo 'CLOUDWISE_DOCKER_MISSING'; exit 1; fi"
+            ),
+        ]
+        output = self._run_ssm_commands(
+            ssm,
+            instance_id,
+            commands,
+            log,
+            stage_message="Docker bootstrap verification",
+            timeout_seconds=max(settings.AWS_SSM_TIMEOUT_SECONDS, 300),
+        )
+        if "CLOUDWISE_DOCKER_MISSING" in output:
+            raise AwsEc2Error(
+                "Docker is not installed on the instance and could not be "
+                "installed automatically. Check the instance's outbound "
+                "network access (packages.docker.io / dnf) and retry."
+            )
+        version = next(
+            (
+                line.strip()
+                for line in reversed(output.splitlines())
+                if "Docker version" in line
+            ),
+            "",
+        )
+        log.info(
+            DeploymentStage.BUILDING,
+            f"Docker bootstrap verified on {instance_id}: "
+            f"{version or 'docker present'}.",
+        )
+        return version
+
+    def _build_compose_diagnostic_commands(self, remote_dir: str) -> list[str]:
+        """
+        Collect read-only Docker/network diagnostics after compose startup.
+
+        This method intentionally does not start, stop, rebuild, remove, or
+        modify containers. It exists only to make application failures
+        actionable when the existing health check returns HTTP 000.
+        """
+        return [
+            f"cd '{remote_dir}'",
+            "echo '=== CLOUDWISE DOCKER COMPOSE STATUS ==='",
+            "if docker compose version >/dev/null 2>&1; then docker compose ps -a || true; elif command -v docker-compose >/dev/null 2>&1; then docker-compose ps -a || true; else echo 'docker compose not installed'; fi",
+            "echo '=== CLOUDWISE DOCKER CONTAINERS ==='",
+            "docker ps -a --no-trunc || true",
+            "echo '=== CLOUDWISE COMPOSE LOGS (TAIL 150) ==='",
+            "if docker compose version >/dev/null 2>&1; then docker compose logs --tail=150 2>&1 || true; elif command -v docker-compose >/dev/null 2>&1; then docker-compose logs --tail=150 2>&1 || true; else echo 'docker compose not installed'; fi",
+            "echo '=== CLOUDWISE LISTENING PORTS ==='",
+            "ss -lntp 2>/dev/null || true",
+            "echo '=== CLOUDWISE LOCAL HTTP CHECK :80 ==='",
+            "curl -sS -o /dev/null -w 'HTTP %{http_code}\n' --max-time 10 http://127.0.0.1:80/ 2>&1 || true",
+        ]
+
     def _build_compose_commands(self, remote_dir: str) -> list[str]:
+        """
+        Start the Compose application and collect useful diagnostics without
+        turning a transient container-state check into a false deployment
+        failure.
+
+        `docker compose up -d --build` is the authoritative start operation.
+        Some valid Compose projects contain one-shot/migration services, and a
+        container can also move from "Started" to "Exited" immediately after
+        `up` returns. The health check below is the final source of truth for
+        whether the deployed application is actually reachable.
+
+        If Compose itself fails, this command deliberately captures `ps -a`
+        and recent logs before returning the original non-zero exit code. That
+        makes the CloudWise UI show the real root cause instead of only
+        "SSM status: Failed".
+        """
+        compose_start = (
+            "set +e; "
+            "if docker compose version >/dev/null 2>&1; then "
+            "  docker compose up -d --build; rc=$?; "
+            "elif command -v docker-compose >/dev/null 2>&1; then "
+            "  docker-compose up -d --build; rc=$?; "
+            "else "
+            "  echo 'docker compose not installed' >&2; rc=127; "
+            "fi; "
+            "echo \"[CloudWise] docker compose exit code: $rc\"; "
+            "echo '=== CLOUDWISE COMPOSE STATUS AFTER START ==='; "
+            "if docker compose version >/dev/null 2>&1; then "
+            "  docker compose ps -a || true; "
+            "elif command -v docker-compose >/dev/null 2>&1; then "
+            "  docker-compose ps -a || true; "
+            "fi; "
+            "if [ \"$rc\" -ne 0 ]; then "
+            "  echo '=== CLOUDWISE COMPOSE LOGS AFTER FAILURE (TAIL 150) ==='; "
+            "  if docker compose version >/dev/null 2>&1; then "
+            "    docker compose logs --tail=150 2>&1 || true; "
+            "  elif command -v docker-compose >/dev/null 2>&1; then "
+            "    docker-compose logs --tail=150 2>&1 || true; "
+            "  fi; "
+            "  echo '=== CLOUDWISE DOCKER CONTAINERS ==='; "
+            "  docker ps -a --no-trunc || true; "
+            "  exit \"$rc\"; "
+            "fi; "
+            "echo '=== CLOUDWISE RUNNING CONTAINERS ==='; "
+            "docker ps --format '{{.Names}} {{.Status}}' || true; "
+            "exit 0"
+        )
+
         return [
             f"cd '{remote_dir}'",
             (
                 "if [ ! -f docker-compose.yml ] && [ ! -f docker-compose.yaml ]; "
                 "then echo 'No docker-compose.yml found' >&2; exit 1; fi"
             ),
-            (
-                "if docker compose version >/dev/null 2>&1; then "
-                "docker compose up -d --build; "
-                "elif command -v docker-compose >/dev/null 2>&1; then "
-                "docker-compose up -d --build; "
-                "else echo 'docker compose not installed' >&2; exit 1; fi"
-            ),
-            "docker ps --format '{{.Names}} {{.Status}}' || true",
+            compose_start,
         ]
 
     def _chunk_commands(self, commands: list[str], max_len: int = 18000) -> list[list[str]]:
@@ -1877,6 +2350,7 @@ class AwsEc2Provider(DeploymentProvider):
         if groups:
             sg = groups[0]
             sg_id = sg["GroupId"]
+            self._tag_cloudwise_resource(ec2, [sg_id], log, "security group")
             self._authorize_standard_ports(ec2, sg_id, log, existing=True)
             return sg_id, sg_name
 
@@ -1893,8 +2367,28 @@ class AwsEc2Provider(DeploymentProvider):
             ),
             VpcId=vpc_id,
         )["GroupId"]
+        self._tag_cloudwise_resource(ec2, [sg_id], log, "security group")
         self._authorize_standard_ports(ec2, sg_id, log, existing=False)
         return sg_id, sg_name
+
+    def _tag_cloudwise_resource(self, ec2, resources: list[str], log, label: str) -> None:
+        """
+        Part 28 — every CloudWise-created resource carries
+        ``ManagedBy=CloudWise`` so cost reports, audits and the
+        terminate/rollback safety checks can find them.
+        """
+        if not resources:
+            return
+        tags = [{"Key": "ManagedBy", "Value": "CloudWise"}]
+        if self.user is not None:
+            tags.append({"Key": "CloudWiseUserId", "Value": str(self.user.id)})
+        try:
+            ec2.create_tags(Resources=resources, Tags=tags)
+        except (ClientError, BotoCoreError) as exc:
+            log.warning(
+                DeploymentStage.PREPARING,
+                f"Could not tag {label} {', '.join(resources)}: {exc}",
+            )
 
     def _authorize_standard_ports(
         self, ec2, sg_id: str, log: DeploymentLogService, existing: bool
@@ -1968,43 +2462,56 @@ class AwsEc2Provider(DeploymentProvider):
             return {"ImageId": ami_id}
 
     def _user_data(self) -> str:
-        if not settings.AWS_INSTALL_DOCKER:
-            return ""
-        return (
-            "#!/bin/bash\n"
-            "set -x\n"
-            "exec > /var/log/cloudwise-userdata.log 2>&1\n"
-            "if command -v dnf > /dev/null 2>&1; then\n"
-            "  dnf install -y amazon-ssm-agent || true\n"
-            "elif command -v yum > /dev/null 2>&1; then\n"
-            "  yum install -y amazon-ssm-agent || true\n"
-            "elif command -v apt-get > /dev/null 2>&1; then\n"
-            "  snap install amazon-ssm-agent --classic || "
-            "(apt-get update -y && apt-get install -y amazon-ssm-agent) || true\n"
-            "fi\n"
-            "systemctl enable amazon-ssm-agent || true\n"
-            "systemctl start  amazon-ssm-agent || true\n"
-            "if command -v dnf > /dev/null 2>&1; then\n"
-            "  dnf install -y docker && systemctl enable --now docker\n"
-            "elif command -v yum > /dev/null 2>&1; then\n"
-            "  yum install -y docker && systemctl enable --now docker\n"
-            "elif command -v apt-get > /dev/null 2>&1; then\n"
-            "  apt-get update -y && apt-get install -y docker.io "
-            "&& systemctl enable --now docker\n"
-            "fi\n"
-            "if ! command -v docker-compose > /dev/null 2>&1; then\n"
-            "  curl -fsSL "
-            "https://github.com/docker/compose/releases/latest/"
-            "download/docker-compose-linux-x86_64 "
-            "-o /usr/local/bin/docker-compose\n"
-            "  chmod +x /usr/local/bin/docker-compose\n"
-            "fi\n"
-            "mkdir -p /usr/local/lib/docker/cli-plugins\n"
-            "if [ ! -e /usr/local/lib/docker/cli-plugins/docker-compose ]; then\n"
-            "  ln -sf /usr/local/bin/docker-compose "
-            "/usr/local/lib/docker/cli-plugins/docker-compose\n"
-            "fi\n"
-        )
+        # SSM is mandatory for CloudWise because all remote deployment
+        # actions use Systems Manager instead of SSH. Therefore the SSM
+        # bootstrap must run even when Docker installation is disabled.
+        lines = [
+            "#!/bin/bash\n",
+            "set -euxo pipefail\n",
+            "exec > /var/log/cloudwise-userdata.log 2>&1\n",
+            "echo '[CloudWise] Starting bootstrap'\n",
+            "if command -v dnf > /dev/null 2>&1; then\n",
+            "  dnf install -y amazon-ssm-agent curl || true\n",
+            "elif command -v yum > /dev/null 2>&1; then\n",
+            "  yum install -y amazon-ssm-agent curl || true\n",
+            "elif command -v apt-get > /dev/null 2>&1; then\n",
+            "  apt-get update -y || true\n",
+            "  apt-get install -y amazon-ssm-agent || "
+            "(snap install amazon-ssm-agent --classic || true)\n",
+            "fi\n",
+            "systemctl daemon-reload || true\n",
+            "systemctl enable amazon-ssm-agent || true\n",
+            "systemctl restart amazon-ssm-agent || systemctl start amazon-ssm-agent || true\n",
+            "echo '[CloudWise] SSM bootstrap completed'\n",
+        ]
+
+        if settings.AWS_INSTALL_DOCKER:
+            lines.extend([
+                "if command -v dnf > /dev/null 2>&1; then\n",
+                "  dnf install -y docker && systemctl enable --now docker\n",
+                "elif command -v yum > /dev/null 2>&1; then\n",
+                "  yum install -y docker && systemctl enable --now docker\n",
+                "elif command -v apt-get > /dev/null 2>&1; then\n",
+                "  apt-get update -y && apt-get install -y docker.io "
+                "&& systemctl enable --now docker\n",
+                "fi\n",
+                "if ! command -v docker-compose > /dev/null 2>&1; then\n",
+                "  curl -fsSL "
+                "https://github.com/docker/compose/releases/latest/"
+                "download/docker-compose-linux-x86_64 "
+                "-o /usr/local/bin/docker-compose\n",
+                "  chmod +x /usr/local/bin/docker-compose\n",
+                "fi\n",
+                "mkdir -p /usr/local/lib/docker/cli-plugins\n",
+                "if [ ! -e /usr/local/lib/docker/cli-plugins/docker-compose ]; then\n",
+                "  ln -sf /usr/local/bin/docker-compose "
+                "/usr/local/lib/docker/cli-plugins/docker-compose\n",
+                "fi\n",
+                "echo '[CloudWise] Docker bootstrap completed'\n",
+            ])
+
+        lines.append("echo '[CloudWise] User-data finished'\n")
+        return "".join(lines)
 
     def _run_instances(
         self,
@@ -2054,8 +2561,15 @@ class AwsEc2Provider(DeploymentProvider):
             ]
         if key_name:
             params["KeyName"] = key_name
-        if instance_profile:
-            params["IamInstanceProfile"] = {"Name": instance_profile}
+        # SSM is mandatory for CloudWise deployments. Always launch the
+        # instance with the configured profile, falling back to the
+        # CloudWise-managed SSM profile when settings are empty.
+        profile_name = (
+            str(instance_profile or "").strip()
+            or getattr(settings, "AWS_EC2_INSTANCE_PROFILE", "")
+            or "cloudwise-ec2-ssm"
+        ).strip() or "cloudwise-ec2-ssm"
+        params["IamInstanceProfile"] = {"Name": profile_name}
         user_data = self._user_data()
         if user_data:
             params["UserData"] = user_data

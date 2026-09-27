@@ -20,6 +20,8 @@ urlpatterns = [
     path('contact', views.contact_view, name='contact'),
     path('estimate', views.estimate_view, name='estimate'),
     path('deploy', views.deploy_view, name='deploy'),
+    # Part 21 — pre-deployment preflight (no record is created)
+    path('deploy/preflight', views.deploy_preflight_view, name='deploy_preflight'),
     path('waitlist', views.waitlist_view, name='waitlist'),
     path('monitoring', views.monitoring_view, name='monitoring'),
     
@@ -30,6 +32,8 @@ urlpatterns = [
     path('deployments/<str:deployment_id>/logs', views.deployment_logs_view, name='deployment_logs'),
     path('deployments/<str:deployment_id>/health', views.deployment_health_view, name='deployment_health'),
     path('deployments/<str:deployment_id>/retry', views.deployment_retry_view, name='deployment_retry'),
+    # Part 14 — stop / cancel a deployment (in flight or live)
+    path('deployments/<str:deployment_id>/stop', views.deployment_stop_view, name='deployment_stop'),
     path('deployments/<str:deployment_id>/terminate', views.deployment_terminate_view, name='deployment_terminate'),
     path('deployments/<str:deployment_id>/rollback', views.deployment_rollback_view, name='deployment_rollback'),
     
@@ -44,8 +48,9 @@ urlpatterns = [
     path('pricing/aws', views.aws_pricing_view, name='aws_pricing'),
 
     # AWS account connection (Part 3 — IAM role, temporary credentials)
-    path('aws/connect-info', views.aws_connect_info_view, name='aws_connect_info'),
-    path('aws/connect', views.aws_connect_view, name='aws_connect'),
+path('aws/connect-info', views.aws_connect_info_view, name='aws_connect_info'),
+path('aws/verify', views.aws_verify_view, name='aws_verify'),
+path('aws/connect', views.aws_connect_view, name='aws_connect'),
     path('aws/connection', views.aws_connection_view, name='aws_connection'),
     path('aws/disconnect', views.aws_disconnect_view, name='aws_disconnect'),
 ]

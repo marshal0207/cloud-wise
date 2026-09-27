@@ -20,6 +20,7 @@ import {
   GitBranch,
   ListChecks,
   ExternalLink,
+  Square,
 } from 'lucide-react';
 import { useCloudWise, formatINR } from '@/context/CloudWiseContext';
 
@@ -52,6 +53,18 @@ interface DeploymentPlanInfo {
   requiredEnvVars?: string[];
   ports?: number[];
   requiresNginx?: boolean;
+}
+
+// One row of the preflight response (POST /api/deploy/preflight).
+// ok: true = passed, false = failed, null = could not be evaluated.
+interface PreflightCheck {
+  key: string;
+  label: string;
+  action?: string;
+  ok: boolean | null;
+  critical?: boolean;
+  detail?: string;
+  remedy?: string;
 }
 
 const authHeaders = (): Record<string, string> => {
@@ -163,6 +176,7 @@ export const Deployment: React.FC = () => {
   const [stageError, setStageError] = useState<{ stage: string; message: string } | null>(null);
   const [pipelineFailure, setPipelineFailure] = useState<{ stage: string; message: string } | null>(null);
   const [retrying, setRetrying] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [lastDeploymentId, setLastDeploymentId] = useState<string | null>(null);
 
   const refreshAwsConnection = async () => {
@@ -178,6 +192,57 @@ export const Deployment: React.FC = () => {
   useEffect(() => {
     void refreshAwsConnection();
   }, []);
+
+  // ------------------------------------------------------------------
+  // Part 21 — preflight: real backend checks run *before* Start.
+  // Nothing is created; the backend only answers "is it ready?".
+  // ------------------------------------------------------------------
+  const [preflightChecks, setPreflightChecks] = useState<PreflightCheck[] | null>(null);
+  const [preflightRunning, setPreflightRunning] = useState(false);
+  const [preflightReady, setPreflightReady] = useState<boolean | null>(null);
+
+  const runPreflight = async (includeRepository = false) => {
+    if (!awsConnection?.connected) {
+      setPreflightChecks(null);
+      setPreflightReady(null);
+      return;
+    }
+    setPreflightRunning(true);
+    try {
+      const res = await fetch('/api/deploy/preflight', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({
+          projectId: activeProject?.id,
+          includeRepository,
+        }),
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        setPreflightChecks(Array.isArray(data.checks) ? data.checks : []);
+        setPreflightReady(Boolean(data.ready));
+      } else {
+        setPreflightChecks(null);
+        setPreflightReady(false);
+      }
+    } catch {
+      setPreflightChecks(null);
+      setPreflightReady(false);
+    } finally {
+      setPreflightRunning(false);
+    }
+  };
+
+  // No auto-start: this only *checks* readiness, it never deploys.
+  useEffect(() => {
+    if (awsConnection?.connected && liveDeployment.status === 'idle') {
+      void runPreflight(false);
+    } else if (!awsConnection?.connected) {
+      setPreflightChecks(null);
+      setPreflightReady(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [awsConnection?.connected, liveDeployment.status]);
 
   // Restore analysis info from context if available
   useEffect(() => {
@@ -659,6 +724,47 @@ export const Deployment: React.FC = () => {
     }
   };
 
+  // Part 14 — stop / cancel: POST /api/deployments/<id>/stop.
+  // Stops an in-flight pipeline and terminates the CloudWise-managed
+  // EC2 instance (only instances tagged ManagedBy=CloudWise).
+  const handleStopDeployment = async () => {
+    const id = deploymentId || lastDeploymentId;
+    if (!id || stopping) return;
+    try {
+      setStopping(true);
+      const res = await fetch(`/api/deployments/${id}/stop`, {
+        method: 'POST',
+        headers: authHeaders(),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        showToast(data.error || 'Could not stop the deployment.', 'error');
+        return;
+      }
+      const stoppedLogs: string[] = Array.isArray(data.data?.logs)
+        ? data.data.logs.map((l: any) => `[${l.timestamp}] [${l.level}] ${l.message}`)
+        : liveDeployment.logs;
+      setPolling(false);
+      setStageError(null);
+      setPipelineFailure(null);
+      setActiveStepIndex(-1);
+      setDeploymentId(null);
+      setLiveDeployment(prev => ({
+        ...prev,
+        status: 'idle' as PipelinePhase,
+        progress: 0,
+        failureReason: null,
+        endpointUrl: null,
+        logs: stoppedLogs,
+      }));
+      showToast(data.data?.message || 'Deployment stopped.', 'success');
+    } catch (err: any) {
+      showToast(err.message || 'Stop failed.', 'error');
+    } finally {
+      setStopping(false);
+    }
+  };
+
   useEffect(() => {
     if (!polling || !deploymentId) return;
 
@@ -686,7 +792,8 @@ export const Deployment: React.FC = () => {
             FAILED: 'failed',
             ROLLING_BACK: 'failed',
             ROLLED_BACK: 'idle',
-            TERMINATED: 'failed',
+            // stopped by the user — ready to start a new deployment
+            TERMINATED: 'idle',
             // legacy lowercase records created before migration 0007
             DEPLOYED: 'deployed',
             DONE: 'deployed',
@@ -1197,19 +1304,79 @@ export const Deployment: React.FC = () => {
                     Complete steps 1–3 (analyze → generate files → configure env) before deploying.
                   </div>
                 )}
+
+                {/* Part 21 — preflight: real checks, nothing created yet */}
+                {awsConnection?.connected && (
+                  <div className="pt-2 border-t border-slate-800 space-y-1.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[11px] font-semibold text-slate-400">
+                        Preflight checks
+                      </span>
+                      <button
+                        onClick={() => void runPreflight(true)}
+                        disabled={preflightRunning}
+                        className="text-[10px] font-bold text-cyan-300 hover:text-cyan-200 disabled:opacity-50 flex items-center gap-1"
+                      >
+                        <RefreshCw size={11} className={preflightRunning ? 'animate-spin' : ''} />
+                        {preflightRunning ? 'Checking…' : 'Re-run full check'}
+                      </button>
+                    </div>
+                    {!preflightChecks && (
+                      <div className="text-[11px] text-slate-500">
+                        {preflightRunning ? 'Running preflight…' : 'Preflight has not run yet.'}
+                      </div>
+                    )}
+                    {preflightChecks?.map(check => (
+                      <div
+                        key={check.key}
+                        className="flex items-start gap-2 text-[11px] leading-snug"
+                      >
+                        {check.ok === true ? (
+                          <CheckCircle2 size={13} className="text-emerald-400 shrink-0 mt-px" />
+                        ) : check.ok === false ? (
+                          <AlertTriangle size={13} className="text-rose-400 shrink-0 mt-px" />
+                        ) : (
+                          <Clock size={13} className="text-slate-500 shrink-0 mt-px" />
+                        )}
+                        <span className={check.ok === false ? 'text-rose-300' : 'text-slate-300'}>
+                          {check.label}
+                          {check.ok === false && check.remedy && (
+                            <span className="block text-[10px] text-slate-500">{check.remedy}</span>
+                          )}
+                        </span>
+                      </div>
+                    ))}
+                    {preflightReady === false && preflightChecks && (
+                      <div className="pt-1 text-[11px] text-rose-300">
+                        Fix the failed checks above before starting the deployment.
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 <button
                   onClick={handleDeploy}
-                  disabled={!canDeploy}
+                  disabled={!canDeploy || preflightRunning || preflightReady === false}
                   className="w-full py-4 rounded-xl bg-gradient-to-r from-cyan-400 via-cyan-500 to-blue-600 hover:from-cyan-300 hover:to-blue-500 text-slate-950 font-bold text-sm transition-all shadow-xl shadow-cyan-500/25 flex items-center justify-center gap-2 active:scale-98 disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   <Rocket className="w-5 h-5" />
-                  <span>Deploy {repoName ? `"${repoName.split('/')[1]}"` : 'Project'} to AWS EC2</span>
+                  <span>
+                    Start Deployment{repoName ? ` — ${repoName.split('/')[1]}` : ''}
+                  </span>
                 </button>
               </div>
             )}
 
             {liveDeployment.status !== 'idle' && (
               <div className="space-y-2 pt-2">
+                <button
+                  onClick={() => void handleStopDeployment()}
+                  disabled={stopping || !(deploymentId || lastDeploymentId)}
+                  className="w-full py-2.5 rounded-xl bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/40 text-rose-300 font-semibold text-xs transition-colors flex items-center justify-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <Square className="w-3.5 h-3.5" />
+                  <span>{stopping ? 'Stopping…' : 'Stop Deployment'}</span>
+                </button>
                 <button
                   onClick={handleReset}
                   className="w-full py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-300 font-semibold text-xs transition-colors flex items-center justify-center gap-1.5"
