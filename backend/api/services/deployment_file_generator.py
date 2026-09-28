@@ -553,6 +553,28 @@ def generate_deployment_files(
     frontend_dir, backend_dir = _resolve_service_directories(files)
     split_layout = bool(frontend_dir and backend_dir)
 
+    if split_layout:
+        # ---------------------------------------------------------------
+        # Additive adaptation layer — repositories with a separate
+        # frontend/ + backend/ layout are rendered by the dedicated
+        # adapter. Every other repository keeps the existing behaviour
+        # below (the adapter is entered only when the detector confirms
+        # the split architecture).
+        # ---------------------------------------------------------------
+        from .deployment.adapters import generate_split_deployment
+        from .deployment.repository_detector import detect_repository
+
+        profile = detect_repository(files, tree=tree)
+        if profile.requires_separate_frontend_backend:
+            return generate_split_deployment(
+                files,
+                profile,
+                analysis=analysis,
+                stack=stack,
+                provider=provider,
+                tree=tree,
+            )
+
     generated_files: dict[str, str] = {}
     dockerfile_preserved = False
     compose_preserved = False

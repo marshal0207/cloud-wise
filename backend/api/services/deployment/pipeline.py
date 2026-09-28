@@ -644,6 +644,11 @@ def run_pipeline(deployment_id: str, payload: dict) -> None:
             "appPort": payload.get("port"),
         }
     )
+    # Split-architecture live verification report (additive key — only set
+    # for separate frontend/ + backend/ deployments).
+    health_report = deploy_result.get("health")
+    if isinstance(health_report, dict):
+        specs["health"] = health_report
     DeploymentRecord.objects.filter(pk=deployment_id).update(
         live_url=live_url or None,
         ip_address=endpoint_ip or public_ip or None,

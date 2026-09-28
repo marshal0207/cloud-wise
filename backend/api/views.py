@@ -18,6 +18,7 @@ from rest_framework import status, permissions
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
+from typing import Mapping, cast
 
 from .models import (
     Project, 
@@ -926,9 +927,29 @@ def _prepare_repository_payload(user, project_id, data, env_vars):
         k: v for k, v in deploy_files.items()
         if not str(k).replace('\\', '/').startswith('.github/')
     }
-    deployment_plan = generated.get('deploymentPlan') or {}
+    deployment_plan = cast(Mapping, generated.get('deploymentPlan') or {})
     app_port = int(generated.get('port') or 80)
     detection = generated.get('detection') or {}
+
+    # ----------------------------------------------------------------
+    # Split-architecture pre-flight (additive adaptation layer)
+    # ----------------------------------------------------------------
+    # Repositories with a separate frontend/ + backend/ layout carry the
+    # detector manifest in the plan. A backend that cannot be started (no
+    # start command) or has no detectable port must fail fast here with an
+    # actionable message instead of failing on the instance.
+    deployment_plan = deployment_plan or {}
+    if deployment_plan.get('architecture') == 'separate_frontend_backend':
+        from .services.deployment.adapters import readiness_problem
+
+        problem = readiness_problem(cast(Mapping, deployment_plan))
+        if problem:
+            return None, None, Response({
+                'success': False,
+                'stage': 'GITHUB',
+                'code': 'REPOSITORY_NOT_DEPLOYABLE',
+                'error': problem,
+            }, status=status.HTTP_400_BAD_REQUEST)
 
     # ----------------------------------------------------------------
     # Stage: ENVIRONMENT

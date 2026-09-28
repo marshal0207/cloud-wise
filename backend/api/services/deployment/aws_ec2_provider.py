@@ -904,6 +904,7 @@ class AwsEc2Provider(DeploymentProvider):
 
             # ---- HEALTH_CHECK ----
             app_port = self._detect_app_port()
+            split_health: dict[str, Any] | None = None
             advance(
                 DeploymentStatus.HEALTH_CHECK,
                 DeploymentStage.HEALTH_CHECK,
@@ -933,6 +934,45 @@ class AwsEc2Provider(DeploymentProvider):
                         f"is not reachable yet ({pub_msg}). Security group "
                         f"ports: {settings.AWS_SECURITY_GROUP_PORTS}.",
                     )
+
+            # ---- Split-architecture live verification (additive layer) ----
+            # For separate frontend/ + backend/ deployments the router nginx
+            # is also probed for a backend API path, so a dead/unrouted API
+            # is caught here instead of reporting the app as live.
+            if healthy:
+                split_plan = self.config.get("deployment_plan") or {}
+                if split_plan.get("architecture") == (
+                    "separate_frontend_backend"
+                ):
+                    from .adapters import verify_split_deployment
+
+                    def _run_split_commands(
+                        commands, stage_message, timeout_seconds,
+                    ):
+                        return self._run_ssm_commands(
+                            ssm,
+                            instance_id,
+                            list(commands),
+                            log,
+                            stage_message=stage_message,
+                            timeout_seconds=timeout_seconds,
+                        )
+
+                    split_health = verify_split_deployment(
+                        split_plan,
+                        endpoint_url=endpoint_url,
+                        run_commands=_run_split_commands,
+                    )
+                    split_status = (split_health or {}).get("status")
+                    split_message = (split_health or {}).get("message") or ""
+                    if split_status == "FAILED":
+                        # Route the failure through the existing health
+                        # failure path (diagnostics + FAILED record).
+                        healthy = False
+                        health_message = split_message
+                    elif split_status == "SUCCESS":
+                        health_message = f"{health_message}. {split_message}"
+
             if healthy:
                 # Part 17 — record the real probe result (SSM curl +
                 # public URL) so the log shows the HTTP status seen.
@@ -1015,12 +1055,14 @@ class AwsEc2Provider(DeploymentProvider):
             metadata["endpointUrl"] = endpoint_url
             metadata["remoteDir"] = remote_dir
             metadata["lastDeployLogs"] = log.all()
+            if split_health is not None:
+                metadata["health"] = split_health
             row.metadata = metadata
             row.save(update_fields=["metadata", "updated_at"])
             self._persist_logs(row, log.all())
 
         # Never include env var values in the returned payload.
-        return {
+        result: dict[str, Any] = {
             "deployment_id": deployment_id,
             "instance_id": instance_id,
             "status": current,
@@ -1037,6 +1079,11 @@ class AwsEc2Provider(DeploymentProvider):
             "file_count": len(files),
             "logs": log.all(),
         }
+        if split_health is not None:
+            # Additive key — never overwrites "status" (the pipeline reads
+            # it as the deployment state).
+            result["health"] = split_health
+        return result
 
     # ------------------------------------------------------------------
     # Non-Docker deployment — runtime install, build, start
