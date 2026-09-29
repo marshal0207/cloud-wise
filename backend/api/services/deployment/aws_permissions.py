@@ -95,6 +95,22 @@ def get_cloudwise_permissions_policy() -> list[dict]:
             "Resource": "*",
         },
         {
+            "Sid": "CloudWiseElasticIp",
+            "Effect": "Allow",
+            # Optional capability: keeps the instance public IP stable
+            # across rebuilds so a database network access list keeps
+            # matching. Without these the pipeline still deploys, using
+            # the instance's dynamic public IP.
+            "Action": [
+                "ec2:DescribeAddresses",
+                "ec2:AllocateAddress",
+                "ec2:AssociateAddress",
+                "ec2:DisassociateAddress",
+                "ec2:ReleaseAddress",
+            ],
+            "Resource": "*",
+        },
+        {
             "Sid": "CloudWiseEC2Lifecycle",
             "Effect": "Allow",
             "Action": [

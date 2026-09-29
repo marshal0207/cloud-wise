@@ -61,12 +61,49 @@ class SplitGenerationTests(SimpleTestCase):
         self.assertIn("EXPOSE 80", dockerfile)
         self.assertIn('CMD ["nginx", "-g", "daemon off;"]', dockerfile)
 
+    def test_frontend_nginx_denies_secret_paths_but_keeps_client_routes(self):
+        dockerfile = self.files["frontend/Dockerfile"]
+
+        # printf collapses "\\" to "\", so the conf nginx reads holds the
+        # same "\.env" rule the router conf has.
+        self.assertIn(r'location ~* "\\.env($|\\.)" { return 404; }', dockerfile)
+        self.assertIn(r'location ~* "\\.git(/|$)" { return 404; }', dockerfile)
+        self.assertIn("try_files $uri $uri/ /index.html;", dockerfile)
+        self.assertIn("location / {", dockerfile)
+
+    def test_plan_reports_that_secret_paths_are_denied(self):
+        self.assertTrue(self.plan["nginxSensitivePathsDenied"])
+
+    def test_a_preserved_router_conf_is_reported_without_the_deny_rules(self):
+        result = generate_deployment_files(
+            {
+                "frontend/package.json": '{"dependencies":{"react":"18.3.1"}}',
+                "backend/package.json": '{"dependencies":{"express":"4.19.2"}}',
+                "nginx.conf": (
+                    "server {\n    listen 80;\n"
+                    "    location / { try_files $uri /index.html; }\n}\n"
+                ),
+            },
+            provider="AWS",
+        )
+
+        self.assertNotIn(
+            "cloudwise-deny-sensitive-paths", result["files"]["nginx.conf"]
+        )
+        self.assertFalse(
+            result["deploymentPlan"]["nginxSensitivePathsDenied"]
+        )
+
     def test_nginx_routes_api_to_detected_backend_port(self):
         nginx = self.files["nginx.conf"]
 
         self.assertIn("location /api/", nginx)
-        self.assertIn("proxy_pass http://backend:5000;", nginx)
-        self.assertIn("proxy_pass http://frontend:80;", nginx)
+        # The upstream stays the Compose service name and is resolved per
+        # request (never a container IP that goes stale).
+        self.assertIn("http://backend:5000", nginx)
+        self.assertIn("http://frontend:80", nginx)
+        self.assertIn("proxy_pass $cloudwise_upstream;", nginx)
+        self.assertIn("resolver 127.0.0.11", nginx)
         self.assertIn("location /", nginx)
 
     def test_compose_keeps_backend_internal_and_passes_env(self):

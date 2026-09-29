@@ -1,6 +1,11 @@
 from django.test import SimpleTestCase
 
-from api.services.deployment_file_generator import generate_deployment_files
+from api.services.deployment_file_generator import (
+    ensure_sensitive_paths_denied,
+    generate_deployment_files,
+    generate_nginx_conf,
+    generate_split_compose,
+)
 
 
 class DeploymentFileGeneratorTests(SimpleTestCase):
@@ -218,8 +223,10 @@ class FullStackGenerationTests(SimpleTestCase):
 
         self.assertIn("location /", nginx)
         self.assertIn("location /api/", nginx)
-        self.assertIn("proxy_pass http://frontend:80;", nginx)
-        self.assertIn("proxy_pass http://backend:8080;", nginx)
+        self.assertIn("http://frontend:80", nginx)
+        self.assertIn("http://backend:8080", nginx)
+        self.assertIn("proxy_pass $cloudwise_upstream;", nginx)
+        self.assertIn("resolver 127.0.0.11", nginx)
 
     def test_backend_port_not_published_to_host(self):
         result = generate_deployment_files(self.FILES, provider="AWS")
@@ -254,7 +261,10 @@ class FullStackGenerationTests(SimpleTestCase):
         self.assertIn("server/Dockerfile", result["files"])
         self.assertIn("nginx.conf", result["files"])
         self.assertTrue(result["deploymentPlan"]["requiresNginx"])
-        self.assertIn("proxy_pass http://backend:3000;", result["files"]["nginx.conf"])
+        self.assertIn("http://backend:3000", result["files"]["nginx.conf"])
+        self.assertIn(
+            "proxy_pass $cloudwise_upstream;", result["files"]["nginx.conf"]
+        )
 
 
 class ExistingDockerfileTests(SimpleTestCase):
@@ -359,3 +369,75 @@ class NginxRequirementTests(SimpleTestCase):
             result = generate_deployment_files(files)
             self.assertFalse(result["deploymentPlan"]["requiresNginx"])
             self.assertNotIn("nginx.conf", result["files"])
+
+
+class SensitivePathDenialTests(SimpleTestCase):
+    """``GET /.env`` must never be answered with the SPA index."""
+
+    FILES = {
+        "frontend/package.json": '{"dependencies":{"react":"18.3.1"}}',
+        "backend/package.json": '{"dependencies":{"express":"4.19.2"}}',
+    }
+    PRESERVED = (
+        "server {\n"
+        "    listen 80;\n"
+        "    location / { try_files $uri $uri/ /index.html; }\n"
+        "}\n"
+    )
+
+    def test_generated_router_denies_secrets_and_keeps_every_route(self):
+        nginx = generate_deployment_files(self.FILES)["files"]["nginx.conf"]
+
+        self.assertIn('location ~* "\\.env($|\\.)" { return 404; }', nginx)
+        self.assertIn('location ~* "\\.git(/|$)" { return 404; }', nginx)
+        self.assertIn('location ~* "\\.(pem|key|p12|pfx)$" { return 404; }', nginx)
+        self.assertIn("cloudwise-deny-sensitive-paths", nginx)
+        # Routing is untouched: the API, the API redirect and the SPA proxy
+        # are all still there.
+        self.assertIn("location /api/", nginx)
+        self.assertIn("http://backend:", nginx)
+        self.assertIn("http://frontend:", nginx)
+        self.assertIn("proxy_pass $cloudwise_upstream;", nginx)
+        self.assertIn("location / {", nginx)
+
+    def test_a_spa_fallback_gets_the_deny_rules_exactly_once(self):
+        out, report = ensure_sensitive_paths_denied(self.PRESERVED)
+
+        self.assertTrue(report["changed"])
+        self.assertEqual(report["blocks"], 1)
+        self.assertIn('location ~* "\\.env($|\\.)" { return 404; }', out)
+        self.assertIn("try_files $uri $uri/ /index.html;", out)
+        self.assertEqual(out.count("cloudwise-deny-sensitive-paths"), 1)
+
+        again, second = ensure_sensitive_paths_denied(out)
+        self.assertEqual(again, out)
+        self.assertFalse(second["changed"])
+        self.assertEqual(second["reason"], "already_denied")
+
+    def test_a_config_without_a_server_block_is_left_alone(self):
+        out, report = ensure_sensitive_paths_denied("upstream backend { }\n")
+
+        self.assertEqual(out, "upstream backend { }\n")
+        self.assertFalse(report["changed"])
+        self.assertEqual(report["reason"], "no_server_block")
+
+    def test_generated_nginx_conf_is_denied_from_the_start(self):
+        conf = generate_nginx_conf(80, 5000)
+
+        self.assertIn("cloudwise-deny-sensitive-paths", conf)
+        self.assertIn("http://frontend:80", conf)
+        self.assertIn("http://backend:5000", conf)
+        self.assertIn('location ~* "\\.env($|\\.)" { return 404; }', conf)
+
+    def test_compose_passes_the_detected_port_exactly_once(self):
+        compose = generate_split_compose(
+            "frontend",
+            "backend",
+            backend_port=5000,
+            env_vars=["PORT", "MONGO_URI", "NODE_ENV"],
+        )
+
+        self.assertEqual(compose.count("- PORT="), 1)
+        self.assertIn("- PORT=5000", compose)
+        self.assertNotIn("${PORT}", compose)
+        self.assertIn("- MONGO_URI=${MONGO_URI}", compose)

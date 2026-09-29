@@ -38,6 +38,7 @@ from ...deployment_file_generator import (
     parse_exposed_port_from_dockerfile,
 )
 from ..repository_detector.models import RepositoryProfile
+from ..mongodb_atlas_service import find_database_env_var
 
 PUBLISHED_PORT = 80
 
@@ -128,12 +129,22 @@ CMD {_cmd_json(frontend.start_command or f"{package_manager} start")}
     # SPA fallback so client-side routes (/doctors, /booking, ...) resolve.
     # Literal "\n" escapes keep the RUN instruction on a single Dockerfile
     # line; printf expands them when the image is built.
+    #
+    # The deny locations use the same rules as the router nginx (see
+    # deployment_file_generator._SENSITIVE_PATH_RULES). printf consumes one
+    # level of backslashes, so '\\\\.' here reaches nginx as '\.'.
     spa_conf = (
         r"server {\n"
         r"    listen 80;\n"
         r"    server_name _;\n"
         r"    root /usr/share/nginx/html;\n"
         r"    index index.html;\n"
+        r"\n"
+        r'    location ~* "\\.env($|\\.)" { return 404; }\n'
+        r'    location ~* "\\.git(/|$)" { return 404; }\n'
+        r'    location ~* "/\\.(ssh|aws|docker|npmrc|netrc|htpasswd)" { return 404; }\n'
+        r'    location ~* "/(id_rsa|id_dsa|id_ecdsa|id_ed25519)(\\.[^/]*)?$" { return 404; }\n'
+        r'    location ~* "\\.(pem|key|p12|pfx)$" { return 404; }\n'
         r"\n"
         r"    location / {\n"
         r"        try_files $uri $uri/ /index.html;\n"
@@ -266,6 +277,11 @@ def render_split_compose(
 
     backend_environment = [f"      - PORT={backend_port}"]
     for name in env_vars or []:
+        if str(name).strip().upper() == "PORT":
+            # PORT already carries the detected port; a ``${PORT}``
+            # passthrough would win in compose (later entries override) and
+            # could send the container to a port nginx never proxies to.
+            continue
         backend_environment.append(f"      - {name}=${{{name}}}")
     backend_env_block = "\n".join(backend_environment)
 
@@ -333,6 +349,381 @@ def readiness_problem(deployment_plan: Mapping | None) -> str | None:
             f"localhost:<port> in the README."
         )
     return None
+
+
+# ---------------------------------------------------------------------------
+# Database readiness endpoint (/api/health)
+# ---------------------------------------------------------------------------
+
+HEALTH_PATH = "/api/health"
+
+_MONGODB_ENV_NAMES = (
+    "MONGO_URI",
+    "MONGODB_URI",
+    "MONGO_URL",
+    "MONGO_CONNECTION_URI",
+    "MONGO_DB_URI",
+    "MONGODB_URL",
+)
+
+_APP_VAR_RE = re.compile(
+    r"(?m)^[ \t]*(?:const|let|var)[ \t]+([A-Za-z_$][\w$]*)[ \t]*=[ \t]*"
+    r"(?:express[ \t]*\(|require\([ \t]*['\"]express['\"]\s*\)[ \t]*\()"
+)
+_MONGOOSE_RE = re.compile(
+    r"require\([ \t]*['\"]mongoose['\"]\)|from[ \t]*['\"]mongoose['\"]"
+    r"|mongoose\.connect",
+)
+_MONGODB_DRIVER_RE = re.compile(
+    r"require\([ \t]*['\"]mongodb['\"]\)|from[ \t]*['\"]mongodb['\"]"
+    r"|MongoClient",
+)
+_DB_ENV_REFERENCE_RE = re.compile(
+    r"process\.env\.([A-Z][A-Z0-9_]{2,})|process\.env\[[\w'\"]+\]"
+)
+
+
+def detect_express_app_var(source: str) -> str:
+    """Name of the Express app instance (``app`` when clearly used)."""
+    match = _APP_VAR_RE.search(str(source or ""))
+    if match:
+        return match.group(1)
+    if re.search(r"(?m)^[ \t]*app\.listen\s*\(", str(source or "")):
+        return "app"
+    return ""
+
+
+def detect_database_driver(sources: Sequence[str]) -> str:
+    """``mongoose`` / ``mongodb`` / ``""`` — which driver the app uses."""
+    text = "\n".join(str(source or "") for source in sources)
+    if _MONGOOSE_RE.search(text):
+        return "mongoose"
+    if _MONGODB_DRIVER_RE.search(text):
+        return "mongodb"
+    return ""
+
+
+def _health_snippet(app_var: str, driver: str, env_var: str) -> str:
+    """The injected handler — never exposes a URI, credential or traceback."""
+    if driver == "mongodb":
+        check = f"""  try {{
+    const uri = process.env['{env_var or "MONGO_URI"}'] || ''
+    if (uri) {{
+      const {{ MongoClient }} = require('mongodb')
+      const client = new MongoClient(uri, {{ serverSelectionTimeoutMS: 1500 }})
+      await client.connect()
+      connected = true
+      await client.close()
+    }}
+  }} catch (error) {{
+    connected = false
+  }}"""
+    else:
+        check = """  try {
+    connected = require('mongoose').connection.readyState === 1
+  } catch (error) {
+    connected = false
+  }"""
+    return (
+        "// CloudWise: database readiness endpoint (added at deploy time).\n"
+        "// HTTP 200 only while the database connection is established; the\n"
+        "// response never contains a connection string, credential or stack\n"
+        "// trace.\n"
+        f"{app_var}.get('{HEALTH_PATH}', async (request, response) => {{\n"
+        "  let connected = false\n"
+        f"{check}\n"
+        "  if (!connected) {\n"
+        "    return response.status(503).json("
+        "{ status: 'unhealthy', database: 'unavailable' })\n"
+        "  }\n"
+        "  return response.status(200).json("
+        "{ status: 'ok', database: 'connected' })\n"
+        "})\n"
+    )
+
+
+def install_database_health_route(
+    source: str,
+    *,
+    app_var: str,
+    driver: str,
+    env_var: str = "",
+) -> tuple[str, str]:
+    """
+    Make ``GET /api/health`` report database readiness.
+
+    Returns ``(new_source, status)`` with ``status`` one of:
+
+    * ``injected``       — the handler was added (or replaces a naive one)
+    * ``already_present``— the repository already reports DB readiness
+    * ``skipped``        — nothing safe to do; existing behaviour kept
+
+    The handler is registered on the *same* Express instance and before any
+    existing ``/api/health`` handler, so Express answers with the
+    database-aware response. No existing route is touched or removed.
+    """
+    text = str(source or "")
+    if not text.strip() or not app_var:
+        return source, "skipped"
+
+    snippet = _health_snippet(app_var, driver, env_var)
+    existing = re.search(
+        r"(?m)^(?P<indent>[ \t]*)(?P<recv>[A-Za-z_$][\w$.]*)\.(?:get|use)"
+        r"[ \t]*\([ \t]*['\"]" + re.escape(HEALTH_PATH) + r"['\"]",
+        text,
+    )
+    if existing is not None:
+        # The repository already answers the endpoint: only take over when
+        # it clearly does not check the database.
+        if "readyState" in text or "database" in text[existing.start():]:
+            return source, "already_present"
+        if existing.group("recv") != app_var:
+            return source, "skipped"
+        at = existing.start()
+        return text[:at] + snippet + "\n" + text[at:], "injected"
+
+    anchor = re.search(
+        rf"(?m)^[ \t]*{re.escape(app_var)}\.listen[ \t]*\(", text
+    )
+    if anchor is not None:
+        at = anchor.start()
+        return text[:at] + snippet + "\n" + text[at:], "injected"
+    return text.rstrip("\n") + "\n\n" + snippet, "injected"
+
+
+# ---------------------------------------------------------------------------
+# nginx upstream stability (no container IPs, no stale DNS)
+# ---------------------------------------------------------------------------
+
+# `proxy_pass http://service[:port];` — a *literal* upstream is resolved by
+# nginx once, at config load, and then cached forever. Docker container IPs
+# change whenever a container is recreated, which is exactly how a running
+# nginx ends up proxying to a dead address.
+_PROXY_PASS_LINE_RE = re.compile(
+    r"^(?P<indent>[ \t]*)proxy_pass[ \t]+"
+    r"(?P<url>https?://(?P<host>[A-Za-z0-9][A-Za-z0-9._-]*)(?::(?P<port>\d+))?)"
+    r"[ \t]*;(?P<ending>\r?\n)?$"
+)
+_IPV4_HOST_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+_RESOLVER_RE = re.compile(r"(?m)^[ \t]*resolver[ \t]+")
+_SERVER_BLOCK_RE = re.compile(r"^[ \t]*server[ \t]*\{")
+
+DOCKER_DNS_RESOLVER = "resolver 127.0.0.11 valid=10s ipv6=off;"
+
+
+def stabilize_nginx_conf(text: str) -> tuple[str, dict[str, Any]]:
+    """
+    Re-resolve compose service names on every request.
+
+    ``proxy_pass http://backend:5000;`` is rewritten to a variable-backed
+    upstream plus Docker's embedded DNS resolver, so the *service name*
+    keeps working after the backend container is recreated with a new IP.
+    Nothing is hard-coded: the host stays the Compose service name, and a
+    config that already uses a variable, an IP address or a proxied URI is
+    left untouched.
+    """
+    report: dict[str, Any] = {
+        "changed": False,
+        "upstreams": 0,
+        "resolverAdded": False,
+        "reason": "",
+    }
+    content = str(text or "")
+    if "proxy_pass" not in content:
+        report["reason"] = "no_proxy_pass"
+        return text, report
+
+    lines = content.splitlines(keepends=True)
+    out: list[str] = []
+    rewritten = 0
+    for line in lines:
+        match = _PROXY_PASS_LINE_RE.match(line)
+        if match is None:
+            out.append(line)
+            continue
+        host = match.group("host")
+        if _IPV4_HOST_RE.match(host) or "$" in line:
+            # An IP address needs no DNS; a variable is already dynamic.
+            out.append(line)
+            continue
+        indent = match.group("indent") or ""
+        ending = match.group("ending") or "\n"
+        out.append(f"{indent}set $cloudwise_upstream {match.group('url')};{ending}")
+        out.append(f"{indent}proxy_pass $cloudwise_upstream;{ending}")
+        rewritten += 1
+
+    if rewritten == 0:
+        report["reason"] = "no_literal_upstream"
+        return text, report
+
+    if _RESOLVER_RE.search("".join(out)) is None:
+        for index, line in enumerate(out):
+            if _SERVER_BLOCK_RE.match(line):
+                ending = "\n" if line.endswith("\n") else ""
+                out.insert(index + 1, f"    {DOCKER_DNS_RESOLVER}{ending}")
+                report["resolverAdded"] = True
+                break
+
+    report["changed"] = True
+    report["upstreams"] = rewritten
+    return "".join(out), report
+
+
+# ---------------------------------------------------------------------------
+# Compose environment wiring (the backend must receive the database URI)
+# ---------------------------------------------------------------------------
+
+def ensure_backend_env_vars(
+    compose_text: str,
+    names: Sequence[str],
+) -> tuple[str, dict[str, Any]]:
+    """
+    Guarantee ``- <VAR>=${<VAR>}`` for each name in the ``backend`` service.
+
+    A repository that reads ``process.env.MONGO_URI`` but whose compose file
+    never forwards the variable silently falls back to in-memory data — and
+    the deployment then fails with a confusing health error. Only additive
+    list entries are inserted (never a rewrite of the file), and anything
+    that cannot be done safely is reported instead of guessed at.
+    """
+    report: dict[str, Any] = {"injected": [], "skipped": [], "present": []}
+    wanted = [str(name) for name in names if str(name).strip()]
+    content = str(compose_text or "")
+    if not wanted or not content.strip():
+        return compose_text, report
+
+    lines = content.splitlines(keepends=True)
+    start = None
+    for index, line in enumerate(lines):
+        if re.match(r"^ {2}backend:[ \t]*(#.*)?$", line):
+            start = index
+            break
+    if start is None:
+        report["skipped"] = list(wanted)
+        report["reason"] = "no_backend_service"
+        return compose_text, report
+
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        if re.match(r"^ {2}\S", lines[index]):
+            end = index
+            break
+
+    block = "".join(lines[start:end])
+    missing = [
+        name for name in wanted
+        if not re.search(rf"\b{re.escape(name)}\b", block)
+    ]
+    report["present"] = [name for name in wanted if name not in missing]
+    if not missing:
+        return compose_text, report
+
+    env_index = None
+    env_kind = ""
+    for index in range(start, end):
+        match = re.match(r"^ {4}environment:[ \t]*(?P<rest>.*)$", lines[index])
+        if match:
+            env_index = index
+            env_kind = "list" if not match.group("rest").strip("# \t") else "inline"
+            break
+
+    items = [f"      - {name}=${{{name}}}\n" for name in missing]
+
+    if env_index is None:
+        insert_at = end
+        while insert_at - 1 > start and not lines[insert_at - 1].strip():
+            insert_at -= 1
+        lines[insert_at:insert_at] = ["    environment:\n", *items]
+        report["injected"] = list(missing)
+        return "".join(lines), report
+
+    if env_kind == "inline":
+        rest = lines[env_index].split("environment:", 1)[1].strip()
+        if rest.rstrip() not in ("{}", ""):
+            report["skipped"] = list(missing)
+            report["reason"] = "mapping_environment"
+            return compose_text, report
+        lines[env_index] = "    environment:\n"
+        lines[env_index + 1:env_index + 1] = items
+        report["injected"] = list(missing)
+        return "".join(lines), report
+
+    boundary = env_index + 1
+    while boundary < end:
+        line = lines[boundary]
+        if line.strip() and re.match(r"^ {4}\S", line):
+            break
+        if line.strip() and re.match(r"^ {6}[\w'\"]+\s*:", line):
+            # mapping-style environment entries: mixing styles is invalid
+            report["skipped"] = list(missing)
+            report["reason"] = "mapping_environment"
+            return compose_text, report
+        boundary += 1
+    lines[boundary:boundary] = items
+    report["injected"] = list(missing)
+    return "".join(lines), report
+
+
+def _backend_sources(
+    profile: RepositoryProfile, files: Mapping[str, str]
+) -> list[str]:
+    """Every file that belongs to the backend service."""
+    backend = profile.backend
+    if backend is None:
+        return []
+    prefix = f"{str(backend.path).strip('/')}/".lower()
+    return [
+        str(content)
+        for key, content in files.items()
+        if str(key).replace("\\", "/").lower().startswith(prefix)
+    ]
+
+
+def _backend_entry_file(
+    profile: RepositoryProfile, files: Mapping[str, str]
+) -> str:
+    """Repo-relative path of the Node entry file, or ``""``."""
+    backend = profile.backend
+    if backend is None:
+        return ""
+    candidates: list[str] = []
+    if backend.entry_file:
+        candidates.append(f"{str(backend.path).strip('/')}/{backend.entry_file}")
+    candidates.extend(
+        f"{str(backend.path).strip('/')}/{name}"
+        for name in ("server.js", "app.js", "index.js")
+    )
+    lowered = {str(key).replace("\\", "/").lower(): str(key) for key in files}
+    for candidate in candidates:
+        key = candidate.replace("\\", "/")
+        if key in files:
+            return key
+        match = lowered.get(key.lower())
+        if match:
+            return match
+    return ""
+
+
+def _resolve_database_env_var(
+    profile: RepositoryProfile,
+    files: Mapping[str, str],
+    env_vars: Sequence[str],
+) -> str:
+    """
+    Name of the variable that carries this repository's database URI.
+
+    Prefers a required variable the repository itself declares, then any
+    conventional MongoDB name the repository references. ``""`` means "no
+    database variable could be identified" — nothing is guessed.
+    """
+    if not profile.database_type and not profile.required_env_vars:
+        return ""
+    for name in profile.required_env_vars or ():
+        if str(name).strip() in _MONGODB_ENV_NAMES:
+            return str(name).strip()
+    return find_database_env_var(
+        {str(name): "" for name in env_vars or ()}, files=files
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +827,45 @@ def generate_split_deployment(
         generated[".github/workflows/deploy.yml"] = cicd_content
         generated[".github/workflows/aws-deploy.yml"] = cicd_content
 
+    # ---- database wiring: env var, readiness endpoint, stable upstreams ----
+    # Three failures used to look identical from the outside ("health check
+    # failed"): the backend never receiving its connection string, no
+    # endpoint that reports database readiness, and nginx caching the
+    # backend's container IP after it was recreated. Each is fixed here,
+    # additively, without touching the architecture.
+    database_env_var = _resolve_database_env_var(profile, files, env_vars)
+    compose_text, compose_env_report = ensure_backend_env_vars(
+        generated["docker-compose.yml"],
+        [database_env_var] if database_env_var else [],
+    )
+    generated["docker-compose.yml"] = compose_text
+
+    nginx_text, nginx_report = stabilize_nginx_conf(generated["nginx.conf"])
+    # Only CloudWise-generated configs are post-processed here: a repository's
+    # own nginx.conf is preserved byte-for-byte (secret-path denial is built
+    # into generate_nginx_conf, and the frontend container gets its own).
+    generated["nginx.conf"] = nginx_text
+
+    health_status = "unavailable"
+    health_file = ""
+    if (profile.backend is not None and profile.backend.runtime == "node") or (
+        profile.database_type
+    ):
+        entry_rel = _backend_entry_file(profile, files)
+        sources = _backend_sources(profile, files)
+        driver = detect_database_driver(sources)
+        app_var = detect_express_app_var(files.get(entry_rel, "")) if entry_rel else ""
+        if entry_rel and app_var and driver:
+            patched, health_status = install_database_health_route(
+                files[entry_rel],
+                app_var=app_var,
+                driver=driver,
+                env_var=database_env_var,
+            )
+            if health_status == "injected":
+                generated[entry_rel] = patched
+                health_file = entry_rel
+
     # ---- deployment plan ----
     deployment_plan = build_deployment_plan(
         generated_files=generated,
@@ -444,6 +874,12 @@ def generate_split_deployment(
         ports=[PUBLISHED_PORT],
         requires_nginx=True,
     )
+    probe_paths = list(profile.api_probe_paths)
+    if health_status in ("injected", "already_present") and (
+        HEALTH_PATH not in probe_paths
+    ):
+        # Probe the endpoint that actually reports database readiness.
+        probe_paths = [HEALTH_PATH, *probe_paths]
     deployment_plan.update({
         "architecture": profile.architecture,
         "manifest": profile.to_manifest(),
@@ -451,8 +887,19 @@ def generate_split_deployment(
         "backendPort": backend_port,
         "portEvidence": backend.port_evidence,
         "apiBasePaths": list(profile.api_base_paths),
-        "apiProbePaths": list(profile.api_probe_paths),
+        "apiProbePaths": probe_paths,
         "issues": list(profile.issues),
+        "databaseEnvVar": database_env_var,
+        "healthEndpoint": (
+            HEALTH_PATH if health_status in ("injected", "already_present") else ""
+        ),
+        "healthEndpointInjected": health_status == "injected",
+        "healthEndpointFile": health_file,
+        "backendEnvInjection": compose_env_report,
+        "nginxUpstreamsStable": bool(nginx_report.get("changed"))
+        or not bool(nginx_report.get("upstreams")),
+        "nginxSensitivePathsDenied": "cloudwise-deny-sensitive-paths"
+        in generated["nginx.conf"],
     })
 
     return {

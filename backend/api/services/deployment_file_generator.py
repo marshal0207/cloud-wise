@@ -344,9 +344,89 @@ CMD ["{toolchain['start']}"]
 # Nginx routing + multi-service compose (full-stack only)
 # ---------------------------------------------------------------------------
 
+# Secrets and VCS metadata are never served. A single-page application's
+# ``try_files $uri $uri/ /index.html`` fallback answers ``GET /.env`` with
+# HTTP 200 + index.html, which a security scanner (and a reviewer) reads as
+# "the environment file is public". These locations are matched before the
+# SPA fallback, return 404, and touch nothing else: /login, /dashboard and
+# every other client-side route keep falling through to index.html.
+_SENSITIVE_PATH_RULES = (
+    "# cloudwise-deny-sensitive-paths — secrets and VCS metadata are never",
+    "# served (404) instead of falling through to the SPA index.",
+    'location ~* "\\.env($|\\.)" { return 404; }',
+    'location ~* "\\.git(/|$)" { return 404; }',
+    'location ~* "/\\.(ssh|aws|docker|npmrc|netrc|htpasswd)" { return 404; }',
+    'location ~* "/(id_rsa|id_dsa|id_ecdsa|id_ed25519)(\\.[^/]*)?$" { return 404; }',
+    'location ~* "\\.(pem|key|p12|pfx)$" { return 404; }',
+)
+_SENSITIVE_DENY_MARKER = "cloudwise-deny-sensitive-paths"
+_SENSITIVE_DENY_DETECTED_RE = re.compile(
+    r"(?m)^[ \t]*location[ \t]+~\*[^\n]*\\?\.env", re.IGNORECASE
+)
+_SERVER_OPEN_RE = re.compile(r"(?m)^[ \t]*server[ \t]*\{")
+
+
+def sensitive_deny_block(indent: str = "    ") -> str:
+    """The deny locations, indented for a ``server {`` body."""
+    return "".join(f"{indent}{rule}\n" for rule in _SENSITIVE_PATH_RULES)
+
+
+def ensure_sensitive_paths_denied(text: str) -> tuple[str, dict]:
+    """
+    Insert the deny locations into every ``server`` block that lacks them.
+
+    Generated and *preserved* repository nginx configs both go through here,
+    so a user-authored ``nginx.conf`` with an SPA fallback gets the same 404
+    guarantee. Idempotent: a config that already denies ``.env`` is returned
+    unchanged, and nothing but the deny block is ever added.
+    """
+    content = str(text or "")
+    report = {"changed": False, "blocks": 0, "reason": ""}
+    if not content.strip():
+        report["reason"] = "empty"
+        return text, report
+    if _SENSITIVE_DENY_MARKER in content or _SENSITIVE_DENY_DETECTED_RE.search(
+        content
+    ):
+        report["reason"] = "already_denied"
+        return text, report
+
+    blocks: list[tuple[str, int]] = []
+    for match in _SERVER_OPEN_RE.finditer(content):
+        depth = 0
+        closing = None
+        for offset in range(match.start(), len(content)):
+            char = content[offset]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    closing = offset
+                    break
+        if closing is None:
+            continue
+        blocks.append((match.group(0), closing))
+
+    if not blocks:
+        report["reason"] = "no_server_block"
+        return text, report
+
+    out = content
+    # Back to front so earlier indices stay valid while later blocks change.
+    for server_line, closing in reversed(blocks):
+        base_indent = re.match(r"[ \t]*", server_line).group(0) or ""
+        block = sensitive_deny_block(base_indent + "    ")
+        line_start = out.rfind("\n", 0, closing) + 1
+        out = out[:line_start] + block + out[line_start:]
+
+    report.update({"changed": True, "blocks": len(blocks)})
+    return out, report
+
+
 def generate_nginx_conf(frontend_port: int, backend_port: int) -> str:
     """Route / to the frontend container and /api to the backend container."""
-    return f"""server {{
+    conf = f"""server {{
     listen 80;
     server_name _;
 
@@ -375,6 +455,8 @@ def generate_nginx_conf(frontend_port: int, backend_port: int) -> str:
     }}
 }}
 """
+    denied, _ = ensure_sensitive_paths_denied(conf)
+    return denied
 
 
 def generate_split_compose(
@@ -392,6 +474,11 @@ def generate_split_compose(
     backend_context = f'./{backend_dir}' if backend_dir else '.'
     backend_environment = [f"      - PORT={backend_port}"]
     for name in env_vars or []:
+        if str(name).strip().upper() == "PORT":
+            # PORT is already set to the detected port; a ``${PORT}``
+            # passthrough would win in compose and could point the container
+            # at a port nginx never proxies to.
+            continue
         backend_environment.append(f"      - {name}=${{{name}}}")
     backend_env_block = "\n".join(backend_environment)
     return f"""version: '3.8'

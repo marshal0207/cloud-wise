@@ -191,6 +191,32 @@ AWS_EC2_ROOT_VOLUME_GB = int(os.getenv('AWS_EC2_ROOT_VOLUME_GB', '30'))
 AWS_EC2_WAIT_FOR_RUNNING = os.getenv('AWS_EC2_WAIT_FOR_RUNNING', 'true').lower() in ('1', 'true', 't')
 AWS_EC2_WAIT_TIMEOUT_SECONDS = int(os.getenv('AWS_EC2_WAIT_TIMEOUT_SECONDS', '300'))
 
+# Stable public IP: attach an Elastic IP to each deployment instance so the
+# address stays the same across rebuilds and a database network access list
+# (MongoDB Atlas, Postgres, ...) keeps matching. Optional — when disabled,
+# or when the role lacks the ec2:*Address permissions, the pipeline keeps
+# using the instance's dynamic public IP.
+AWS_USE_ELASTIC_IP = os.getenv('AWS_USE_ELASTIC_IP', 'true').lower() in ('1', 'true', 't')
+
+# ---------------------------------------------------------------------------
+# MongoDB Atlas Network Access (optional automation)
+#
+# These are *Atlas administration* credentials for the CloudWise operator —
+# they are completely separate from the application's MongoDB connection
+# string, which stays in the deployment environment and is never logged.
+#
+# When all three are set, CloudWise adds a narrow <public-ip>/32 entry to the
+# project's Atlas access list after the instance gets its address. When they
+# are not set, nothing is faked: the deployment reports that Atlas Network
+# Access must allow the EC2 public IP instead.
+# ---------------------------------------------------------------------------
+MONGODB_ATLAS_PUBLIC_KEY = os.getenv('MONGODB_ATLAS_PUBLIC_KEY', '')
+MONGODB_ATLAS_PRIVATE_KEY = os.getenv('MONGODB_ATLAS_PRIVATE_KEY', '')
+MONGODB_ATLAS_PROJECT_ID = os.getenv('MONGODB_ATLAS_PROJECT_ID', '')
+MONGODB_ATLAS_AUTO_ALLOWLIST = os.getenv(
+    'MONGODB_ATLAS_AUTO_ALLOWLIST', 'true'
+).lower() in ('1', 'true', 't')
+
 # Security group — only these ports are ever opened publicly (80/443/22).
 # Application ports (3000/8000/8080...) are intentionally NOT exposed.
 AWS_SECURITY_GROUP_NAME = os.getenv('AWS_SECURITY_GROUP_NAME', 'cloudwise-sg')

@@ -39,6 +39,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from collections.abc import Mapping
 from typing import Any
 
 from django.conf import settings
@@ -52,17 +53,44 @@ from botocore.exceptions import (
 
 from ...models import EC2Instance
 from .aws_connection_service import AwsConnectionError, get_session
+from .database_preflight import (
+    STATUS_FAILED,
+    STATUS_SKIPPED,
+    STATUS_SUCCESS,
+    build_preflight_report,
+    build_probe_commands,
+    build_probe_url,
+    classify_backend_start_failure,
+    classify_health_failure,
+    detect_database_dependency,
+    gate_result,
+)
 from .log_service import DeploymentLogService
+# Imported as a module (not by name) so the Atlas Admin API seam stays
+# patchable in tests: patching the function where it is *defined* must
+# change what the deployment calls.
+from . import mongodb_atlas_service
+from .mongodb_atlas_service import (
+    describe_uri_for_deployment,
+    remove_atlas_access_entry,
+)
 from .provider import DeploymentProvider
 from .status import DeploymentStage, DeploymentStatus, is_valid_transition
 
 try:
     from ...services.tech_stack_detector import detect_tech_stack, UnsupportedTechStackError
-    from ...services.deployment_file_generator import analyze_repository
+    from ...services.deployment_file_generator import (
+        analyze_repository,
+        sensitive_deny_block as deployment_file_generator_sensitive_deny_block,
+    )
 except ImportError:
     detect_tech_stack = None
     analyze_repository = None
     UnsupportedTechStackError = None
+
+    def deployment_file_generator_sensitive_deny_block(indent: str = "    ") -> str:
+        """Fallback when the generator module is unavailable."""
+        return ""
 
 # Lifecycle progress mapping for get_status()
 _PROGRESS = {
@@ -87,9 +115,28 @@ _STATE_MAP = {
     "terminated": DeploymentStatus.FAILED,
 }
 
+# Backend service gate: how long to wait for the container to listen. Node
+# drivers default to a 30s server-selection timeout, so two full connection
+# attempts fit inside the window and the resulting error lands in the log
+# tail the gate collects. A backend that listens returns immediately.
+_GATE_ATTEMPTS = 12
+_GATE_INTERVAL_SECONDS = 5
+
 
 class AwsEc2Error(Exception):
-    """Raised when AWS EC2 provisioning / status operations fail."""
+    """
+    Raised when AWS EC2 provisioning / deployment operations fail.
+
+    ``error_code`` is an optional machine-readable diagnosis (for example
+    ``DATABASE_CONNECTION_FAILED`` or ``BACKEND_NOT_RUNNING``) carried to
+    the pipeline. It defaults to ``""`` so every existing
+    ``AwsEc2Error(message)`` call site keeps working unchanged and the
+    pipeline keeps falling back to its generic failure codes.
+    """
+
+    def __init__(self, message: str = "", error_code: str = ""):
+        super().__init__(message)
+        self.error_code = str(error_code or "")
 
 
 class AwsEc2Provider(DeploymentProvider):
@@ -280,6 +327,11 @@ class AwsEc2Provider(DeploymentProvider):
         if row is not None:
             self._persist_logs(row, log.all())
 
+        # MongoDB Atlas Network Access entry is intentionally NOT removed
+        # here: rollback keeps the instance running, so the next deployment
+        # from the same address still needs it. Cleanup runs on termination
+        # (see terminate_instance), where the address is gone for good.
+
         final = DeploymentStatus.ROLLED_BACK
         if is_valid_transition(status, final):
             log.info(
@@ -350,10 +402,32 @@ class AwsEc2Provider(DeploymentProvider):
             raise AwsEc2Error(message) from exc
 
         row = EC2Instance.objects.filter(instance_id=instance_id).first()
+        public_ip = str(getattr(row, "public_ip", "") or "") if row else None
         if row is not None:
             row.status = "terminated"
             row.save(update_fields=["status", "updated_at"])
             self._persist_logs(row, log.all())
+
+        # MongoDB Atlas Network Access cleanup — safe precisely because the
+        # instance is gone: its /32 entry can never be needed again, and
+        # only CloudWise-tagged entries (description prefix) are removed.
+        # Rollback keeps the instance, so its entry is deliberately kept.
+        if public_ip:
+            try:
+                cleanup = remove_atlas_access_entry(
+                    public_ip=public_ip, deployment_id=instance_id
+                )
+            except Exception as cleanup_exc:  # noqa: BLE001
+                log.warning(
+                    DeploymentStage.COMPLETED,
+                    f"Atlas Network Access cleanup skipped: {cleanup_exc}",
+                )
+            else:
+                action = str(cleanup.get("action") or "")
+                message = str(cleanup.get("message") or "")
+                if message:
+                    level = log.warning if action == "failed" else log.info
+                    level(DeploymentStage.COMPLETED, message)
 
         log.info(
             DeploymentStage.COMPLETED,
@@ -601,7 +675,14 @@ class AwsEc2Provider(DeploymentProvider):
                 ssm = self.get_session().client("ssm", region_name=region)
                 self._ensure_ssm_managed(ssm, instance_id, log)
 
-            public_ip = (instance or {}).get("PublicIpAddress") or ""
+            # Stable public address (optional): keeps the instance IP the
+            # same across rebuilds so database network access lists keep
+            # matching. Purely additive — falls back to the dynamic IP.
+            elastic_ip = self._ensure_elastic_ip(ec2, instance_id, log)
+
+            public_ip = (
+                elastic_ip or (instance or {}).get("PublicIpAddress") or ""
+            )
             private_ip = (instance or {}).get("PrivateIpAddress") or ""
             state = ((instance or {}).get("State") or {}).get("Name", "pending")
 
@@ -686,6 +767,7 @@ class AwsEc2Provider(DeploymentProvider):
             "instance_type": instance_type,
             "ami_id": image.get("ImageId", ""),
             "public_ip": public_ip,
+            "elastic_ip": elastic_ip,
             "private_ip": private_ip,
             "security_group_id": sg_id,
             "security_group_name": sg_name,
@@ -750,6 +832,11 @@ class AwsEc2Provider(DeploymentProvider):
         deployment_id = instance_id
         log = self._new_log(deployment_id)
         current = DeploymentStatus.QUEUED
+        # Populated during the run; kept outside the try so the failure and
+        # success paths can always report what actually happened.
+        atlas_access: dict[str, Any] = {}
+        split_health: dict[str, Any] | None = None
+        db_preflight: dict[str, Any] = {}
 
         def advance(to_status: str, stage: str, message: str) -> None:
             nonlocal current
@@ -789,8 +876,43 @@ class AwsEc2Provider(DeploymentProvider):
                     f"(state: {state})."
                 )
             public_ip = instance.get("PublicIpAddress") or ""
+            elastic_ip = self._elastic_ip_for(ec2, instance_id)
+            if elastic_ip:
+                # The Elastic IP is the address actually reachable from
+                # Atlas — always report and allowlist that one.
+                public_ip = elastic_ip
 
             self._ensure_ssm_managed(ssm, instance_id, log)
+
+            # ---- MongoDB Atlas Network Access (additive) ----
+            # The instance now has its final public address, so the /32
+            # entry can be written before the containers start.
+            atlas_access = self._ensure_atlas_network_access(
+                env_vars=env_vars,
+                deployment_id=deployment_id,
+                public_ip=public_ip,
+                log=log,
+            )
+
+            split_plan = self.config.get("deployment_plan") or {}
+            split_plan = (
+                dict(split_plan) if isinstance(split_plan, Mapping) else {}
+            )
+            # Health-check order for split repositories:
+            #   compose services -> backend container -> process -> port
+            #   -> database -> nginx -> /api/health -> frontend -> public URL
+            # The backend gate covers the first four steps; it is SKIPPED for
+            # architectures that do not declare a backend container.
+            backend_gate: dict[str, Any] = {
+                "status": STATUS_SKIPPED,
+                "errorCode": "",
+                "message": "",
+                "diagnostics": "",
+            }
+            try:
+                backend_port = int(split_plan.get("backendPort") or 0)
+            except (TypeError, ValueError):
+                backend_port = 0
 
             if has_docker:
                 # Part 9 — verify (and repair) the Docker bootstrap before
@@ -870,13 +992,18 @@ class AwsEc2Provider(DeploymentProvider):
                     "Container build/start command completed on the instance.",
                 )
 
+                # Apply the uploaded nginx.conf and re-resolve the backend
+                # upstream: a recreated backend container gets a new address
+                # while the running nginx keeps the one it resolved at start.
+                self._refresh_nginx(ssm, instance_id, remote_dir, log)
+
                 # Diagnostics only: do not change the existing deployment
                 # commands, health-check logic, ports, networking, or state
                 # transitions. If the application later fails its health
                 # check, these diagnostics make the real container failure
                 # visible in CloudWise logs.
                 diagnostic_commands = self._build_compose_diagnostic_commands(
-                    remote_dir
+                    remote_dir, backend_port=backend_port or None
                 )
                 try:
                     diagnostic_output = self._run_ssm_commands(
@@ -902,6 +1029,39 @@ class AwsEc2Provider(DeploymentProvider):
                         f"{diagnostic_exc}",
                     )
 
+                # ---- Backend container / port gate ----
+                # The database can only be reached once the process is up and
+                # listening, so this runs before the entry-point probes. It
+                # never invents a failure: when nothing proves the backend is
+                # broken it reports SKIPPED and the existing health check
+                # stays the source of truth.
+                if (
+                    split_plan.get("architecture")
+                    == "separate_frontend_backend"
+                    and backend_port
+                ):
+                    backend_gate = self._check_backend_service(
+                        ssm,
+                        instance_id,
+                        remote_dir,
+                        log,
+                        backend_port=backend_port,
+                        atlas=atlas_access,
+                        public_ip=str(public_ip or ""),
+                    )
+                    gate_status = str(backend_gate.get("status") or "")
+                    if gate_status == STATUS_FAILED:
+                        log.error(
+                            DeploymentStage.DEPLOYING,
+                            str(backend_gate.get("message") or ""),
+                        )
+                    elif gate_status == STATUS_SUCCESS:
+                        log.info(
+                            DeploymentStage.DEPLOYING,
+                            f"Backend container is listening on port "
+                            f"{backend_port}.",
+                        )
+
             # ---- HEALTH_CHECK ----
             app_port = self._detect_app_port()
             split_health: dict[str, Any] | None = None
@@ -911,11 +1071,45 @@ class AwsEc2Provider(DeploymentProvider):
                 "Waiting for the application to become healthy "
                 f"(port {app_port})...",
             )
-            # Prefer an in-instance check (works even when the security
-            # group only exposes 80/443/22), then confirm via public URL.
-            healthy, health_message = self._wait_healthy_on_instance(
-                ssm, instance_id, app_port
-            )
+
+            # ---- Database preflight (additive verification layer) ----
+            # Runs before the deployment may be declared healthy: it checks
+            # that the external database this repository declares is
+            # configured and reachable *from this instance*, and records
+            # what answered on the HTTP entry point so a later failure can
+            # be told apart from a database / backend / nginx problem.
+            # A backend container that never listens short-circuits it: the
+            # database probe would pass (the cluster itself answers) while
+            # the application can never reach it.
+            if str(backend_gate.get("status") or "") == STATUS_FAILED:
+                db_preflight = {
+                    "status": STATUS_FAILED,
+                    "errorCode": str(backend_gate.get("errorCode") or ""),
+                    "message": str(backend_gate.get("message") or ""),
+                }
+            else:
+                db_preflight = self._run_database_preflight(
+                    ssm,
+                    instance_id,
+                    remote_dir,
+                    log,
+                    app_port=app_port,
+                    public_ip=public_ip,
+                )
+
+            if db_preflight.get("status") == "FAILED":
+                # Fail fast with the precise database diagnosis instead of
+                # waiting for an application that can never become healthy.
+                healthy = False
+                health_message = str(
+                    db_preflight.get("message") or "database preflight failed"
+                )
+            else:
+                # Prefer an in-instance check (works even when the security
+                # group only exposes 80/443/22), then confirm via public URL.
+                healthy, health_message = self._wait_healthy_on_instance(
+                    ssm, instance_id, app_port
+                )
             public_ip = public_ip or ""
             if app_port in (80, 443):
                 endpoint_url = f"http://{public_ip}" if public_ip else ""
@@ -940,7 +1134,6 @@ class AwsEc2Provider(DeploymentProvider):
             # is also probed for a backend API path, so a dead/unrouted API
             # is caught here instead of reporting the app as live.
             if healthy:
-                split_plan = self.config.get("deployment_plan") or {}
                 if split_plan.get("architecture") == (
                     "separate_frontend_backend"
                 ):
@@ -987,12 +1180,15 @@ class AwsEc2Provider(DeploymentProvider):
                 # collect the container state/logs now so the user sees the
                 # actual application error (nginx config, frontend build,
                 # backend crash, port binding, etc.) in CloudWise.
+                failure_diagnostics = ""
                 if has_docker:
                     try:
                         failure_diagnostics = self._run_ssm_commands(
                             ssm,
                             instance_id,
-                            self._build_compose_diagnostic_commands(remote_dir),
+                            self._build_compose_diagnostic_commands(
+                                remote_dir, backend_port=backend_port or None
+                            ),
                             log,
                             stage_message="health-check diagnostics",
                             timeout_seconds=120,
@@ -1014,19 +1210,48 @@ class AwsEc2Provider(DeploymentProvider):
                         " Last compose output: "
                         + compose_output.strip()[-500:]
                     )
+
+                # Map the failure onto a precise error code when the probe
+                # data allows it; otherwise the generic health-check failure
+                # is reported exactly as before. The container diagnostics
+                # and the Atlas allowlist report tell EC2/Docker/container
+                # failures apart from a blocked database connection.
+                error_code, diagnosis = classify_health_failure(
+                    health_message=health_message,
+                    split_report=split_health,
+                    preflight=db_preflight,
+                    app_port=app_port,
+                    diagnostics=failure_diagnostics,
+                    atlas=atlas_access,
+                    public_ip=str(public_ip or ""),
+                )
+                if error_code and diagnosis:
+                    if str(error_code).startswith(
+                        ("DATABASE_", "MONGODB_", "EC2_", "DOCKER_")
+                    ) or str(error_code) == "CONTAINER_FAILED":
+                        # The diagnosis already reads as a complete sentence
+                        # (database / infrastructure root cause).
+                        failure_text = str(diagnosis)
+                    else:
+                        failure_text = (
+                            f"Application health check failed: {diagnosis}"
+                        )
+                else:
+                    failure_text = (
+                        f"Application health check failed: {health_message}"
+                    )
+                if not failure_text.endswith((".", "!", "?")):
+                    failure_text += "."
                 log.error(
                     DeploymentStage.FAILED,
-                    f"Application health check failed: {health_message}.{tail}",
+                    f"{failure_text}{tail}",
                 )
                 row = EC2Instance.objects.filter(
                     instance_id=instance_id
                 ).first()
                 if row is not None:
                     self._persist_logs(row, log.all())
-                raise AwsEc2Error(
-                    f"Application health check failed: "
-                    f"{health_message}"
-                )
+                raise AwsEc2Error(failure_text, error_code=error_code)
 
             # ---- RUNNING ----
             advance(
@@ -1049,6 +1274,46 @@ class AwsEc2Provider(DeploymentProvider):
                 self._persist_logs(row, log.all())
             raise AwsEc2Error(message) from exc
 
+        # ---- success reporting: real endpoint, real database status ----
+        plan = self.config.get("deployment_plan")
+        plan = dict(plan) if isinstance(plan, Mapping) else {}
+        health_path = str(plan.get("healthEndpoint") or "")
+        database_report: dict[str, Any] = {"status": "unknown"}
+        backend_answered = bool(
+            ((split_health or {}).get("backend") or {}).get("ok")
+            if isinstance(split_health, Mapping)
+            else False
+        )
+        if plan.get("healthEndpointInjected") and isinstance(
+            split_health, Mapping
+        ):
+            # The injected endpoint returns 200 only while the application
+            # is connected to its database, so this is a real signal.
+            database_report = {
+                "status": "connected" if backend_answered else "unavailable",
+                "verifiedBy": health_path or "/api/health",
+            }
+        elif str(db_preflight.get("verdict") or "") == "reachable":
+            # DNS/TCP only — deliberately not called "connected".
+            database_report = {
+                "status": "reachable",
+                "verifiedBy": "instance probe (DNS + TCP)",
+            }
+        if atlas_access:
+            database_report["atlasAccess"] = {
+                key: atlas_access.get(key)
+                for key in (
+                    "configured",
+                    "action",
+                    "cidr",
+                    "publicIp",
+                    "envVar",
+                    "atlas",
+                    "message",
+                )
+                if key in atlas_access
+            }
+
         row = EC2Instance.objects.filter(instance_id=instance_id).first()
         if row is not None:
             metadata = dict(row.metadata or {})
@@ -1057,6 +1322,9 @@ class AwsEc2Provider(DeploymentProvider):
             metadata["lastDeployLogs"] = log.all()
             if split_health is not None:
                 metadata["health"] = split_health
+            metadata["database"] = database_report
+            if atlas_access:
+                metadata["atlasAccess"] = database_report.get("atlasAccess")
             row.metadata = metadata
             row.save(update_fields=["metadata", "updated_at"])
             self._persist_logs(row, log.all())
@@ -1069,9 +1337,12 @@ class AwsEc2Provider(DeploymentProvider):
             "provider_type": self.PROVIDER_TYPE,
             "endpoint_url": endpoint_url,
             "public_ip": public_ip,
+            "elastic_ip": elastic_ip,
+            "frontend_url": f"http://{public_ip}/" if public_ip else "",
             "region": region,
             "remote_dir": remote_dir,
             "healthy": True,
+            "database": database_report,
             "message": (
                 f"Application containers are live at {endpoint_url}."
             ),
@@ -1079,6 +1350,9 @@ class AwsEc2Provider(DeploymentProvider):
             "file_count": len(files),
             "logs": log.all(),
         }
+        if health_path and public_ip:
+            # Only ever the address this deployment actually reached.
+            result["backend_health_url"] = f"http://{public_ip}{health_path}"
         if split_health is not None:
             # Additive key — never overwrites "status" (the pipeline reads
             # it as the deployment state).
@@ -1391,11 +1665,13 @@ class AwsEc2Provider(DeploymentProvider):
 
     def _build_nginx_config(self, port: int) -> str:
         """Build nginx configuration to serve the app on port 80."""
+        deny = deployment_file_generator_sensitive_deny_block()
         return (
             f"cat > /etc/nginx/sites-available/cloudwise <<'EOF'\n"
             f"server {{\n"
             f"    listen 80;\n"
             f"    server_name _;\n"
+            f"{deny}"
             f"    location / {{\n"
             f"        proxy_pass http://127.0.0.1:{port};\n"
             f"        proxy_set_header Host $host;\n"
@@ -1465,6 +1741,236 @@ class AwsEc2Provider(DeploymentProvider):
                 return True, message
             time.sleep(interval)
         return False, last_message
+
+    # ------------------------------------------------------------------
+    # Database preflight (additive verification layer)
+    # ------------------------------------------------------------------
+
+    def _run_database_preflight(
+        self,
+        ssm,
+        instance_id: str,
+        remote_dir: str,
+        log: DeploymentLogService,
+        *,
+        app_port: int,
+        public_ip: str = "",
+    ) -> dict[str, Any]:
+        """
+        Stage and run the in-instance database / entry-point probe.
+
+        Returns a report dict whose ``status`` is SUCCESS, FAILED or
+        SKIPPED. This helper never raises: a probe that cannot run is
+        reported as SKIPPED and the existing application health check
+        remains the source of truth. Probing localhost (env vars, DNS, TCP
+        port, HTTP entry point) is deliberately conservative — it only
+        fails a deployment on hard evidence such as a missing database
+        environment variable or a refused connection.
+        """
+        plan = self.config.get("deployment_plan")
+        plan = dict(plan) if isinstance(plan, Mapping) else {}
+        files = self.config.get("files")
+        files = dict(files) if isinstance(files, Mapping) else {}
+        env_vars = self.config.get("env_vars")
+        env_vars = dict(env_vars) if isinstance(env_vars, Mapping) else {}
+
+        dependency: dict[str, Any] | None
+        try:
+            dependency = detect_database_dependency(
+                files=files, env_vars=env_vars, plan=plan
+            )
+        except Exception as detection_exc:  # noqa: BLE001
+            dependency = None
+            log.warning(
+                DeploymentStage.HEALTH_CHECK,
+                f"Database dependency detection failed: {detection_exc}",
+            )
+
+        probe_paths = plan.get("apiProbePaths")
+        probe_path = str(probe_paths[0]) if probe_paths else ""
+        proxy_url = build_probe_url(app_port, probe_path)
+
+        try:
+            commands = build_probe_commands(
+                dependency,
+                env_file=f"{remote_dir}/.env",
+                proxy_url=proxy_url,
+            )
+            output = (
+                self._run_ssm_commands(
+                    ssm,
+                    instance_id,
+                    commands,
+                    log,
+                    stage_message="database preflight",
+                    timeout_seconds=120,
+                )
+                if commands
+                else ""
+            )
+        except Exception as probe_exc:  # noqa: BLE001
+            log.warning(
+                DeploymentStage.HEALTH_CHECK,
+                f"Database preflight could not run on {instance_id}: "
+                f"{probe_exc}",
+            )
+            return build_preflight_report(
+                dependency=dependency,
+                probe_output="",
+                public_ip=public_ip,
+            )
+
+        report = build_preflight_report(
+            dependency=dependency,
+            probe_output=output,
+            public_ip=public_ip,
+        )
+        message = str(report.get("message") or "")
+        if not message:
+            return report
+        if report.get("status") == "FAILED":
+            log.error(DeploymentStage.HEALTH_CHECK, message)
+        else:
+            log.info(DeploymentStage.HEALTH_CHECK, message)
+        return report
+
+    def _backend_gate_commands(self, remote_dir: str, port: int) -> list[str]:
+        """
+        One read-only command that waits for the backend to listen on port.
+
+        Health-check order for a split repository is
+        compose services -> container running -> process -> port listening ->
+        database -> nginx -> /api/health -> frontend -> public URL; this
+        command covers everything up to "port listening". The whole wait runs
+        inside a single SSM command (no shell state is shared between
+        commands) and never starts, stops, rebuilds or removes a container.
+
+        Output::
+
+            CLOUDWISE_CONTAINER service=backend status=running restarts=1 exit=0
+            ...
+            CLOUDWISE_GATE_RESULT listening|exited|dead|created|crashloop|
+                                     starting|no_backend_container|no_compose
+            === CLOUDWISE BACKEND LOGS (TAIL 40) ===
+            === CLOUDWISE ERROR LINES (TAIL 40) ===
+
+        The log tail matters: the database error that explains a container
+        that never listens is only visible in the container's own output.
+        """
+        script = self._backend_listening_command_body(port)
+        return [
+            (
+                f"cd '{remote_dir}'; "
+                "if docker compose version >/dev/null 2>&1; then "
+                "C='docker compose'; "
+                "elif command -v docker-compose >/dev/null 2>&1; then "
+                "C='docker-compose'; else C=''; fi; "
+                "if [ -z \"$C\" ]; then "
+                "echo 'CLOUDWISE_GATE_RESULT no_compose'; exit 0; fi; "
+                "cid=$($C ps -aq backend 2>/dev/null | head -n 1); "
+                "if [ -z \"$cid\" ]; then "
+                "cid=$($C ps -q backend 2>/dev/null | head -n 1); fi; "
+                "if [ -z \"$cid\" ]; then "
+                "echo 'CLOUDWISE_GATE_RESULT no_backend_container'; "
+                "exit 0; fi; "
+                f"listen() {{ docker exec \"$cid\" sh -c '{script}' sh {port} "
+                ">/dev/null 2>&1; }; "
+                "verdict=starting; i=0; "
+                f"while [ \"$i\" -lt {_GATE_ATTEMPTS} ]; do "
+                "if listen; then verdict=listening; break; fi; "
+                "st=$(docker inspect -f '{{.State.Status}}' \"$cid\" "
+                "2>/dev/null || echo unknown); "
+                "rs=$(docker inspect -f '{{.RestartCount}}' \"$cid\" "
+                "2>/dev/null || echo 0); "
+                "ex=$(docker inspect -f '{{.State.ExitCode}}' \"$cid\" "
+                "2>/dev/null || echo 0); "
+                "echo \"CLOUDWISE_CONTAINER service=backend status=$st "
+                "restarts=$rs exit=$ex\"; "
+                "case \"$st\" in exited|dead|created) verdict=$st; "
+                "break;; esac; "
+                "if [ \"$rs\" -ge 2 ] 2>/dev/null; then "
+                "verdict=crashloop; break; fi; "
+                f"i=$((i+1)); sleep {_GATE_INTERVAL_SECONDS}; "
+                "done; "
+                "echo \"CLOUDWISE_GATE_RESULT $verdict\"; "
+                "echo '=== CLOUDWISE BACKEND LOGS (TAIL 40) ==='; "
+                "$C logs --no-color --tail=40 backend 2>&1 || true; "
+                "echo '=== CLOUDWISE ERROR LINES (TAIL 40) ==='; "
+                "$C logs --no-color --tail=400 2>&1 | "
+                "grep -iE 'error|exception|fatal|failed|refused|whitelist|"
+                "allowlist' | tail -n 40 || true"
+            )
+        ]
+
+    def _check_backend_service(
+        self,
+        ssm,
+        instance_id: str,
+        remote_dir: str,
+        log: DeploymentLogService,
+        *,
+        backend_port: int,
+        atlas: Mapping[str, Any] | None,
+        public_ip: str,
+    ) -> dict[str, Any]:
+        """
+        Verify that the backend container is running and listening.
+
+        Returns ``{"status": SUCCESS|FAILED|SKIPPED, "errorCode", "message",
+        "diagnostics"}`` and never raises: evidence that cannot be collected
+        (mocked SSM, no compose, a differently named service) leaves the
+        existing health check in charge. A deployment is only failed here on
+        positive evidence — a dead container, a crash loop, or a database
+        error in the logs.
+        """
+        report: dict[str, Any] = {
+            "status": STATUS_SKIPPED,
+            "errorCode": "",
+            "message": "",
+            "diagnostics": "",
+        }
+        try:
+            output = self._run_ssm_commands(
+                ssm,
+                instance_id,
+                self._backend_gate_commands(remote_dir, backend_port),
+                log,
+                stage_message="backend service gate",
+                timeout_seconds=max(settings.AWS_SSM_TIMEOUT_SECONDS, 180),
+            )
+        except Exception as gate_exc:  # noqa: BLE001 — never block a deploy
+            log.warning(
+                DeploymentStage.HEALTH_CHECK,
+                f"Backend service gate could not run: {gate_exc}",
+            )
+            return report
+
+        report["diagnostics"] = output or ""
+        verdict = gate_result(output or "")
+        if verdict == "listening":
+            report["status"] = STATUS_SUCCESS
+            return report
+        if verdict in ("no_compose", "no_backend_container"):
+            log.info(
+                DeploymentStage.HEALTH_CHECK,
+                f"Backend service gate skipped ({verdict}); the health "
+                "check remains the source of truth.",
+            )
+            return report
+
+        code, message = classify_backend_start_failure(
+            output,
+            atlas=atlas,
+            public_ip=public_ip,
+            backend_port=backend_port,
+        )
+        if not code or not message:
+            # No proof of a failure — a slow start is not an error.
+            return report
+        report.update(
+            {"status": STATUS_FAILED, "errorCode": code, "message": message}
+        )
+        return report
 
     def _wait_healthy_on_instance(
         self, ssm, instance_id: str, port: int
@@ -1858,6 +2364,312 @@ class AwsEc2Provider(DeploymentProvider):
             f"{instance_id}. Waiting for SSM agent to register…",
         )
 
+    # ------------------------------------------------------------------
+    # Optional stable public address (Elastic IP)
+    # ------------------------------------------------------------------
+
+    def _elastic_ip_enabled(self) -> bool:
+        """AWS_USE_ELASTIC_IP setting, with a per-deployment override."""
+        if "use_elastic_ip" in self.config:
+            return bool(self.config.get("use_elastic_ip"))
+        return bool(getattr(settings, "AWS_USE_ELASTIC_IP", True))
+
+    @staticmethod
+    def _is_ipv4(value: object) -> bool:
+        text = str(value or "")
+        parts = text.split(".")
+        if len(parts) != 4:
+            return False
+        try:
+            return all(0 <= int(part) <= 255 for part in parts)
+        except ValueError:
+            return False
+
+    def _ensure_elastic_ip(
+        self, ec2, instance_id: str, log: DeploymentLogService
+    ) -> str:
+        """
+        Best-effort stable public IP for a CloudWise-managed instance.
+
+        A rebuilt instance normally gets a *new* public IP, which is exactly
+        what makes a database's network access list (MongoDB Atlas Network
+        Access, Neon IP allowlist, ...) stop matching. An Elastic IP keeps
+        the address stable across rebuilds.
+
+        Order: the address already attached to the instance, then a free
+        CloudWise-tagged address, then a new allocation. Every failure is
+        logged as a warning and the deployment continues with the dynamic
+        public IP — an address the role cannot grant must never fail a
+        deployment.
+        """
+        if not self._elastic_ip_enabled():
+            return ""
+
+        def _tag(address: dict, key: str) -> str:
+            for tag in address.get("Tags") or []:
+                if isinstance(tag, dict) and tag.get("Key") == key:
+                    return str(tag.get("Value") or "")
+            return ""
+
+        def _addresses(filters: list[dict]) -> list[dict]:
+            response = ec2.describe_addresses(Filters=filters)
+            if not isinstance(response, dict):
+                return []
+            addresses = response.get("Addresses")
+            if not isinstance(addresses, list):
+                return []
+            return [item for item in addresses if isinstance(item, dict)]
+
+        owner = str(getattr(self.user, "id", "") or "")
+
+        try:
+            attached = _addresses(
+                [{"Name": "instance-id", "Values": [instance_id]}]
+            )
+            for address in attached:
+                public_ip = str(address.get("PublicIp") or "")
+                if self._is_ipv4(public_ip):
+                    log.info(
+                        DeploymentStage.PREPARING,
+                        f"Instance {instance_id} already uses Elastic IP "
+                        f"{public_ip} (stable address kept).",
+                    )
+                    return public_ip
+
+            reusable = [
+                address
+                for address in _addresses(
+                    [{"Name": "tag:ManagedBy", "Values": ["CloudWise"]}]
+                )
+                if self._is_ipv4(address.get("PublicIp"))
+                and not address.get("InstanceId")
+                and _tag(address, "Owner") in ("", owner)
+            ]
+            for address in reusable:
+                public_ip = str(address.get("PublicIp") or "")
+                try:
+                    ec2.associate_address(
+                        AllocationId=str(address.get("AllocationId") or ""),
+                        InstanceId=instance_id,
+                    )
+                except Exception:  # noqa: BLE001 — try the next candidate
+                    continue
+                log.info(
+                    DeploymentStage.PREPARING,
+                    f"Reused free CloudWise Elastic IP {public_ip} for "
+                    f"instance {instance_id}.",
+                )
+                return public_ip
+
+            allocation = ec2.allocate_address(Domain="vcap")
+            if not isinstance(allocation, dict):
+                return ""
+            public_ip = str(allocation.get("PublicIp") or "")
+            allocation_id = str(allocation.get("AllocationId") or "")
+            if not self._is_ipv4(public_ip):
+                return ""
+            if allocation_id:
+                try:
+                    tags = [{"Key": "ManagedBy", "Value": "CloudWise"}]
+                    if owner:
+                        tags.append({"Key": "Owner", "Value": str(owner)})
+                    ec2.create_tags(Resources=[allocation_id], Tags=tags)
+                except Exception:  # noqa: BLE001 — tagging is cosmetic
+                    pass
+            try:
+                if allocation_id:
+                    ec2.associate_address(
+                        AllocationId=allocation_id, InstanceId=instance_id
+                    )
+                else:
+                    ec2.associate_address(
+                        PublicIp=public_ip, InstanceId=instance_id
+                    )
+            except Exception as association_exc:
+                if allocation_id:
+                    try:
+                        ec2.release_address(AllocationId=allocation_id)
+                    except Exception:  # noqa: BLE001 — best effort only
+                        pass
+                raise association_exc
+            log.info(
+                DeploymentStage.PREPARING,
+                f"Allocated and associated Elastic IP {public_ip} with "
+                f"instance {instance_id} (stable address for database "
+                "network access lists).",
+            )
+            return public_ip
+        except Exception as exc:  # noqa: BLE001 — never block a deployment
+            log.warning(
+                DeploymentStage.PREPARING,
+                f"Elastic IP could not be attached to {instance_id} "
+                f"({exc}). Continuing with the instance's dynamic public "
+                "IP; grant ec2:AllocateAddress / ec2:AssociateAddress to "
+                "keep the address stable across rebuilds.",
+            )
+            return ""
+
+    def _elastic_ip_for(self, ec2, instance_id: str) -> str:
+        """Public IP currently attached as an Elastic IP, else ``""``."""
+        try:
+            response = ec2.describe_addresses(
+                Filters=[{"Name": "instance-id", "Values": [instance_id]}]
+            )
+        except Exception:  # noqa: BLE001 — optional permission / not an EIP
+            return ""
+        addresses = response.get("Addresses") if isinstance(response, dict) else None
+        for address in addresses or []:
+            if not isinstance(address, dict):
+                continue
+            public_ip = str(address.get("PublicIp") or "")
+            if self._is_ipv4(public_ip):
+                return public_ip
+        return ""
+
+    def _ensure_atlas_network_access(
+        self,
+        *,
+        env_vars: Mapping[str, Any],
+        deployment_id: str,
+        public_ip: str,
+        log: DeploymentLogService,
+    ) -> dict[str, Any]:
+        """
+        Allowlist this instance's ``/32`` address on MongoDB Atlas.
+
+        Runs once the instance has a public address and *before* the
+        containers start, so the application's first connection attempt
+        already sees the entry. Additive and non-blocking: when the Atlas
+        Admin API credentials are not configured (or fail), the deployment
+        continues and the database preflight / health check reports the
+        precise "MongoDB Atlas Network Access must allow the EC2 public IP"
+        failure instead of a bare health-check error.
+        """
+        files = self.config.get("files")
+        files = dict(files) if isinstance(files, Mapping) else {}
+        try:
+            uri_info = describe_uri_for_deployment(env_vars, files=files)
+        except Exception as exc:  # noqa: BLE001 — detection never blocks deploy
+            uri_info = {"envVar": "", "atlas": False, "uriAvailable": False}
+            log.warning(
+                DeploymentStage.PREPARING,
+                f"Database connection-string inspection skipped: {exc}",
+            )
+
+        report: dict[str, Any] = {
+            **uri_info,
+            "publicIp": str(public_ip or ""),
+            "configured": False,
+            "action": "skipped",
+            "message": "",
+        }
+        if not uri_info.get("atlas"):
+            report["message"] = (
+                "No MongoDB Atlas connection string detected — Atlas "
+                "allowlisting not required."
+            )
+            return report
+
+        if not getattr(settings, "MONGODB_ATLAS_AUTO_ALLOWLIST", True):
+            report.update(
+                action="disabled",
+                configured=False,
+                message=(
+                    "Automatic Atlas allowlisting is disabled "
+                    "(MONGODB_ATLAS_AUTO_ALLOWLIST=false). Allow "
+                    f"{public_ip}/32 in MongoDB Atlas Network Access."
+                ),
+            )
+            log.info(
+                DeploymentStage.PREPARING,
+                report["message"],
+            )
+            return report
+
+        try:
+            result = mongodb_atlas_service.ensure_atlas_access_entry(
+                public_ip=public_ip, deployment_id=deployment_id
+            )
+        except Exception as exc:  # noqa: BLE001 — never block a deployment
+            result = {
+                "configured": False,
+                "action": "failed",
+                "cidr": f"{public_ip}/32" if public_ip else "",
+                "message": f"MongoDB Atlas allowlisting failed: {exc}",
+            }
+        report.update(
+            {
+                key: value
+                for key, value in dict(result).items()
+                if key not in uri_info
+            }
+        )
+        message = str(report.get("message") or "")
+        action = str(report.get("action") or "")
+        level = log.info if action in ("added", "exists", "updated") else log.warning
+        level(
+            DeploymentStage.PREPARING,
+            message or f"Atlas Network Access action: {action}.",
+        )
+        if not report.get("configured"):
+            # Never pretend the address was allowlisted.
+            log.warning(
+                DeploymentStage.PREPARING,
+                "MongoDB Atlas API credentials are not configured "
+                "(MONGODB_ATLAS_PUBLIC_KEY / MONGODB_ATLAS_PRIVATE_KEY / "
+                "MONGODB_ATLAS_PROJECT_ID): CloudWise did not modify Atlas "
+                "Network Access.",
+            )
+        return report
+
+    def _nginx_refresh_commands(self, remote_dir: str) -> list[str]:
+        """Reload/restart the router so upstreams resolve current IPs."""
+        return [
+            f"cd '{remote_dir}'",
+            (
+                "if docker compose version >/dev/null 2>&1; then C='docker compose'; "
+                "elif command -v docker-compose >/dev/null 2>&1; then "
+                "C='docker-compose'; else C=''; fi; "
+                "if [ -n \"$C\" ]; then "
+                "$C exec -T nginx nginx -s reload 2>/dev/null || "
+                "$C restart nginx 2>/dev/null || true; "
+                "else echo 'compose unavailable; nginx not refreshed'; fi"
+            ),
+        ]
+
+    def _refresh_nginx(
+        self, ssm, instance_id: str, remote_dir: str, log: DeploymentLogService
+    ) -> None:
+        """
+        Apply the uploaded nginx.conf and re-resolve the backend upstream.
+
+        Docker assigns a new address whenever a container is recreated while
+        nginx keeps running, which turns ``proxy_pass http://backend:5000``
+        into a connection refused against a dead address. Reloading nginx
+        right after ``docker compose up`` re-reads the config and the DNS
+        name, so the router always points at the current container.
+        """
+        try:
+            self._run_ssm_commands(
+                ssm,
+                instance_id,
+                self._nginx_refresh_commands(remote_dir),
+                log,
+                stage_message="nginx configuration refresh",
+                timeout_seconds=120,
+            )
+            log.info(
+                DeploymentStage.DEPLOYING,
+                "Router nginx reloaded so /api upstreams use the current "
+                "backend container address.",
+            )
+        except Exception as exc:  # noqa: BLE001 — diagnostics-grade step
+            log.warning(
+                DeploymentStage.DEPLOYING,
+                f"nginx refresh skipped ({exc}); the health check remains "
+                "the source of truth.",
+            )
+
     @staticmethod
     def _safe_rel_path(path: str) -> str:
         """Normalize a repo-relative path and refuse traversal escapes."""
@@ -2002,27 +2814,152 @@ class AwsEc2Provider(DeploymentProvider):
         )
         return version
 
-    def _build_compose_diagnostic_commands(self, remote_dir: str) -> list[str]:
+    def _build_compose_diagnostic_commands(
+        self, remote_dir: str, backend_port: int | None = None
+    ) -> list[str]:
         """
         Collect read-only Docker/network diagnostics after compose startup.
 
         This method intentionally does not start, stop, rebuild, remove, or
         modify containers. It exists only to make application failures
         actionable when the existing health check returns HTTP 000.
+
+        Two things make the output usable for a *diagnosis*:
+
+        * per-service log tails — a single ``docker compose logs`` dump is
+          dominated by frontend/nginx access lines and hides the one backend
+          error that explains the failure;
+        * machine-readable container-state markers
+          (``CLOUDWISE_CONTAINER service=... status=... restarts=...``) —
+          ``docker compose ps`` only prints human text, which the failure
+          classifier cannot read reliably.
+
+        Section order matters: the collected output is truncated to its last
+        8000 characters, so the markers and the error lines come last.
         """
-        return [
+        compose_selector = (
+            "if docker compose version >/dev/null 2>&1; then C='docker compose'; "
+            "elif command -v docker-compose >/dev/null 2>&1; then "
+            "C='docker-compose'; else C=''; fi; "
+        )
+
+        def _service_logs(service: str, tail: int) -> str:
+            return (
+                compose_selector
+                + f"if [ -n \"$C\" ]; then "
+                + f"$C logs --no-color --tail={tail} {service} 2>&1 "
+                + "|| true; "
+                + "else echo 'docker compose not installed'; fi"
+            )
+
+        container_state = (
+            compose_selector
+            + "if [ -z \"$C\" ]; then echo 'docker compose not installed'; else "
+            "ids=$($C ps -aq 2>/dev/null || $C ps -q 2>/dev/null); "
+            "for id in $ids; do docker inspect -f "
+            "'CLOUDWISE_CONTAINER service={{index .Config.Labels "
+            "\"com.docker.compose.service\"}} status={{.State.Status}} "
+            "restarts={{.RestartCount}} exit={{.State.ExitCode}}' "
+            "\"$id\" 2>/dev/null || true; done; fi"
+        )
+
+        error_lines = (
+            compose_selector
+            + "if [ -n \"$C\" ]; then "
+            "$C logs --no-color --tail=400 2>&1 | "
+            "grep -iE 'error|exception|fatal|failed|refused|whitelist|allowlist' | "
+            "tail -n 40 || true; else echo 'docker compose not installed'; fi"
+        )
+
+        commands = [
             f"cd '{remote_dir}'",
             "echo '=== CLOUDWISE DOCKER COMPOSE STATUS ==='",
-            "if docker compose version >/dev/null 2>&1; then docker compose ps -a || true; elif command -v docker-compose >/dev/null 2>&1; then docker-compose ps -a || true; else echo 'docker compose not installed'; fi",
+            (
+                "if docker compose version >/dev/null 2>&1; then "
+                "docker compose ps -a || true; "
+                "elif command -v docker-compose >/dev/null 2>&1; then "
+                "docker-compose ps -a || true; else "
+                "echo 'docker compose not installed'; fi"
+            ),
             "echo '=== CLOUDWISE DOCKER CONTAINERS ==='",
-            "docker ps -a --no-trunc || true",
-            "echo '=== CLOUDWISE COMPOSE LOGS (TAIL 150) ==='",
-            "if docker compose version >/dev/null 2>&1; then docker compose logs --tail=150 2>&1 || true; elif command -v docker-compose >/dev/null 2>&1; then docker-compose logs --tail=150 2>&1 || true; else echo 'docker compose not installed'; fi",
+            (
+                "docker ps -a --format "
+                "'{{.Names}} | {{.Status}} | {{.Image}}' || true"
+            ),
             "echo '=== CLOUDWISE LISTENING PORTS ==='",
-            "ss -lntp 2>/dev/null || true",
+            "ss -lntp 2>/dev/null | head -n 20 || true",
             "echo '=== CLOUDWISE LOCAL HTTP CHECK :80 ==='",
-            "curl -sS -o /dev/null -w 'HTTP %{http_code}\n' --max-time 10 http://127.0.0.1:80/ 2>&1 || true",
+            (
+                "curl -sS -o /dev/null -w 'HTTP %{http_code}\\n' --max-time 10 "
+                "http://127.0.0.1:80/ 2>&1 || true"
+            ),
+            "echo '=== CLOUDWISE NGINX LOGS (TAIL 15) ==='",
+            _service_logs("nginx", 15),
+            "echo '=== CLOUDWISE FRONTEND LOGS (TAIL 25) ==='",
+            _service_logs("frontend", 25),
+            "echo '=== CLOUDWISE BACKEND LOGS (TAIL 40) ==='",
+            _service_logs("backend", 40),
+            "echo '=== CLOUDWISE ERROR LINES (TAIL 40) ==='",
+            error_lines,
         ]
+        if backend_port:
+            commands.extend([
+                f"echo '=== CLOUDWISE BACKEND LISTENING :{backend_port} ==='",
+                self._backend_listening_commands(backend_port),
+            ])
+        commands.extend([
+            "echo '=== CLOUDWISE CONTAINER STATE ==='",
+            container_state,
+        ])
+        return commands
+
+    @staticmethod
+    def _backend_listening_command_body(port: int) -> str:
+        """Shell fragment: does the ``backend`` container listen on ``port``?"""
+        script = (
+            'p="$1"; '
+            "if command -v ss >/dev/null 2>&1; then "
+            'ss -lnt | grep -q ":$p "; exit $?; fi; '
+            "if command -v netstat >/dev/null 2>&1; then "
+            'netstat -lnt | grep -q ":$p "; exit $?; fi; '
+            'h=$(printf "%04x" "$p"); '
+            'grep -qi ":$h " /proc/net/tcp /proc/net/tcp6 2>/dev/null'
+        )
+        return script
+
+    def _backend_listening_commands(self, port: int) -> str:
+        """
+        One self-contained command that reports whether the backend container
+        is accepting connections on its *internal* port.
+
+        The port check runs inside the container (netstat/ss when present,
+        ``/proc/net/tcp`` otherwise) because no runtime image guarantees a
+        network tool, and the answer is printed as a marker so the failure
+        classifier can read it.
+        """
+        script = self._backend_listening_command_body(port)
+        return (
+            "if docker compose version >/dev/null 2>&1; then "
+            "C='docker compose'; "
+            "elif command -v docker-compose >/dev/null 2>&1; then "
+            "C='docker-compose'; else C=''; fi; "
+            "if [ -z \"$C\" ]; then "
+            f"echo 'CLOUDWISE_BACKEND_LISTENING port={port} result=no_compose'; "
+            "else "
+            f"cid=$($C ps -aq backend 2>/dev/null | head -n 1); "
+            "if [ -z \"$cid\" ]; then "
+            f"cid=$($C ps -q backend 2>/dev/null | head -n 1); fi; "
+            "if [ -z \"$cid\" ]; then "
+            f"echo 'CLOUDWISE_BACKEND_LISTENING port={port} "
+            "result=no_backend_container'; "
+            f"elif docker exec \"$cid\" sh -c '{script}' sh {port} "
+            ">/dev/null 2>&1; then "
+            f"echo 'CLOUDWISE_BACKEND_LISTENING port={port} result=yes'; "
+            "else "
+            f"echo 'CLOUDWISE_BACKEND_LISTENING port={port} result=no'; "
+            "fi; fi"
+        )
+
 
     def _build_compose_commands(self, remote_dir: str) -> list[str]:
         """
@@ -2043,9 +2980,15 @@ class AwsEc2Provider(DeploymentProvider):
         """
         compose_start = (
             "set +e; "
+            # Recreate this project's containers from scratch so a previous
+            # run's stopped/recreated containers never linger next to the new
+            # ones. `down` is scoped to the compose project in this directory
+            # (never the whole host), so other deployments are untouched.
             "if docker compose version >/dev/null 2>&1; then "
+            "  docker compose down --remove-orphans >/dev/null 2>&1; "
             "  docker compose up -d --build; rc=$?; "
             "elif command -v docker-compose >/dev/null 2>&1; then "
+            "  docker-compose down --remove-orphans >/dev/null 2>&1; "
             "  docker-compose up -d --build; rc=$?; "
             "else "
             "  echo 'docker compose not installed' >&2; rc=127; "

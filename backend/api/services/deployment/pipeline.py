@@ -613,7 +613,9 @@ def run_pipeline(deployment_id: str, payload: dict) -> None:
             deployment_id,
             DeploymentStage.DEPLOYING,
             f"Deploy: {exc}",
-            error_code="DEPLOY_FAILED",
+            # A specific diagnosis from the provider (database / backend /
+            # nginx / frontend) wins over the generic deploy failure code.
+            error_code=getattr(exc, "error_code", "") or "DEPLOY_FAILED",
         )
         return
     except Exception as exc:  # noqa: BLE001 — never leave a record stuck
@@ -649,6 +651,20 @@ def run_pipeline(deployment_id: str, payload: dict) -> None:
     health_report = deploy_result.get("health")
     if isinstance(health_report, dict):
         specs["health"] = health_report
+    # Real endpoint + database facts from the provider (never fabricated:
+    # every value below comes from a probe that actually answered).
+    for key, spec_key in (
+        ("frontend_url", "frontendUrl"),
+        ("backend_health_url", "backendHealthUrl"),
+        ("elastic_ip", "elasticIp"),
+        ("public_ip", "publicIp"),
+    ):
+        value = deploy_result.get(key)
+        if isinstance(value, str) and value:
+            specs[spec_key] = value
+    database_report = deploy_result.get("database")
+    if isinstance(database_report, dict) and database_report:
+        specs["database"] = database_report
     DeploymentRecord.objects.filter(pk=deployment_id).update(
         live_url=live_url or None,
         ip_address=endpoint_ip or public_ip or None,
@@ -658,8 +674,12 @@ def run_pipeline(deployment_id: str, payload: dict) -> None:
         updated_at=timezone.now(),
     )
 
+    database_status = str(
+        (database_report or {}).get("status") if isinstance(database_report, dict) else ""
+    )
     final_message = (
         f"Deployment {final_status}: application live at {live_url}."
+        + (f" Database: {database_status}." if database_status else "")
         if live_url
         else f"Deployment {final_status} on instance {instance_id}."
     )

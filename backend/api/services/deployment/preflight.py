@@ -21,6 +21,7 @@ import logging
 
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
+from django.conf import settings
 
 from .aws_permissions import get_cloudwise_permissions_policy
 from .log_service import sanitize_message
@@ -68,6 +69,7 @@ def _check(
     *,
     critical: bool = True,
     remedy: str = "",
+    optional: bool = False,
 ) -> dict:
     """
     Run one AWS probe and normalise the outcome.
@@ -75,6 +77,10 @@ def _check(
     ``ok`` is True when the call succeeded, False when it was denied and
     None when the probe could not be evaluated (so it never blocks a
     deployment it cannot judge).
+
+    ``optional`` marks a nice-to-have capability: even when the call is
+    denied the check reports ``ok: None`` with ``critical: False`` so the
+    deployment still proceeds on the fallback path.
     """
     try:
         detail = fn()
@@ -101,6 +107,20 @@ def _check(
                 "remedy": remedy,
             }
         denied = code in _DENIED_CODES
+        if optional and denied:
+            return {
+                "key": key,
+                "label": label,
+                "action": action,
+                "ok": None,
+                "critical": False,
+                "code": code,
+                "detail": sanitize_message(
+                    f"{action} not available ({code}); continuing without "
+                    "this optional capability."
+                )[:300],
+                "remedy": remedy,
+            }
         return {
             "key": key,
             "label": label,
@@ -209,6 +229,34 @@ def verify_permissions(connection, credentials: dict | None = None, region: str 
             remedy="Attach the CloudWise permissions policy to your role.",
         )
     )
+
+    # Optional: a stable public IP (Elastic IP) keeps the instance address
+    # the same across rebuilds so a database network access list keeps
+    # matching. Probed read-only; a denied role simply falls back to the
+    # dynamic public IP, so this check must never block a deployment.
+    if getattr(settings, "AWS_USE_ELASTIC_IP", True):
+
+        def _elastic_ips() -> str:
+            response = ec2.describe_addresses()
+            count = len(response.get("Addresses") or [])
+            return f"{count} Elastic IP address(es) visible"
+
+        checks.append(
+            _check(
+                "elastic_ip",
+                "Stable public IP (Elastic IP)",
+                "ec2:DescribeAddresses",
+                _elastic_ips,
+                critical=False,
+                optional=True,
+                remedy=(
+                    "Optional: add ec2:DescribeAddresses, ec2:AllocateAddress, "
+                    "ec2:AssociateAddress, ec2:DisassociateAddress and "
+                    "ec2:ReleaseAddress to your role to keep the public IP "
+                    "stable across rebuilds (recommended for databases)."
+                ),
+            )
+        )
 
     # 2 — resolve the AMI the pipeline will launch (also proves DescribeImages
     #      and the SSM public parameter read the policy grants).
