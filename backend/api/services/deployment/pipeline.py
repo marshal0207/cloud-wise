@@ -16,6 +16,12 @@ instead of a timer.
 By default the pipeline runs on a daemon thread so the HTTP request
 returns immediately. Set ``DEPLOYMENT_RUN_INLINE = True`` (used by the
 test suite) to run it synchronously in the request thread.
+
+Lifecycle rule: this pipeline never stops or terminates EC2. A
+successful run ends at ``RUNNING`` with the instance left running, and
+the record stays RUNNING until the user explicitly stops
+(``POST /deployments/<id>/stop``) or destroys
+(``POST /deployments/<id>/terminate``) the deployment.
 """
 
 from __future__ import annotations
@@ -29,6 +35,7 @@ from django.utils import timezone
 from ...models import AWSConnection, DeploymentRecord, Project
 from .aws_connection_service import AwsConnectionError, assume_role_credentials
 from .aws_ec2_provider import AwsEc2Error, AwsEc2Provider
+from .lifecycle import deployment_worker
 from .log_service import make_log_entry, sanitize_message
 from .status import (
     DeploymentStage,
@@ -132,6 +139,43 @@ def set_status(
     """
     record = DeploymentRecord.objects.filter(pk=deployment_id).first()
     if record is None:
+        return False
+
+    # ------------------------------------------------------------------
+    # Lifecycle safety: a background worker may never destroy a healthy
+    # deployment. RUNNING -> TERMINATED is only reachable after an
+    # explicit stop (cancel_requested is set by POST
+    # /deployments/<id>/stop) or an explicit destroy. A stale cleanup,
+    # finally block or late worker write is logged as an error and
+    # refused instead of being applied.
+    # ------------------------------------------------------------------
+    if (
+        record.deployment_status != to_status
+        and record.deployment_status == DeploymentStatus.RUNNING
+        and to_status == DeploymentStatus.TERMINATED
+        and not record.cancel_requested
+    ):
+        logger.error(
+            "Refused automatic deployment %s transition RUNNING -> "
+            "TERMINATED (%s): no explicit stop/destroy was requested. "
+            "A successful deployment keeps its EC2 instance running.",
+            deployment_id,
+            message,
+        )
+        return False
+
+    # A stopped deployment is frozen: the pipeline winding down after an
+    # explicit stop must not move it to TERMINATED/FAILED or re-run it.
+    if (
+        record.deployment_status != to_status
+        and record.deployment_status == DeploymentStatus.STOPPED
+    ):
+        logger.warning(
+            "Refused deployment %s transition STOPPED -> %s: %s",
+            deployment_id,
+            to_status,
+            message,
+        )
         return False
 
     values: dict = {"updated_at": timezone.now()}
@@ -245,7 +289,10 @@ class RecordLogStream:
         record = DeploymentRecord.objects.filter(pk=self.deployment_id).first()
         if record is None:
             return
-        if record.deployment_status == DeploymentStatus.TERMINATED:
+        if record.deployment_status in (
+            DeploymentStatus.TERMINATED,
+            DeploymentStatus.STOPPED,
+        ):
             # Frozen by a user stop — a winding-down pipeline must not
             # keep appending progress to a stopped deployment.
             return
@@ -293,7 +340,10 @@ def append_log(
     record = DeploymentRecord.objects.filter(pk=deployment_id).first()
     if record is None:
         return
-    if record.deployment_status == DeploymentStatus.TERMINATED:
+    if record.deployment_status in (
+        DeploymentStatus.TERMINATED,
+        DeploymentStatus.STOPPED,
+    ):
         return
     message = sanitize_message(message)
     logs = list(record.logs or [])
@@ -319,8 +369,8 @@ def fail_deployment(
     """
     Record a terminal failure with an understandable, stage-tagged message.
 
-    A deployment the user already stopped (TERMINATED) is never
-    overwritten with FAILED — the stop wins (Part 14).
+    A deployment the user already stopped (TERMINATED or STOPPED) is
+    never overwritten with FAILED — the stop wins (Part 14).
     """
     record = DeploymentRecord.objects.filter(pk=deployment_id).first()
     if record is None:
@@ -334,7 +384,12 @@ def fail_deployment(
     ):
         logs.append(make_log_entry(stage, message, level="ERROR"))
 
-    if record.deployment_status == DeploymentStatus.TERMINATED:
+    if record.deployment_status in (
+        DeploymentStatus.TERMINATED,
+        DeploymentStatus.STOPPED,
+    ):
+        # An explicitly stopped deployment is frozen: the failure log is
+        # kept for diagnostics, but the status is never overwritten.
         DeploymentRecord.objects.filter(pk=deployment_id).update(
             logs=logs, updated_at=timezone.now()
         )
@@ -378,7 +433,20 @@ def start_pipeline(deployment_id: str, payload: dict) -> None:
 
 
 def run_pipeline(deployment_id: str, payload: dict) -> None:
-    """Execute the real AWS deployment for one DeploymentRecord."""
+    """
+    Execute the real AWS deployment for one DeploymentRecord.
+
+    The whole run executes inside the deployment-worker marker: the
+    provider refuses EC2 TerminateInstances issued from this background
+    worker, so no cleanup/finally handler added here can ever destroy a
+    successfully deployed instance. Termination stays an explicit user
+    action (POST /deployments/<id>/terminate).
+    """
+    with deployment_worker():
+        _run_pipeline(deployment_id, payload)
+
+
+def _run_pipeline(deployment_id: str, payload: dict) -> None:
     record = DeploymentRecord.objects.filter(pk=deployment_id).first()
     if record is None:
         logger.warning("Deployment %s disappeared before the pipeline ran.", deployment_id)
@@ -579,6 +647,65 @@ def run_pipeline(deployment_id: str, payload: dict) -> None:
         return
 
     # ------------------------------------------------------------------
+    # Step 2.5 — MongoDB Atlas Network Access Integration
+    # ------------------------------------------------------------------
+    env_vars = payload.get("env_vars") or {}
+    if "MONGO_URI" in env_vars and public_ip:
+        append_log(
+            deployment_id,
+            "INFO",
+            DeploymentStage.BUILDING,
+            "[ATLAS] MongoDB Atlas detected"
+        )
+        from ...models import MongoDBAtlasConnection
+        atlas_conn = MongoDBAtlasConnection.objects.filter(user_id=record.user_id, status="connected").first()
+        
+        if not atlas_conn:
+            fail_deployment(
+                deployment_id,
+                DeploymentStage.BUILDING,
+                "MongoDB Atlas access is required for this deployment, but CloudWise is not authorized to manage the Atlas project's network access list. Configure the CloudWise Atlas integration and retry.",
+                error_code="ATLAS_AUTHORIZATION_REQUIRED",
+            )
+            return
+            
+        from .atlas.atlas_client import AtlasClient
+        from .atlas.atlas_network_access import ensure_ec2_ip_allowed
+        
+        try:
+            client_secret = atlas_conn.get_secret()
+            atlas_client = AtlasClient(atlas_conn.client_id, client_secret, atlas_conn.project_id)
+            append_log(deployment_id, "INFO", DeploymentStage.BUILDING, "[ATLAS] Checking CloudWise Atlas authorization")
+            append_log(deployment_id, "INFO", DeploymentStage.BUILDING, "[ATLAS] Requesting Administration API token")
+            append_log(deployment_id, "INFO", DeploymentStage.BUILDING, "[ATLAS] Checking project network access")
+            
+            result = ensure_ec2_ip_allowed(atlas_client, public_ip, deployment_id)
+            if result.get("status") == "error":
+                fail_deployment(
+                    deployment_id,
+                    DeploymentStage.BUILDING,
+                    f"MongoDB Atlas could not be updated. {result.get('message')}",
+                    error_code=result.get("error_code") or "ATLAS_INTEGRATION_FAILED"
+                )
+                return
+            else:
+                append_log(
+                    deployment_id,
+                    "INFO",
+                    DeploymentStage.BUILDING,
+                    f"[ATLAS] {result.get('message')}"
+                )
+        except Exception as e:
+            logger.exception("Atlas integration error")
+            fail_deployment(
+                deployment_id,
+                DeploymentStage.BUILDING,
+                "MongoDB Atlas could not be updated. Retry the deployment.",
+                error_code="ATLAS_INTERNAL_ERROR"
+            )
+            return
+
+    # ------------------------------------------------------------------
     # Step 3 — upload files, build, start containers, health check
     # ------------------------------------------------------------------
     stream.set_phase("deploy")
@@ -711,6 +838,17 @@ def run_pipeline(deployment_id: str, payload: dict) -> None:
         error_code="" if final_status == DeploymentStatus.RUNNING else "DEPLOY_FAILED",
         error_message="" if final_status == DeploymentStatus.RUNNING else final_message,
     )
+
+    if final_status == DeploymentStatus.RUNNING and instance_id:
+        # The pipeline ends here. EC2 keeps running until the user
+        # explicitly stops or destroys the deployment.
+        append_log(
+            deployment_id,
+            "INFO",
+            DeploymentStage.COMPLETED,
+            f"Deployment {deployment_id} completed successfully; "
+            f"keeping EC2 {instance_id} running.",
+        )
 
     _persist_to_project(deployment_id)
 

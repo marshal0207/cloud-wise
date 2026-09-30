@@ -91,7 +91,8 @@ The frontend will start at `http://localhost:5173` and automatically proxy `/api
 - Django Admin Control Panel for Data Management
 
 # Django setup
-```
+```   
+    python -m venv .venv
     .\.venv\Scripts\Activate.ps1 
     python manage.py runserver
 ```

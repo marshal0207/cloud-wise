@@ -92,7 +92,7 @@ class EstimationRecord(models.Model):
     ram = models.IntegerField(default=32)
     storage = models.IntegerField(default=500)
     traffic = models.CharField(max_length=255, default='1,000,000 req/day')
-    region = models.CharField(max_length=255, default='Gujarat (GIFT City / Gandhinagar)')
+    region = models.CharField(max_length=255, default='us-east-1')
     performance_tier = models.CharField(max_length=255, default='High Performance')
     budget_tier = models.CharField(max_length=255, default='Balanced')
     calculated_result = models.JSONField(default=dict)
@@ -293,3 +293,28 @@ class EC2Instance(models.Model):
 
     def __str__(self):
         return f"{self.instance_id} ({self.status})"
+
+
+class MongoDBAtlasConnection(models.Model):
+    """
+    MongoDB Atlas connection for a user.
+    Stores the OAuth2 Client Credentials for the Atlas Administration API.
+    """
+    user = models.OneToOneField(CustomUser, on_delete=models.CASCADE, related_name='atlas_connection')
+    client_id = models.CharField(max_length=255)
+    client_secret_encrypted = models.TextField()
+    project_id = models.CharField(max_length=100)
+    status = models.CharField(max_length=50, default='connected')
+    connected_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def set_secret(self, plain_secret: str):
+        from .services.token_encryption import encrypt_token
+        self.client_secret_encrypted = encrypt_token(plain_secret)
+
+    def get_secret(self) -> str:
+        from .services.token_encryption import decrypt_token
+        return decrypt_token(self.client_secret_encrypted)
+
+    def __str__(self):
+        return f"MongoDB Atlas connection for {self.user.email or self.user.username} ({self.project_id})"

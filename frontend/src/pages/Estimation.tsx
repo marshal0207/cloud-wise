@@ -283,7 +283,7 @@ export const Estimation: React.FC = () => {
                   onChange={(e) => handleInputChange('region', e.target.value)}
                   className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-3 py-2.5 text-xs text-white focus:border-cyan-400"
                 >
-                  <option value="Gujarat (GIFT City / Gandhinagar)">Gujarat (GIFT City / Gandhinagar)</option>
+                  <option value="US East (N. Virginia)">US East (N. Virginia)</option>
                   <option value="Mumbai (ap-south-1)">Mumbai (ap-south-1)</option>
                   <option value="Bengaluru (ap-south-2)">Bengaluru (ap-south-2)</option>
                 </select>

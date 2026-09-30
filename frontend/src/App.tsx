@@ -13,7 +13,8 @@ import {
   Info,
   Mail,
   User,
-  KeyRound
+  KeyRound,
+  Database
 } from 'lucide-react';
 
 import { CloudWiseProvider } from '@/context/CloudWiseContext';
@@ -27,6 +28,7 @@ import { Estimation } from '@/pages/Estimation';
 import { Recommendation } from '@/pages/Recommendation';
 import { GenerateFiles } from '@/pages/GenerateFiles';
 import { ConnectAws } from '@/pages/ConnectAws';
+import { ConnectAtlas } from '@/pages/ConnectAtlas';
 import { Deployment } from '@/pages/Deployment';
 import { DeploymentDetails } from '@/pages/DeploymentDetails';
 import { Optimization } from '@/pages/Optimization';
@@ -42,6 +44,7 @@ const navItems: SlideTabItem[] = [
   { name: 'Recommend', url: '/recommendation', icon: Sparkles },
   { name: 'Files & GitHub', url: '/generate', icon: FileCode },
   { name: 'Connect AWS', url: '/connect-aws', icon: KeyRound },
+  { name: 'MongoDB Atlas', url: '/connect-atlas', icon: Database },
   { name: 'Deploy', url: '/deployment', icon: Rocket },
   { name: 'Monitoring', url: '/monitoring', icon: Activity },
   { name: 'Cost Tuning', url: '/optimization', icon: Zap },
@@ -69,6 +72,7 @@ const AnimatedRoutes: React.FC = () => {
           <Route path="/recommendation" element={<Recommendation />} />
           <Route path="/generate" element={<GenerateFiles />} />
           <Route path="/connect-aws" element={<ConnectAws />} />
+          <Route path="/connect-atlas" element={<ConnectAtlas />} />
           <Route path="/deployment" element={<Deployment />} />
           <Route path="/deployment/:id" element={<DeploymentDetails />} />
           <Route path="/optimization" element={<Optimization />} />
@@ -83,6 +87,7 @@ const AnimatedRoutes: React.FC = () => {
     </AnimatePresence>
   );
 };
+
 
 export const App: React.FC = () => {
   return (

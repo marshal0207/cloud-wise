@@ -725,8 +725,9 @@ export const Deployment: React.FC = () => {
   };
 
   // Part 14 — stop / cancel: POST /api/deployments/<id>/stop.
-  // Stops an in-flight pipeline and terminates the CloudWise-managed
-  // EC2 instance (only instances tagged ManagedBy=CloudWise).
+  // Cancels an in-flight pipeline; a live deployment has its EC2
+  // instance STOPPED (retained — it is never terminated; destroying it
+  // is the separate /terminate action).
   const handleStopDeployment = async () => {
     const id = deploymentId || lastDeploymentId;
     if (!id || stopping) return;
@@ -792,7 +793,9 @@ export const Deployment: React.FC = () => {
             FAILED: 'failed',
             ROLLING_BACK: 'failed',
             ROLLED_BACK: 'idle',
-            // stopped by the user — ready to start a new deployment
+            // stopped by the user — instance retained (not terminated)
+            STOPPED: 'idle',
+            // destroyed by an explicit user action
             TERMINATED: 'idle',
             // legacy lowercase records created before migration 0007
             DEPLOYED: 'deployed',

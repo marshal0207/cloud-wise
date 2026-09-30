@@ -7,3 +7,6 @@ dj-database-url>=2.1.0
 psycopg2-binary>=2.9.9; sys_platform != 'win32' or python_version < '3.14'
 boto3>=1.35.0
 cryptography>=42.0.0
+# MongoDB Atlas Administration API client (Connect Atlas + IP allowlisting)
+requests>=2.31.0
+

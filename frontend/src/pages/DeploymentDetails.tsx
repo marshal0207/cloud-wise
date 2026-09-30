@@ -12,6 +12,8 @@ import {
   GitCommitHorizontal,
   ListChecks,
   Monitor,
+  Pause,
+  Play,
   RefreshCw,
   Server,
   ShieldCheck,
@@ -61,6 +63,8 @@ const STATUS_TONE: Record<string, string> = {
   RUNNING: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40',
   FAILED: 'bg-rose-500/20 text-rose-300 border-rose-500/40',
   TERMINATED: 'bg-slate-800 text-slate-300 border-slate-700',
+  // instance powered off on purpose — retained, never terminated
+  STOPPED: 'bg-sky-500/20 text-sky-300 border-sky-500/40',
   ROLLED_BACK: 'bg-amber-500/20 text-amber-300 border-amber-500/40',
   ROLLING_BACK: 'bg-amber-500/20 text-amber-300 border-amber-500/40 animate-pulse',
 };
@@ -290,6 +294,28 @@ export const DeploymentDetails: React.FC = () => {
             <span>Retry</span>
           </button>
         )}
+        {status === 'STOPPED' && (
+          <button
+            onClick={() => void act('start', 'start', 'EC2 instance starting.')}
+            disabled={!!busy}
+            className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs flex items-center gap-1.5 disabled:opacity-50"
+          >
+            <Play size={14} />
+            <span>Start Instance</span>
+          </button>
+        )}
+        {!IN_FLIGHT.has(status) && status !== 'STOPPED' && status !== 'TERMINATED' && (
+          <button
+            onClick={() =>
+              void act('stop', 'stop', 'EC2 instance stopped — retained, not terminated.')
+            }
+            disabled={!!busy}
+            className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-100 font-bold text-xs flex items-center gap-1.5 disabled:opacity-50"
+          >
+            <Pause size={14} />
+            <span>Stop Instance</span>
+          </button>
+        )}
         <button
           onClick={() => void act('rollback', 'rollback', 'Rollback recorded. EC2 instance retained.')}
           disabled={!!busy || status === 'TERMINATED'}
@@ -299,12 +325,18 @@ export const DeploymentDetails: React.FC = () => {
           <span>Rollback</span>
         </button>
         <button
-          onClick={() => void act('terminate', 'terminate', 'EC2 instance terminated.')}
+          onClick={() =>
+            window.confirm(
+              'Destroy this deployment? The EC2 instance and everything on it will be terminated. This cannot be undone.'
+            )
+              ? void act('terminate', 'terminate', 'Deployment destroyed. EC2 instance terminated.')
+              : undefined
+          }
           disabled={!!busy || status === 'TERMINATED'}
           className="px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs flex items-center gap-1.5 disabled:opacity-50"
         >
           <AlertTriangle size={14} />
-          <span>Terminate Instance</span>
+          <span>Destroy Deployment</span>
         </button>
       </div>
 

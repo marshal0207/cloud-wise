@@ -65,6 +65,7 @@ from .database_preflight import (
     detect_database_dependency,
     gate_result,
 )
+from .lifecycle import in_deployment_worker, refusal_message
 from .log_service import DeploymentLogService
 # Imported as a module (not by name) so the Atlas Admin API seam stays
 # patchable in tests: patching the function where it is *defined* must
@@ -100,6 +101,7 @@ _PROGRESS = {
     DeploymentStatus.DEPLOYING: 70,
     DeploymentStatus.HEALTH_CHECK: 90,
     DeploymentStatus.RUNNING: 100,
+    DeploymentStatus.STOPPED: 100,
     DeploymentStatus.FAILED: 45,
     DeploymentStatus.ROLLING_BACK: 60,
     DeploymentStatus.ROLLED_BACK: 100,
@@ -109,8 +111,8 @@ _PROGRESS = {
 _STATE_MAP = {
     "pending": DeploymentStatus.BUILDING,
     "running": DeploymentStatus.RUNNING,
-    "stopping": DeploymentStatus.FAILED,
-    "stopped": DeploymentStatus.FAILED,
+    "stopping": DeploymentStatus.STOPPED,
+    "stopped": DeploymentStatus.STOPPED,
     "shutting-down": DeploymentStatus.FAILED,
     "terminated": DeploymentStatus.FAILED,
 }
@@ -355,15 +357,26 @@ class AwsEc2Provider(DeploymentProvider):
     def terminate_instance(self, instance_id: str) -> dict[str, Any]:
         """
         Terminate the CloudWise-managed EC2 instance in the *user's* AWS
-        account.
+        account — only for an explicit user Destroy/Delete action.
 
         Safety: only instances carrying the ``ManagedBy=CloudWise`` tag are
         ever terminated, so a hand-typed instance id can never destroy a
-        resource CloudWise did not create.
+        resource CloudWise did not create. Calls made from inside the
+        background deployment worker are refused and logged as errors:
+        a successful deployment must never be terminated by pipeline
+        cleanup code.
         """
         instance_id = str(instance_id or "").strip()
         if not instance_id:
             raise AwsEc2Error("No EC2 instance id supplied for termination.")
+        if in_deployment_worker():
+            raise AwsEc2Error(
+                refusal_message(
+                    "termination",
+                    f"deployment worker tried to terminate {instance_id} "
+                    "after a deployment action",
+                )
+            )
         if self.connection is None or self.connection.status != "active":
             raise AwsEc2Error(
                 "AWS account not connected. Connect your AWS account "
@@ -439,6 +452,217 @@ class AwsEc2Provider(DeploymentProvider):
             "region": self._region(),
             "state": "terminated",
             "message": f"Termination requested for {instance_id}.",
+            "logs": log.all(),
+        }
+
+    def stop_instance(self, instance_id: str) -> dict[str, Any]:
+        """
+        Stop (never terminate) the CloudWise-managed EC2 instance.
+
+        Stopping only powers the instance off: the instance, its disks
+        and everything running on it are retained and can be started
+        again later. This is the provider half of the explicit
+        ``POST /deployments/<id>/stop`` user action.
+        """
+        instance_id = str(instance_id or "").strip()
+        if not instance_id:
+            raise AwsEc2Error("No EC2 instance id supplied for stopping.")
+        if in_deployment_worker():
+            raise AwsEc2Error(
+                refusal_message(
+                    "stop",
+                    f"deployment worker tried to stop {instance_id} "
+                    "outside an explicit user action",
+                )
+            )
+        if self.connection is None or self.connection.status != "active":
+            raise AwsEc2Error(
+                "AWS account not connected. Connect your AWS account "
+                "(IAM role) first."
+            )
+
+        log = self._new_log(instance_id)
+        session = self.get_session()
+        ec2 = session.client("ec2", region_name=self._region())
+
+        instance = self._describe_instance(ec2, instance_id)
+        if instance is None:
+            raise AwsEc2Error(
+                f'EC2 instance "{instance_id}" not found in AWS account.'
+            )
+
+        tags = {t.get("Key"): t.get("Value") for t in (instance.get("Tags") or [])}
+        if tags.get("ManagedBy") != "CloudWise":
+            raise AwsEc2Error(
+                f"Instance {instance_id} is not managed by CloudWise "
+                "(missing the ManagedBy=CloudWise tag). Refusing to "
+                "stop it."
+            )
+
+        state = (instance.get("State") or {}).get("Name", "")
+        if state in ("terminated", "shutting-down"):
+            raise AwsEc2Error(
+                f"Instance {instance_id} is already terminated and can no "
+                "longer be stopped."
+            )
+
+        if state == "stopped":
+            log.info(
+                DeploymentStage.COMPLETED,
+                f"EC2 instance {instance_id} is already stopped.",
+            )
+        else:
+            log.info(
+                DeploymentStage.DEPLOYING,
+                f"User requested stop for deployment {instance_id}; "
+                f"stopping EC2 {instance_id} (current state: {state}) in "
+                f"{self._region()}. Stopping is not termination: the "
+                "instance is retained and can be started again.",
+            )
+            try:
+                ec2.stop_instances(InstanceIds=[instance_id])
+            except (ClientError, BotoCoreError) as exc:
+                message = self._friendly_ec2_error(exc)
+                log.error(DeploymentStage.FAILED, message)
+                raise AwsEc2Error(message) from exc
+
+        row = EC2Instance.objects.filter(instance_id=instance_id).first()
+        if row is not None:
+            row.status = "stopped"
+            row.save(update_fields=["status", "updated_at"])
+            self._persist_logs(row, log.all())
+
+        log.info(
+            DeploymentStage.COMPLETED,
+            f"Stop requested for {instance_id}. The instance is powered "
+            "off (not terminated); start it again with the Start action. "
+            "MongoDB/Atlas network access is untouched because the "
+            "instance is retained.",
+        )
+        return {
+            "instance_id": instance_id,
+            "region": self._region(),
+            "state": "stopped",
+            "stopped": True,
+            "message": f"Stop requested for {instance_id}.",
+            "logs": log.all(),
+        }
+
+    def start_instance(self, instance_id: str) -> dict[str, Any]:
+        """
+        Start an existing stopped CloudWise-managed EC2 instance and wait
+        until it is running again (SSM, Docker and the application come
+        back with it).
+
+        This is the provider half of the explicit
+        ``POST /deployments/<id>/start`` user action. Terminated
+        instances are never recreated here — that is a new deployment.
+        """
+        instance_id = str(instance_id or "").strip()
+        if not instance_id:
+            raise AwsEc2Error("No EC2 instance id supplied for starting.")
+        if in_deployment_worker():
+            raise AwsEc2Error(
+                refusal_message(
+                    "start",
+                    f"deployment worker tried to start {instance_id} "
+                    "outside an explicit user action",
+                )
+            )
+        if self.connection is None or self.connection.status != "active":
+            raise AwsEc2Error(
+                "AWS account not connected. Connect your AWS account "
+                "(IAM role) first."
+            )
+
+        log = self._new_log(instance_id)
+        session = self.get_session()
+        ec2 = session.client("ec2", region_name=self._region())
+
+        instance = self._describe_instance(ec2, instance_id)
+        if instance is None:
+            raise AwsEc2Error(
+                f'EC2 instance "{instance_id}" not found in AWS account.'
+            )
+
+        tags = {t.get("Key"): t.get("Value") for t in (instance.get("Tags") or [])}
+        if tags.get("ManagedBy") != "CloudWise":
+            raise AwsEc2Error(
+                f"Instance {instance_id} is not managed by CloudWise "
+                "(missing the ManagedBy=CloudWise tag). Refusing to "
+                "start it."
+            )
+
+        state = (instance.get("State") or {}).get("Name", "")
+        if state in ("terminated", "shutting-down"):
+            raise AwsEc2Error(
+                f"Instance {instance_id} was terminated. Deploy again to "
+                "create a new instance."
+            )
+
+        if state == "running":
+            log.info(
+                DeploymentStage.COMPLETED,
+                f"EC2 instance {instance_id} is already running.",
+            )
+        else:
+            wait_config = {"Delay": 5, "MaxAttempts": 60}
+            if state == "stopping":
+                log.info(
+                    DeploymentStage.DEPLOYING,
+                    f"Waiting for {instance_id} to finish stopping before "
+                    "starting it again.",
+                )
+                try:
+                    ec2.get_waiter("instance_stopped").wait(
+                        InstanceIds=[instance_id],
+                        WaiterConfig=wait_config,
+                    )
+                except WaiterError:
+                    pass  # describe below reports the real state
+            log.info(
+                DeploymentStage.DEPLOYING,
+                f"User requested start for deployment {instance_id}; "
+                f"starting EC2 {instance_id} in {self._region()}.",
+            )
+            try:
+                ec2.start_instances(InstanceIds=[instance_id])
+            except (ClientError, BotoCoreError) as exc:
+                message = self._friendly_ec2_error(exc)
+                log.error(DeploymentStage.FAILED, message)
+                raise AwsEc2Error(message) from exc
+
+            try:
+                ec2.get_waiter("instance_running").wait(
+                    InstanceIds=[instance_id],
+                    WaiterConfig=wait_config,
+                )
+            except WaiterError:
+                pass  # describe below reports the real state
+            instance = self._describe_instance(ec2, instance_id) or instance
+
+        public_ip = str(instance.get("PublicIpAddress") or "")
+        self._sync_instance_row(
+            instance_id, state="running", public_ip=public_ip or None
+        )
+
+        row = EC2Instance.objects.filter(instance_id=instance_id).first()
+        if row is not None:
+            self._persist_logs(row, log.all())
+
+        log.info(
+            DeploymentStage.COMPLETED,
+            f"Start requested for {instance_id}. The instance is running "
+            f"again{f' at {public_ip}' if public_ip else ''}; verify the "
+            "application health before opening the live URL.",
+        )
+        return {
+            "instance_id": instance_id,
+            "region": self._region(),
+            "state": "running",
+            "started": True,
+            "public_ip": public_ip,
+            "message": f"Start requested for {instance_id}.",
             "logs": log.all(),
         }
 

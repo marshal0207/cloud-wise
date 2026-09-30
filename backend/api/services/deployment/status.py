@@ -12,10 +12,13 @@ BUILDING      — Building the Docker image.
 DEPLOYING     — Starting container / pushing to registry.
 HEALTH_CHECK  — Running post-deploy health checks.
 RUNNING       — Deployment is live and healthy.
+STOPPED       — The EC2 instance was STOPPED by the user (never
+                terminated — it can be started again).
 FAILED        — Deployment encountered an unrecoverable error.
 ROLLING_BACK  — Rollback is in progress.
 ROLLED_BACK   — Rollback completed successfully.
-TERMINATED    — The EC2 instance was terminated by its owner.
+TERMINATED    — The EC2 instance was terminated by an explicit
+                destroy/delete action.
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ class DeploymentStatus:
     DEPLOYING = "DEPLOYING"
     HEALTH_CHECK = "HEALTH_CHECK"
     RUNNING = "RUNNING"
+    STOPPED = "STOPPED"
     FAILED = "FAILED"
     ROLLING_BACK = "ROLLING_BACK"
     ROLLED_BACK = "ROLLED_BACK"
@@ -40,6 +44,7 @@ class DeploymentStatus:
         DEPLOYING,
         HEALTH_CHECK,
         RUNNING,
+        STOPPED,
         FAILED,
         ROLLING_BACK,
         ROLLED_BACK,
@@ -75,48 +80,67 @@ class DeploymentStage:
 
 _VALID_TRANSITIONS: dict[str, set[str]] = {
     # Every non-terminal state may be stopped by the user (Part 14).
+    # Stopping STOPs the EC2 instance — it is never terminated.
     DeploymentStatus.QUEUED: {
         DeploymentStatus.PREPARING,
         DeploymentStatus.FAILED,
+        DeploymentStatus.STOPPED,
         DeploymentStatus.TERMINATED,
     },
     DeploymentStatus.PREPARING: {
         DeploymentStatus.BUILDING,
         DeploymentStatus.FAILED,
+        DeploymentStatus.STOPPED,
         DeploymentStatus.TERMINATED,
     },
     DeploymentStatus.BUILDING: {
         DeploymentStatus.DEPLOYING,
         DeploymentStatus.FAILED,
+        DeploymentStatus.STOPPED,
         DeploymentStatus.TERMINATED,
     },
     DeploymentStatus.DEPLOYING: {
         DeploymentStatus.HEALTH_CHECK,
         DeploymentStatus.FAILED,
+        DeploymentStatus.STOPPED,
         DeploymentStatus.TERMINATED,
     },
     DeploymentStatus.HEALTH_CHECK: {
         DeploymentStatus.RUNNING,
         DeploymentStatus.FAILED,
+        DeploymentStatus.STOPPED,
         DeploymentStatus.TERMINATED,
     },
+    # A running deployment keeps its infrastructure until the user
+    # explicitly stops (STOPPED), rolls back, fails or destroys it.
     DeploymentStatus.RUNNING: {
         DeploymentStatus.ROLLING_BACK,
         DeploymentStatus.FAILED,
+        DeploymentStatus.STOPPED,
+        DeploymentStatus.TERMINATED,
+    },
+    # Stopped: the EC2 instance exists but is powered off. Only an
+    # explicit user action (start / destroy / rollback) leaves it.
+    DeploymentStatus.STOPPED: {
+        DeploymentStatus.RUNNING,
+        DeploymentStatus.ROLLING_BACK,
         DeploymentStatus.TERMINATED,
     },
     DeploymentStatus.FAILED: {
         DeploymentStatus.ROLLING_BACK,
         DeploymentStatus.QUEUED,  # retry restarts the pipeline on the record
+        DeploymentStatus.STOPPED,
         DeploymentStatus.TERMINATED,
     },
     DeploymentStatus.ROLLING_BACK: {
         DeploymentStatus.ROLLED_BACK,
         DeploymentStatus.FAILED,
+        DeploymentStatus.STOPPED,
         DeploymentStatus.TERMINATED,
     },
     DeploymentStatus.ROLLED_BACK: {
         DeploymentStatus.QUEUED,  # retry after a rollback
+        DeploymentStatus.STOPPED,
         DeploymentStatus.TERMINATED,
     },
     DeploymentStatus.TERMINATED: set(),  # terminal state
@@ -182,6 +206,7 @@ STATUS_PROGRESS: dict[str, int] = {
     DeploymentStatus.DEPLOYING: 70,
     DeploymentStatus.HEALTH_CHECK: 90,
     DeploymentStatus.RUNNING: 100,
+    DeploymentStatus.STOPPED: 100,
     DeploymentStatus.FAILED: 60,
     DeploymentStatus.ROLLING_BACK: 50,
     DeploymentStatus.ROLLED_BACK: 100,
@@ -205,6 +230,7 @@ IN_FLIGHT: tuple[str, ...] = (
 # Statuses no pipeline is running for.
 SETTLED: tuple[str, ...] = (
     DeploymentStatus.RUNNING,
+    DeploymentStatus.STOPPED,
     DeploymentStatus.FAILED,
     DeploymentStatus.ROLLED_BACK,
     DeploymentStatus.TERMINATED,

@@ -135,7 +135,7 @@ export const defaultEstimation: EstimationData = {
   ram: 32,
   storage: 500,
   traffic: '1,000,000 req/day',
-  region: 'Gujarat (GIFT City / Gandhinagar)',
+  region: 'US East (N. Virginia)',
   performanceTier: 'High Performance',
   budgetTier: 'Balanced',
   calculatedResult: {

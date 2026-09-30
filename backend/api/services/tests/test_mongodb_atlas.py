@@ -103,6 +103,13 @@ class UriInspectionTests(SimpleTestCase):
         _assert_no_secret(self, status)
 
 
+# Hermetic: a developer's local backend/.env may legitimately contain
+# MONGODB_ATLAS_* — "not configured" must be forced, never inherited.
+@override_settings(
+    MONGODB_ATLAS_PUBLIC_KEY="",
+    MONGODB_ATLAS_PRIVATE_KEY="",
+    MONGODB_ATLAS_PROJECT_ID="",
+)
 class NotConfiguredTests(SimpleTestCase):
     def test_not_configured_never_claims_allowlisting_happened(self):
         report = atlas.ensure_atlas_access_entry(
@@ -238,33 +245,37 @@ class AllowlistEntryTests(SimpleTestCase):
         self.assertEqual(request.call_args[0][0], "DELETE")
         self.assertIn("198.51.100.4%2F32", request.call_args[0][1])
 
-    def test_authorization_header_is_never_returned_or_logged(self):
-        """The private key must only ever live inside the request header."""
+    def test_private_key_never_leaves_the_transport(self):
+        """The key pair only ever lives inside the digest auth object."""
+        from requests.auth import HTTPDigestAuth
+
         captured = {}
 
-        def fake_urlopen(request, timeout=None):
-            captured["header"] = request.get_header("Authorization")
+        def fake_request(method, url, **kwargs):
+            captured["auth"] = kwargs.get("auth")
+            captured["headers"] = kwargs.get("headers")
 
             class _Response:
-                def getcode(self):
-                    return 200
+                status_code = 200
+                content = b'{"results": []}'
 
-                def read(self, size=0):
-                    return b'{"results": []}'
-
-                def __enter__(self):
-                    return self
-
-                def __exit__(self, *args):
-                    return False
+                def json(self):
+                    return {"results": []}
 
             return _Response()
 
-        with patch.object(atlas.urllib.request, "urlopen", fake_urlopen):
+        with patch.object(atlas.requests, "request", fake_request):
             status, payload = atlas._request("GET", "/groups/x/accessList")
+
         self.assertEqual(status, 200)
-        self.assertTrue(captured["header"].startswith("Basic "))
+        auth = captured["auth"]
+        self.assertIsInstance(auth, HTTPDigestAuth)
+        self.assertEqual(auth.username, "pk")
+        self.assertEqual(auth.password, "sk")
+        # no Authorization header is ever assembled by this module
+        self.assertNotIn("Authorization", captured["headers"] or {})
         self.assertNotIn("sk", repr(payload))
+        self.assertNotIn("sk", repr(captured["headers"]))
 
 
 class HealthEndpointTests(SimpleTestCase):

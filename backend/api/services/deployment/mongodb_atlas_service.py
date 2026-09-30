@@ -18,7 +18,8 @@ Safety rules honoured here
 * **No application credentials are read, stored or logged** — only the
   Atlas *administration* credentials the operator configured themselves.
 * The Atlas private key never leaves this module: it is only used to build
-  an ``Authorization`` header that is never printed.
+  the digest challenge/response handed to the HTTP transport, which is
+  never printed.
 * Only ``/32`` entries are written. ``0.0.0.0/0`` is never produced.
 * Entries are tagged ``CloudWise deployment <deployment-id>`` so a later
   cleanup can tell CloudWise-managed entries from hand-made ones.
@@ -26,18 +27,19 @@ Safety rules honoured here
   reports ``configured: False`` — it never pretends allowlisting happened.
 * When the connection string is not an Atlas one, nothing is attempted.
 
-Standard library only (``urllib``): the project does not ship ``requests``.
+HTTP: the Atlas Administration API authenticates API keys with HTTP
+Digest authentication (Basic and the OAuth token endpoint both answer
+401), so this module uses ``requests.HTTPDigestAuth`` — the same
+transport the Connect Atlas flow uses.
 """
 
 from __future__ import annotations
 
-import base64
-import json
 import re
-import urllib.error
 import urllib.parse
-import urllib.request
 from typing import Any, Mapping
+
+import requests
 
 ATLAS_API_BASE = "https://cloud.mongodb.com/api/atlas/v2"
 HTTP_TIMEOUT_SECONDS = 15
@@ -245,7 +247,7 @@ def describe_uri_for_deployment(
 
 
 # ---------------------------------------------------------------------------
-# Atlas Admin API (HTTP Basic: public key / private key)
+# Atlas Admin API (HTTP Digest: public key / private key)
 # ---------------------------------------------------------------------------
 
 def _request(
@@ -259,45 +261,39 @@ def _request(
     Call the Atlas Admin API. Returns ``(status_code, payload)``.
 
     ``status == 0`` means the request never reached the API (network /
-    TLS / DNS problem). The Authorization header is built here and never
-    returned, stored or logged.
+    TLS / DNS problem). The key pair only ever lives inside the digest
+    auth object handed to the transport — it is never returned, stored
+    or logged.
     """
     public_key, private_key, _ = atlas_credentials()
     if not (public_key and private_key):
         return 0, {"detail": "Atlas API credentials are not configured."}
 
     url = f"{ATLAS_API_BASE}{path}"
-    data = json.dumps(body).encode("utf-8") if body is not None else None
-    request = urllib.request.Request(url, data=data, method=method.upper())
-    request.add_header("Accept", "application/json")
-    request.add_header(
-        "Authorization",
-        "Basic "
-        + base64.b64encode(f"{public_key}:{private_key}".encode("utf-8")).decode(
-            "ascii"
-        ),
-    )
-    if data is not None:
-        request.add_header("Content-Type", "application/json")
-
-    def _payload(raw: bytes) -> dict[str, Any]:
-        try:
-            parsed = json.loads(raw.decode("utf-8", "replace"))
-        except (TypeError, ValueError):
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
+    headers = {"Accept": "application/json"}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
 
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return int(response.getcode() or 200), _payload(response.read(65536))
-    except urllib.error.HTTPError as exc:
-        try:
-            raw = exc.read(65536)
-        except Exception:  # noqa: BLE001
-            raw = b""
-        return int(exc.code or 0), _payload(raw)
-    except Exception:  # noqa: BLE001 — never surface request internals
+        response = requests.request(
+            method.upper(),
+            url,
+            headers=headers,
+            json=body,
+            auth=requests.auth.HTTPDigestAuth(public_key, private_key),
+            timeout=timeout,
+        )
+    except requests.RequestException:
+        # never surface request internals
         return 0, {"detail": "The MongoDB Atlas API could not be reached."}
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    return int(response.status_code), payload
 
 
 def _detail(payload: Mapping[str, Any] | None) -> str:

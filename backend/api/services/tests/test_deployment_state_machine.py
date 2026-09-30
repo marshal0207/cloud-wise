@@ -3,7 +3,8 @@ Tests for the deployment state machine and its new endpoints.
 
 Covers:
   Part 11 — status transitions, progress, stage/timestamp/error fields
-  Part 14 — POST /api/deployments/<id>/stop (cancel in flight, release EC2)
+  Part 14 — POST /api/deployments/<id>/stop (cancel in flight, stop the
+            EC2 instance — it is never terminated)
   Part 21 — POST /api/deploy/preflight (readiness before anything is created)
   Part 22 — permission self-check after AssumeRole (fails fast naming the
             missing IAM action)
@@ -302,21 +303,47 @@ class StopEndpointTest(TestCase):
         self.assertIsNotNone(record.finished_at)
         self.assertTrue(stop_requested(str(record.pk)))
 
-    @patch("api.services.deployment.aws_ec2_provider.AwsEc2Provider.terminate_instance")
-    def test_live_deployment_terminates_the_managed_instance(self, mock_terminate):
+    @patch("api.services.deployment.aws_ec2_provider.AwsEc2Provider.stop_instance")
+    @patch(
+        "api.services.deployment.aws_ec2_provider.AwsEc2Provider.terminate_instance"
+    )
+    def test_live_deployment_stops_the_managed_instance(
+        self, mock_terminate, mock_stop
+    ):
+        """Stopping a live deployment powers the instance off, never destroys it."""
         _make_connection(self.user)
-        mock_terminate.return_value = {"region": "ap-south-1", "logs": []}
+        mock_stop.return_value = {
+            "region": "ap-south-1",
+            "state": "stopped",
+            "logs": [],
+        }
         record = _make_record(self.user, deployment_status=DeploymentStatus.RUNNING)
 
         self.client.force_authenticate(user=self.user)
         response = self.client.post(f"/api/deployments/{record.pk}/stop")
 
         self.assertEqual(response.status_code, 200)
-        self.assertTrue(response.data["data"]["instanceTerminated"])
-        mock_terminate.assert_called_once_with("i-sm1")
+        self.assertTrue(response.data["data"]["instanceStopped"])
+        self.assertFalse(response.data["data"]["instanceTerminated"])
+        mock_stop.assert_called_once_with("i-sm1")
+        mock_terminate.assert_not_called()
 
         record.refresh_from_db()
-        self.assertEqual(record.deployment_status, DeploymentStatus.TERMINATED)
+        self.assertEqual(record.deployment_status, DeploymentStatus.STOPPED)
+
+    @patch("api.views.AwsEc2Provider")
+    def test_stop_never_terminates_and_stop_is_409(self, mock_provider_cls):
+        """A second stop on an already stopped deployment is refused."""
+        _make_connection(self.user)
+        record = _make_record(
+            self.user, deployment_status=DeploymentStatus.STOPPED
+        )
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.post(f"/api/deployments/{record.pk}/stop")
+
+        self.assertEqual(response.status_code, 409)
+        mock_provider_cls.assert_not_called()
 
     def test_instance_without_connection_returns_503(self):
         record = _make_record(self.user, deployment_status=DeploymentStatus.RUNNING)

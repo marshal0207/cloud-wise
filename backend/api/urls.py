@@ -32,8 +32,11 @@ urlpatterns = [
     path('deployments/<str:deployment_id>/logs', views.deployment_logs_view, name='deployment_logs'),
     path('deployments/<str:deployment_id>/health', views.deployment_health_view, name='deployment_health'),
     path('deployments/<str:deployment_id>/retry', views.deployment_retry_view, name='deployment_retry'),
-    # Part 14 — stop / cancel a deployment (in flight or live)
+    # Part 14 — lifecycle actions (always explicit user actions):
+    # stop = StopInstances (instance retained), start = StartInstances,
+    # terminate = TerminateInstances (destroy), rollback = keep instance.
     path('deployments/<str:deployment_id>/stop', views.deployment_stop_view, name='deployment_stop'),
+    path('deployments/<str:deployment_id>/start', views.deployment_start_view, name='deployment_start'),
     path('deployments/<str:deployment_id>/terminate', views.deployment_terminate_view, name='deployment_terminate'),
     path('deployments/<str:deployment_id>/rollback', views.deployment_rollback_view, name='deployment_rollback'),
     
@@ -53,4 +56,9 @@ path('aws/verify', views.aws_verify_view, name='aws_verify'),
 path('aws/connect', views.aws_connect_view, name='aws_connect'),
     path('aws/connection', views.aws_connection_view, name='aws_connection'),
     path('aws/disconnect', views.aws_disconnect_view, name='aws_disconnect'),
+
+    # MongoDB Atlas Connection
+    path('atlas/connection', views.atlas_connection_view, name='atlas_connection'),
+    path('atlas/connect', views.atlas_connect_view, name='atlas_connect'),
+    path('atlas/disconnect', views.atlas_disconnect_view, name='atlas_disconnect'),
 ]

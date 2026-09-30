@@ -65,6 +65,7 @@ from .services.deployment.status import (
     DeploymentStatus,
     IN_FLIGHT,
     STATUS_PROGRESS,
+    is_valid_transition,
     progress_for,
 )
 from .services.deployment.aws_connection_service import (
@@ -753,14 +754,14 @@ def estimate_view(request):
     ram_num = int(data.get('ram', 32))
     storage_num = int(data.get('storage', 500))
     traffic = data.get('traffic', '1,000,000 req/day')
-    region = data.get('region', 'Gujarat (GIFT City / Gandhinagar)')
+    region = data.get('region', 'us-east-1')
     performance_tier = data.get('performanceTier', 'High Performance')
     budget_tier = data.get('budgetTier', 'Balanced')
 
     target_region = region.lower()
     region_multiplier = 1.0
-    if 'gujarat' in target_region:
-        region_multiplier = 0.92
+    if 'us-east-1' in target_region:
+        region_multiplier = 1.0
     elif 'bengaluru' in target_region:
         region_multiplier = 1.05
     elif 'kolkata' in target_region:
@@ -2162,9 +2163,20 @@ def deployment_status_view(request, deployment_id):
 
     if instance_state in ('terminated', 'shutting-down'):
         deployment_status = DeploymentStatus.TERMINATED
+    elif instance_state in ('stopping', 'stopped'):
+        # Stopped is a live, retained instance — never reported as
+        # FAILED and never as TERMINATED.
+        deployment_status = DeploymentStatus.STOPPED
     elif instance_state not in ('running', 'pending', 'stopped'):
         deployment_status = DeploymentStatus.FAILED
     elif record.deployment_status in _ALIVE and instance_state == 'running':
+        deployment_status = DeploymentStatus.RUNNING
+    elif (
+        record.deployment_status == DeploymentStatus.STOPPED
+        and instance_state == 'running'
+    ):
+        # Started again outside the API (or an in-progress start):
+        # running means live again.
         deployment_status = DeploymentStatus.RUNNING
 
     update_fields = []
@@ -2407,10 +2419,16 @@ def deployment_retry_view(request, deployment_id):
 @permission_classes([permissions.IsAuthenticated])
 def deployment_terminate_view(request, deployment_id):
     """
-    Terminate the EC2 instance backing this deployment — always inside
+    Destroy the EC2 instance backing this deployment — always inside
     the owning user's own AWS account, and only for instances tagged
     ``ManagedBy=CloudWise``.
+
+    This is the ONLY endpoint that terminates an instance: it is
+    reached from an explicit user "Destroy" action. Rolling back,
+    stopping, failing or completing a deployment never terminates EC2.
     """
+    from .services.deployment.log_service import make_log_entry
+
     record = _find_deployment_record(deployment_id, user=request.user)
     if record is None:
         return Response({
@@ -2446,6 +2464,22 @@ def deployment_terminate_view(request, deployment_id):
 
     try:
         aws_provider = AwsEc2Provider(user=record.user, connection=aws_connection)
+        logger.info(
+            'User requested destruction for deployment %s; terminating EC2 %s.',
+            record.pk, record.instance_id,
+        )
+        destroy_entry = make_log_entry(
+            record.current_stage
+            if record.current_stage in DeploymentStage.ALL
+            else DeploymentStage.COMPLETED,
+            f'User requested destruction for deployment {record.pk}; '
+            f'terminating EC2 {record.instance_id}.',
+            level='WARNING',
+        )
+        record.logs = list(record.logs or []) + [destroy_entry]
+        DeploymentRecord.objects.filter(pk=record.pk).update(
+            logs=record.logs, updated_at=timezone.now()
+        )
         result = aws_provider.terminate_instance(record.instance_id)
     except AwsEc2Error as exc:
         return Response({
@@ -2476,13 +2510,19 @@ def deployment_terminate_view(request, deployment_id):
 @permission_classes([permissions.IsAuthenticated])
 def deployment_stop_view(request, deployment_id):
     """
-    Part 14 — stop/cancel a deployment.
+    Part 14 — stop a deployment (always an explicit user action).
 
-    * In flight (pipeline running): the stop request is recorded, the
-      pipeline aborts at its next checkpoint and the record settles on
-      TERMINATED (a stop always wins over a late FAILED/RUNNING write).
-    * Live (instance running): the EC2 instance is terminated — only
-      instances tagged ``ManagedBy=CloudWise`` are ever touched.
+    * In flight (pipeline running) and no instance yet: the stop
+      request is recorded, the pipeline aborts at its next checkpoint
+      and the record settles on TERMINATED (a stop always wins over a
+      late FAILED/RUNNING write).
+    * Instance exists: the EC2 instance is STOPPED — never terminated.
+      The instance, its disks, the application data and the Atlas
+      network access entry are all retained, so the deployment can be
+      started again with POST /deployments/<id>/start.
+
+    Stopping is not destruction: terminating the instance stays an
+    explicit user action on POST /deployments/<id>/terminate.
     """
     from .services.deployment.log_service import make_log_entry
     from .services.deployment.status import progress_for
@@ -2494,7 +2534,10 @@ def deployment_stop_view(request, deployment_id):
             'error': f'Deployment "{deployment_id}" not found.',
         }, status=status.HTTP_404_NOT_FOUND)
 
-    if record.deployment_status == DeploymentStatus.TERMINATED:
+    if record.deployment_status in (
+        DeploymentStatus.TERMINATED,
+        DeploymentStatus.STOPPED,
+    ):
         return Response({
             'success': False,
             'stage': 'AWS',
@@ -2511,6 +2554,10 @@ def deployment_stop_view(request, deployment_id):
         f'Stop requested for deployment {record.pk} by the user '
         f'(was {record.deployment_status}).'
     )
+    logger.info(
+        'User requested stop for deployment %s (was %s).',
+        record.pk, record.deployment_status,
+    )
     DeploymentRecord.objects.filter(pk=record.pk).update(
         cancel_requested=True,
         updated_at=timezone.now(),
@@ -2520,7 +2567,7 @@ def deployment_stop_view(request, deployment_id):
     )
 
     instance_id = record.instance_id
-    instance_terminated = False
+    instance_stopped = False
     if instance_id:
         aws_connection = AWSConnection.objects.filter(
             user_id=record.user_id, status='active'
@@ -2530,7 +2577,7 @@ def deployment_stop_view(request, deployment_id):
                 'success': False,
                 'stage': 'AWS',
                 'error': (
-                    f'AWS connection is required to release instance '
+                    f'AWS connection is required to stop instance '
                     f'{instance_id}. Connect your AWS account and stop again.'
                 ),
                 'connectUrl': '/connect-aws',
@@ -2541,44 +2588,167 @@ def deployment_stop_view(request, deployment_id):
             aws_provider = AwsEc2Provider(
                 user=record.user, connection=aws_connection
             )
-            result = aws_provider.terminate_instance(instance_id)
+            result = aws_provider.stop_instance(instance_id)
         except AwsEc2Error as exc:
             return Response({
                 'success': False,
                 'stage': 'AWS',
-                'error': f'Could not terminate instance {instance_id}: {exc}',
+                'error': f'Could not stop instance {instance_id}: {exc}',
                 'stopRequested': True,
             }, status=status.HTTP_502_BAD_GATEWAY)
 
-        instance_terminated = True
+        instance_stopped = True
         record.logs = list(record.logs or []) + list(result.get('logs') or [])
 
-    # Settle the record on TERMINATED through the state machine.
-    terminal_message = (
-        f'Deployment stopped. Instance {instance_id} terminated.'
-        if instance_terminated
-        else 'Deployment stopped before an instance was created.'
-    )
+    # Settle the record on the state machine: STOPPED when the instance
+    # was stopped (it is retained), TERMINATED only when there never was
+    # an instance to keep alive.
+    if instance_stopped:
+        new_status = DeploymentStatus.STOPPED
+        stop_message = (
+            f'Deployment stopped. Instance {instance_id} is stopped and '
+            'retained (not terminated) — start it again from the '
+            'deployment page.'
+        )
+    else:
+        new_status = DeploymentStatus.TERMINATED
+        stop_message = 'Deployment stopped before an instance was created.'
     values = {
         'cancel_requested': True,
-        'deployment_status': DeploymentStatus.TERMINATED,
+        'deployment_status': new_status,
         'current_stage': stage,
-        'progress': progress_for(DeploymentStatus.TERMINATED),
-        'status_message': terminal_message,
-        'finished_at': timezone.now(),
+        'progress': progress_for(new_status),
+        'status_message': stop_message,
         'updated_at': timezone.now(),
         'logs': list(record.logs or []),
     }
+    if new_status == DeploymentStatus.TERMINATED:
+        values['finished_at'] = timezone.now()
     DeploymentRecord.objects.filter(pk=record.pk).update(**values)
 
     return Response({
         'success': True,
         'data': {
             'deploymentId': record.pk,
-            'deploymentStatus': DeploymentStatus.TERMINATED,
+            'deploymentStatus': new_status,
             'instanceId': instance_id or None,
-            'instanceTerminated': instance_terminated,
-            'message': terminal_message,
+            'instanceStopped': instance_stopped,
+            # Stopping never terminates the instance — destruction is a
+            # separate, explicit action on /terminate.
+            'instanceTerminated': False,
+            'message': stop_message,
+            'logs': values['logs'],
+        },
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+@permission_classes([permissions.IsAuthenticated])
+def deployment_start_view(request, deployment_id):
+    """
+    Start the stopped EC2 instance behind this deployment (StartInstances
+    in the owning user's own AWS account) and bring the record back to
+    RUNNING.
+
+    Always an explicit user action: nothing in the deployment pipeline
+    ever starts, stops or terminates instances on its own. Terminated
+    instances are never recreated here — that is a new deployment.
+    """
+    from .services.deployment.status import progress_for
+
+    record = _find_deployment_record(deployment_id, user=request.user)
+    if record is None:
+        return Response({
+            'success': False,
+            'error': f'Deployment "{deployment_id}" not found.',
+        }, status=status.HTTP_404_NOT_FOUND)
+
+    if not record.instance_id:
+        return Response({
+            'success': False,
+            'stage': 'AWS',
+            'error': 'No EC2 instance recorded for this deployment.',
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    if record.deployment_status in _IN_FLIGHT:
+        return Response({
+            'success': False,
+            'stage': 'AWS',
+            'error': (
+                f'Deployment {record.pk} is still in flight '
+                f'({record.deployment_status}); wait for it to settle '
+                'before starting the instance.'
+            ),
+            'currentStatus': record.deployment_status,
+        }, status=status.HTTP_409_CONFLICT)
+
+    if record.deployment_status == DeploymentStatus.TERMINATED:
+        return Response({
+            'success': False,
+            'stage': 'AWS',
+            'error': f'Instance {record.instance_id} is terminated. Deploy again to create a new instance.',
+            'currentStatus': record.deployment_status,
+        }, status=status.HTTP_409_CONFLICT)
+
+    aws_connection = AWSConnection.objects.filter(
+        user_id=record.user_id, status='active'
+    ).first()
+    if aws_connection is None:
+        return Response({
+            'success': False,
+            'stage': 'AWS',
+            'error': 'AWS account connection not found.',
+            'connectUrl': '/connect-aws',
+        }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+    logger.info(
+        'User requested start for deployment %s (instance %s, was %s).',
+        record.pk, record.instance_id, record.deployment_status,
+    )
+    try:
+        aws_provider = AwsEc2Provider(user=record.user, connection=aws_connection)
+        result = aws_provider.start_instance(record.instance_id)
+    except AwsEc2Error as exc:
+        return Response({
+            'success': False,
+            'stage': 'AWS',
+            'error': f'Start failed: {exc}',
+        }, status=status.HTTP_502_BAD_GATEWAY)
+
+    new_status = record.deployment_status
+    if new_status != DeploymentStatus.RUNNING and is_valid_transition(
+        new_status, DeploymentStatus.RUNNING
+    ):
+        new_status = DeploymentStatus.RUNNING
+
+    start_message = result.get('message') or f'Deployment {record.pk} started.'
+    values = {
+        'deployment_status': new_status,
+        'progress': progress_for(new_status),
+        'status_message': start_message,
+        'error_code': '',
+        'error_message': '',
+        # the previous stop flag no longer applies once the instance runs
+        'cancel_requested': False,
+        'logs': list(record.logs or []) + list(result.get('logs') or []),
+        'updated_at': timezone.now(),
+    }
+    public_ip = result.get('public_ip')
+    if public_ip:
+        values['ip_address'] = public_ip
+    if new_status == DeploymentStatus.RUNNING:
+        values['finished_at'] = timezone.now()
+    DeploymentRecord.objects.filter(pk=record.pk).update(**values)
+
+    return Response({
+        'success': True,
+        'data': {
+            'deploymentId': record.pk,
+            'deploymentStatus': new_status,
+            'instanceId': record.instance_id,
+            'ipAddress': values.get('ip_address') or record.ip_address,
+            'region': result.get('region') or record.region,
+            'message': start_message,
             'logs': values['logs'],
         },
     }, status=status.HTTP_200_OK)
@@ -2646,3 +2816,177 @@ def deployment_rollback_view(request, deployment_id):
             'logs': record.logs,
         },
     }, status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated])
+def atlas_connection_view(request):
+    """
+    Current user's MongoDB Atlas integration status.
+
+    Reports the record state plus whether the server-side environment
+    configuration is present. Credentials are never returned — only
+    presence flags and the (non-secret) project id.
+    """
+    from .models import MongoDBAtlasConnection
+    from .services.deployment.mongodb_atlas_service import (
+        atlas_configured,
+        atlas_credentials,
+    )
+
+    public_key, private_key, env_project_id = atlas_credentials()
+    conn = MongoDBAtlasConnection.objects.filter(user=request.user).first()
+    connected = bool(conn and conn.status == 'connected')
+
+    return Response({
+        'connected': connected,
+        'configured': atlas_configured(),
+        'publicKeyPresent': bool(public_key),
+        'privateKeyPresent': bool(private_key),
+        'projectIdPresent': bool(env_project_id),
+        'projectId': (conn.project_id if conn else env_project_id) or '',
+        'status': (
+            conn.status if conn
+            else ('configured' if atlas_configured() else 'not_configured')
+        ),
+        'connectedAt': conn.connected_at if conn else None,
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+@permission_classes([permissions.IsAuthenticated])
+def atlas_connect_view(request):
+    """
+    Verify MongoDB Atlas authorization and record it for the signed-in
+    CloudWise user (creates/updates MongoDBAtlasConnection).
+
+    Credentials come from the server-side configuration when the
+    request does not carry explicit ones — the normal Connect Atlas
+    flow:
+
+        backend .env (MONGODB_ATLAS_PUBLIC_KEY / _PRIVATE_KEY / _PROJECT_ID)
+            → Atlas OAuth token
+            → read MONGODB_ATLAS_PROJECT_ID
+            → read the project Network Access list
+            → MongoDBAtlasConnection(status="connected")
+
+    The record is written **only** after that verification succeeds, so
+    the deployment check at pipeline.py:661 is a real authorization
+    gate rather than an environment-variable sniff. The private key is
+    stored with the existing Fernet encryption and is never returned,
+    never logged and never sent to the deployed application.
+    """
+    from .models import MongoDBAtlasConnection
+    from .services.deployment.atlas.atlas_client import AtlasClient
+    from .services.deployment.atlas.atlas_verification import (
+        verify_atlas_authorization,
+    )
+    from .services.deployment.mongodb_atlas_service import atlas_credentials
+
+    data = request.data if isinstance(request.data, dict) else {}
+    supplied_id = str(data.get('clientId') or '').strip()
+    supplied_secret = str(data.get('clientSecret') or '').strip()
+    supplied_project = str(data.get('projectId') or '').strip()
+    supplied = (supplied_id, supplied_secret, supplied_project)
+
+    env_public, env_private, env_project = atlas_credentials()
+
+    if any(supplied) and not all(supplied):
+        return Response({
+            'success': False,
+            'code': 'ATLAS_INCOMPLETE_CREDENTIALS',
+            'error': (
+                'Provide all of clientId, clientSecret and projectId, or '
+                'none of them to use the server-side configuration.'
+            ),
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    if all(supplied):
+        client_id, client_secret, project_id = supplied
+        source = 'request'
+    else:
+        client_id, client_secret, project_id = (
+            env_public, env_private, env_project
+        )
+        source = 'environment'
+
+    if not (client_id and client_secret and project_id):
+        missing = [
+            name for name, value in (
+                ('MONGODB_ATLAS_PUBLIC_KEY', client_id),
+                ('MONGODB_ATLAS_PRIVATE_KEY', client_secret),
+                ('MONGODB_ATLAS_PROJECT_ID', project_id),
+            )
+            if not value
+        ]
+        return Response({
+            'success': False,
+            'code': 'ATLAS_NOT_CONFIGURED',
+            'configured': False,
+            'error': (
+                'MongoDB Atlas is not configured on this server. Missing: '
+                f'{", ".join(missing)}. Add them to the backend .env file '
+                'and restart CloudWise, or provide the Atlas API key below.'
+            ),
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    client = AtlasClient(client_id, client_secret, project_id)
+    verification = verify_atlas_authorization(client)
+    if not verification['ok']:
+        logger.warning(
+            'Atlas connect verification failed for user %s: %s',
+            request.user.pk, verification['error_code'],
+        )
+        http_status = verification.get('http_status') or status.HTTP_502_BAD_GATEWAY
+        if http_status not in (
+            status.HTTP_400_BAD_REQUEST,
+            status.HTTP_401_UNAUTHORIZED,
+            status.HTTP_403_FORBIDDEN,
+        ):
+            http_status = status.HTTP_502_BAD_GATEWAY
+        return Response({
+            'success': False,
+            'code': verification['error_code'],
+            'configured': bool(env_public and env_private and env_project),
+            'error': verification['message'],
+        }, status=http_status)
+
+    # OneToOne(user) → get_or_create can never create a duplicate row.
+    conn, _created = MongoDBAtlasConnection.objects.get_or_create(
+        user=request.user,
+        defaults={
+            'client_id': client_id,
+            'project_id': project_id,
+            'status': 'connected',
+        },
+    )
+    conn.client_id = client_id
+    conn.project_id = project_id
+    conn.status = 'connected'
+    conn.set_secret(client_secret)  # Fernet-encrypted at rest
+    conn.save()
+
+    logger.info(
+        'Atlas integration connected for user %s (project %s, source %s)',
+        request.user.pk, project_id, source,
+    )
+    return Response({
+        'success': True,
+        'data': {
+            'projectId': conn.project_id,
+            'status': conn.status,
+            'connectedAt': conn.connected_at,
+            'source': source,
+            'projectName': verification.get('project_name') or '',
+            'publicKeyPresent': True,
+        },
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+@permission_classes([permissions.IsAuthenticated])
+def atlas_disconnect_view(request):
+    """Remove Atlas API credentials."""
+    from .models import MongoDBAtlasConnection
+    MongoDBAtlasConnection.objects.filter(user=request.user).delete()
+    return Response({'success': True}, status=status.HTTP_200_OK)
