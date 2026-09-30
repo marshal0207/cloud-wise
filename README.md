@@ -38,6 +38,9 @@ pip install -r requirements.txt
 # Run database migrations
 python manage.py migrate
 
+# Populate multi-cloud pricing cache (AWS, Azure, GCP compute tiers)
+python manage.py refresh_pricing
+
 # Start Django development server (runs on http://127.0.0.1:8000)
 python manage.py runserver 127.0.0.1:8000
 ```
@@ -90,9 +93,11 @@ The frontend will start at `http://localhost:5173` and automatically proxy `/api
 - Dynamic Cost Optimization Tuning
 - Django Admin Control Panel for Data Management
 
-# Django setup
-```
-    .\.venv\Scripts\Activate.ps1 
-    python manage.py runserver
-```
+---
+
+## ☁️ AWS Sandbox & Least-Privilege IAM Policy
+
+For full details on configuring the team AWS sandbox account with Free Tier guardrails (strictly enforcing 2 vCPUs, 2 GB RAM, and 30 GB EBS matching `free_tier_policy.py`), see:
+📄 [docs/AWS_SANDBOX_IAM_POLICY.md](docs/AWS_SANDBOX_IAM_POLICY.md)
+
 
