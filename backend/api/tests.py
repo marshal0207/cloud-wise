@@ -283,6 +283,7 @@ class BackendApiTests(TestCase):
             hourly_usd=Decimal('0.1460'),
             specs={'vcpu': 4, 'ramGB': 16, 'storageGB': 100},
             source='GCP Pricing (Estimated Fallback)',
+            estimated=True,
         )
 
         res = self.client.get('/api/pricing/compare?vcpu=4&ram=16&region=Asia%20Pacific%20(Mumbai)')
@@ -298,6 +299,52 @@ class BackendApiTests(TestCase):
         self.assertEqual(data['providers']['AWS']['monthlyInr'], 10300)
         self.assertEqual(data['providers']['Azure']['monthlyInr'], 11633)
         self.assertEqual(data['providers']['GCP']['monthlyInr'], 8846)
+        self.assertFalse(data['providers']['AWS']['estimated'])
+        self.assertFalse(data['providers']['Azure']['estimated'])
+        self.assertTrue(data['providers']['GCP']['estimated'])
+
+    def test_pricing_compare_surfaces_boolean_estimated_flag(self):
+        from api.models import CloudPricingCache
+        from decimal import Decimal
+
+        # Explicitly verify boolean estimated flag is returned, not just source string
+        CloudPricingCache.objects.create(
+            provider='AWS',
+            instance_type='t3.small',
+            region='Asia Pacific (Mumbai)',
+            price_per_month=Decimal('1245.00'),
+            hourly_usd=Decimal('0.0208'),
+            specs={'vcpu': 1, 'ramGB': 2},
+            source='AWS Pricing API',
+            estimated=False,
+        )
+        CloudPricingCache.objects.create(
+            provider='Azure',
+            instance_type='Standard_B1ms',
+            region='Asia Pacific (Mumbai)',
+            price_per_month=Decimal('1250.00'),
+            hourly_usd=Decimal('0.0207'),
+            specs={'vcpu': 1, 'ramGB': 2},
+            source='Azure Pricing (Estimated Fallback)',
+            estimated=True,
+        )
+        CloudPricingCache.objects.create(
+            provider='GCP',
+            instance_type='e2-custom-1-2048',
+            region='Asia Pacific (Mumbai)',
+            price_per_month=Decimal('1150.00'),
+            hourly_usd=Decimal('0.0190'),
+            specs={'vcpu': 1, 'ramGB': 2},
+            source='GCP Pricing (Estimated Fallback)',
+            estimated=True,
+        )
+
+        res = self.client.get('/api/pricing/compare?vcpu=1&ram=2')
+        self.assertEqual(res.status_code, 200)
+        providers = res.json()['data']['providers']
+        self.assertIs(providers['AWS']['estimated'], False)
+        self.assertIs(providers['Azure']['estimated'], True)
+        self.assertIs(providers['GCP']['estimated'], True)
 
     def test_pricing_compare_closest_match_within_20_percent(self):
         from api.models import CloudPricingCache

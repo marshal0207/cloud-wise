@@ -87,6 +87,9 @@ def get_or_fetch_provider_pricing(
     ).first()
 
     if cached and match_type in ('EXACT_TIER', 'CLOSEST_MATCH'):
+        is_estimated = getattr(cached, 'estimated', None)
+        if is_estimated is None:
+            is_estimated = cached.specs.get('estimated', 'Estimated' in (cached.source or ''))
         return {
             'provider': provider,
             'instanceType': cached.instance_type,
@@ -98,7 +101,7 @@ def get_or_fetch_provider_pricing(
             'matchedTier': matched_tier_name,
             'specs': cached.specs,
             'lastUpdated': cached.last_updated.isoformat(),
-            'estimated': 'Estimated' in cached.source,
+            'estimated': bool(is_estimated),
         }
 
     # Fetch live
@@ -133,6 +136,7 @@ def get_or_fetch_provider_pricing(
     hourly_usd = Decimal(str(snapshot.get('hourlyUsd', 0.0)))
     source = snapshot.get('source', 'API')
     specs = snapshot.get('specs', {})
+    is_estimated = bool(snapshot.get('estimated', False))
 
     # Upsert into cache
     cache_entry, _ = CloudPricingCache.objects.update_or_create(
@@ -144,6 +148,7 @@ def get_or_fetch_provider_pricing(
             'hourly_usd': hourly_usd,
             'specs': specs,
             'source': source,
+            'estimated': is_estimated,
         },
     )
 
@@ -158,7 +163,7 @@ def get_or_fetch_provider_pricing(
         'matchedTier': matched_tier_name,
         'specs': specs,
         'lastUpdated': cache_entry.last_updated.isoformat(),
-        'estimated': snapshot.get('estimated', False),
+        'estimated': is_estimated,
     }
 
 

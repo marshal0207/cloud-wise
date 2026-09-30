@@ -226,6 +226,7 @@ class Command(BaseCommand):
                     'hourly_usd': hourly_usd,
                     'specs': specs,
                     'source': source,
+                    'estimated': bool(snapshot.get('estimated', False)),
                 },
             )
             action = 'Created' if created else 'Updated'

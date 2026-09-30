@@ -167,6 +167,7 @@ class CloudPricingCache(models.Model):
     hourly_usd = models.DecimalField(max_digits=10, decimal_places=4, default=0.0)
     specs = models.JSONField(default=dict)
     source = models.CharField(max_length=100, default='API')
+    estimated = models.BooleanField(default=False)
     last_updated = models.DateTimeField(auto_now=True)
 
     class Meta:

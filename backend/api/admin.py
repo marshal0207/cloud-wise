@@ -47,6 +47,6 @@ class WaitlistSubscriberAdmin(admin.ModelAdmin):
 
 @admin.register(CloudPricingCache)
 class CloudPricingCacheAdmin(admin.ModelAdmin):
-    list_display = ['provider', 'instance_type', 'region', 'price_per_month', 'hourly_usd', 'source', 'last_updated']
-    list_filter = ['provider', 'region', 'source']
+    list_display = ['provider', 'instance_type', 'region', 'price_per_month', 'hourly_usd', 'estimated', 'source', 'last_updated']
+    list_filter = ['provider', 'region', 'estimated', 'source']
     search_fields = ['provider', 'instance_type', 'region']
