@@ -77,7 +77,7 @@ export const Recommendation: React.FC = () => {
           Cloud Infrastructure Recommendations
         </h1>
         <p className="text-slate-400 text-sm sm:text-base leading-relaxed">
-          Based on your workload profile (<strong className="text-cyan-300">{estimation.appType}</strong> requiring ~{estimation.vcpu} vCPUs & {estimation.ram}GB RAM in {estimation.region}), we matched 4 top cloud configurations.
+          Based on your workload profile (<strong className="text-cyan-300">{estimation.appType}</strong> requiring ~{estimation.vcpu} vCPUs & {estimation.ram}GB RAM in {estimation.region}), we matched 3 top cloud configurations.
         </p>
         <p className="text-[11px] text-slate-500">
           AWS pricing: {awsPricingStatus === 'loading' ? 'loading live rate...' : awsPricingStatus === 'live' ? 'live AWS Pricing API' : 'estimated fallback'}; other providers are estimated.
@@ -142,7 +142,7 @@ export const Recommendation: React.FC = () => {
       </div>
 
       {/* Cards Comparison Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
         {recommendations.map((rec) => {
           const isSelected = selectedRecommendation.id === rec.id;
 

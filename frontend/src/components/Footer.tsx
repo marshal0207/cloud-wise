@@ -61,7 +61,6 @@ export const Footer: React.FC = () => {
               <span className="px-2.5 py-1 rounded bg-slate-900 border border-slate-800 text-[11px] text-slate-300 font-medium">Amazon Web Services</span>
               <span className="px-2.5 py-1 rounded bg-slate-900 border border-slate-800 text-[11px] text-slate-300 font-medium">Microsoft Azure</span>
               <span className="px-2.5 py-1 rounded bg-slate-900 border border-slate-800 text-[11px] text-slate-300 font-medium">Google Cloud</span>
-              <span className="px-2.5 py-1 rounded bg-slate-900 border border-slate-800 text-[11px] text-slate-300 font-medium">DigitalOcean</span>
             </div>
           </div>
 

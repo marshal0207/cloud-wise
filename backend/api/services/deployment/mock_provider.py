@@ -2,7 +2,7 @@
 MockDeploymentProvider — Simulated deployment provider.
 
 This provider NEVER:
-  - Calls AWS, Azure, GCP, or DigitalOcean APIs
+  - Calls AWS, Azure, or GCP APIs
   - Creates real cloud resources
   - Uses or exposes AWS/cloud credentials
   - Stores GitHub tokens or passwords
@@ -81,9 +81,9 @@ class MockDeploymentProvider(DeploymentProvider):
         if not configuration.get("environment_name"):
             raise ValueError("configuration must include 'environment_name'.")
 
-        # Allow Vercel, Render, AWS, Azure, GCP, DigitalOcean, and MOCK
+        # Allow Vercel, Render, AWS, Azure, GCP, and MOCK
         requested_provider = str(configuration.get("provider", "MOCK")).upper()
-        allowed_providers = ("MOCK", "VERCEL", "RENDER", "AWS", "AZURE", "GCP", "DIGITALOCEAN", "", "NONE")
+        allowed_providers = ("MOCK", "VERCEL", "RENDER", "AWS", "AZURE", "GCP", "", "NONE")
         if requested_provider not in allowed_providers:
             raise UnsupportedProviderError(
                 f"Provider '{requested_provider}' is not supported. "

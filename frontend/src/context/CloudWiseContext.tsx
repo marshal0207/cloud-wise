@@ -34,7 +34,7 @@ export interface EstimationData {
 export interface RecommendationOption {
   id: string;
   title: string;
-  provider: 'AWS' | 'Azure' | 'GCP' | 'DigitalOcean';
+  provider: 'AWS' | 'Azure' | 'GCP';
   badge: 'Recommended' | 'Alternative' | 'Budget Option' | 'Performance Option';
   specs: {
     vcpu: number;
@@ -188,7 +188,6 @@ export const buildRecommendations = (est: EstimationData): RecommendationOption[
   const awsCost  = Math.round(base * 1.00);
   const gcpCost  = Math.round(base * 1.16);
   const azureCost = Math.round(base * 1.11);
-  const doCost   = Math.round(base * 0.74);
   return [
     {
       id: 'aws-rec-1',
@@ -225,18 +224,6 @@ export const buildRecommendations = (est: EstimationData): RecommendationOption[
       reliability: '99.95% SLA',
       features: ['Azure Defender', 'Accelerated Networking', 'Hybrid Benefit', 'Zone Redundant Storage'],
       reasoning: `Azure Dsv5 suits enterprise compliance and hybrid deployments for ${est.appType} in ${region}.`,
-    },
-    {
-      id: 'do-rec-4',
-      title: `DigitalOcean (CPU-Opt — ${vcpu}vCPU/${Math.round(ram * 0.5)}GB)`,
-      provider: 'DigitalOcean',
-      badge: 'Budget Option',
-      specs: { vcpu, ram: Math.round(ram * 0.5), storage: `${Math.round(storage * 0.8)} GB NVMe SSD`, network: '5 Gbps' },
-      monthlyCost: doCost,
-      hourlyCost: Math.round((doCost / 720) * 100) / 100,
-      reliability: '99.99% SLA',
-      features: ['Free 5TB Bandwidth', 'Simple Firewalls', '1-Click Monitoring', 'Fixed Pricing'],
-      reasoning: `DigitalOcean offers maximum savings with flat pricing for budget-conscious ${est.appType} deployments.`,
     },
   ];
 };

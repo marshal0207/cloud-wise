@@ -166,7 +166,7 @@ export const Auth: React.FC = () => {
         <p className="text-xs sm:text-sm text-slate-400">
           {activeTab === 'login' 
             ? 'Access your multi-cloud cluster sizing and cost optimization portal.'
-            : 'Start optimizing infrastructure spend across AWS, Azure, GCP & DigitalOcean.'}
+            : 'Start optimizing infrastructure spend across AWS, Azure & GCP.'}
         </p>
       </div>
 

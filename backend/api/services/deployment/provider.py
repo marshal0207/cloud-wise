@@ -2,7 +2,7 @@
 DeploymentProvider — Abstract base class for all deployment providers.
 
 Defines the provider-independent interface that every deployment
-backend (Mock, future AWS, Azure, GCP, DigitalOcean) must implement.
+backend (Mock, future AWS, Azure, GCP) must implement.
 No cloud SDK is imported here. No credentials are referenced.
 """
 

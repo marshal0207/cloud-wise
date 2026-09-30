@@ -35,7 +35,7 @@ export const About: React.FC = () => {
       num: '02',
       title: 'Multi-Cloud Matching',
       icon: Sparkles,
-      desc: 'Benchmark monthly and hourly instance rates across AWS, Azure, GCP, and DigitalOcean with AI reasoning.',
+      desc: 'Benchmark monthly and hourly instance rates across AWS, Azure, and GCP with AI reasoning.',
       route: '/recommendation'
     },
     {
@@ -117,7 +117,7 @@ export const About: React.FC = () => {
             </li>
             <li className="flex items-center gap-2">
               <span className="w-1.5 h-1.5 rounded-full bg-rose-400 shrink-0" />
-              <span>Opaque pricing across AWS, Azure, GCP, and DigitalOcean</span>
+              <span>Opaque pricing across AWS, Azure, and GCP</span>
             </li>
             <li className="flex items-center gap-2">
               <span className="w-1.5 h-1.5 rounded-full bg-rose-400 shrink-0" />
@@ -209,7 +209,7 @@ export const About: React.FC = () => {
             <Globe2 className="w-6 h-6 text-indigo-400" />
             <h4 className="text-base font-bold text-white">SaaS Founders & CTOs</h4>
             <p className="text-xs text-slate-400 leading-relaxed">
-              Gain transparent multi-cloud unit economics. Compare AWS, GCP, Azure, and DigitalOcean rates before scaling your startup.
+              Gain transparent multi-cloud unit economics. Compare AWS, GCP, and Azure rates before scaling your startup.
             </p>
           </div>
 
