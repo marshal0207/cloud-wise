@@ -47,6 +47,11 @@ export interface RecommendationOption {
   reliability: string;
   features: string[];
   reasoning?: string;
+  instanceType?: string;
+  matchType?: 'EXACT_TIER' | 'CLOSEST_MATCH' | 'ON_DEMAND_LOOKUP';
+  matchedTier?: string | null;
+  estimated?: boolean;
+  source?: string;
 }
 
 export interface DeploymentDetails {
@@ -176,7 +181,7 @@ export const buildOptimizations = (monthlyCost: number, vcpu: number, storage: n
 
 export const defaultOptimizations: OptimizationItem[] = buildOptimizations(12280, 8, 500);
 
-export const buildRecommendations = (est: EstimationData): RecommendationOption[] => {
+export const buildRecommendations = (est: EstimationData, compareData?: any): RecommendationOption[] => {
   const vcpu = est.vcpu;
   const ram = est.ram;
   const storage = est.storage;
@@ -185,45 +190,79 @@ export const buildRecommendations = (est: EstimationData): RecommendationOption[
     : region.toLowerCase().includes('bengaluru') ? 1.05
     : region.toLowerCase().includes('kolkata') ? 0.96 : 1.0;
   const base = Math.round((vcpu * 1000 + ram * 200 + storage * 6) * regionMult);
-  const awsCost  = Math.round(base * 1.00);
-  const gcpCost  = Math.round(base * 1.16);
-  const azureCost = Math.round(base * 1.11);
+  const fallbackAwsCost  = Math.round(base * 1.00);
+  const fallbackGcpCost  = Math.round(base * 1.16);
+  const fallbackAzureCost = Math.round(base * 1.11);
+
+  const awsData = compareData?.providers?.AWS;
+  const azureData = compareData?.providers?.Azure;
+  const gcpData = compareData?.providers?.GCP;
+
+  const awsCost = awsData?.monthlyInr ?? fallbackAwsCost;
+  const awsHourly = awsData?.hourlyUsd ?? Math.round((fallbackAwsCost / 730) * 100) / 100;
+  const awsInstance = awsData?.instanceType ?? `c6i.${vcpu > 4 ? '2xlarge' : vcpu > 2 ? 'xlarge' : 'large'}`;
+
+  const gcpCost = gcpData?.monthlyInr ?? fallbackGcpCost;
+  const gcpHourly = gcpData?.hourlyUsd ?? Math.round((fallbackGcpCost / 730) * 100) / 100;
+  const gcpInstance = gcpData?.instanceType ?? `e2-custom-${vcpu}-${ram * 1024}`;
+
+  const azureCost = azureData?.monthlyInr ?? fallbackAzureCost;
+  const azureHourly = azureData?.hourlyUsd ?? Math.round((fallbackAzureCost / 730) * 100) / 100;
+  const azureInstance = azureData?.instanceType ?? `Standard_D${vcpu}s_v5`;
+
+  const usdRate = compareData?.usdToInrRate ?? 83.0;
+
   return [
     {
       id: 'aws-rec-1',
-      title: `AWS (c6i — ${vcpu}vCPU/${ram}GB)`,
+      title: `AWS (${awsInstance} — ${vcpu}vCPU/${ram}GB)`,
       provider: 'AWS',
       badge: 'Recommended',
       specs: { vcpu, ram, storage: `${storage} GB NVMe SSD`, network: '10 Gbps' },
       monthlyCost: awsCost,
-      hourlyCost: Math.round((awsCost / 720) * 100) / 100,
+      hourlyCost: awsHourly,
       reliability: '99.99% SLA',
       features: ['Auto-scaling enabled', 'AWS Shield DDoS Protection', 'Daily EBS Snapshots', 'Multi-AZ Replication'],
-      reasoning: `AWS c6i provides optimal compute throughput for ${est.appType} with ${vcpu} vCPUs and ${ram}GB RAM in ${region}.`,
+      reasoning: `AWS ${awsInstance} provides optimal compute throughput for ${est.appType} with ${vcpu} vCPUs and ${ram}GB RAM in ${region}. Rate: $${awsHourly}/hr (₹${awsCost}/mo at ₹${usdRate}/USD).`,
+      instanceType: awsInstance,
+      matchType: awsData?.matchType ?? 'EXACT_TIER',
+      matchedTier: awsData?.matchedTier ?? null,
+      estimated: awsData ? Boolean(awsData.estimated) : true,
+      source: awsData?.source ?? 'Static Fallback Model',
     },
     {
       id: 'gcp-rec-2',
-      title: `GCP (n2-standard — ${vcpu}vCPU/${ram}GB)`,
+      title: `GCP (${gcpInstance} — ${vcpu}vCPU/${ram}GB)`,
       provider: 'GCP',
       badge: 'Performance Option',
       specs: { vcpu, ram, storage: `${storage} GB Hyperdisk`, network: '16 Gbps' },
       monthlyCost: gcpCost,
-      hourlyCost: Math.round((gcpCost / 720) * 100) / 100,
+      hourlyCost: gcpHourly,
       reliability: '99.99% SLA',
       features: ['Custom machine types', 'Google Cloud Armor', 'Live Migration', 'Sustained Use Discount'],
-      reasoning: `GCP n2-standard offers 16 Gbps network bandwidth ideal for high-traffic ${est.appType} workloads.`,
+      reasoning: `GCP ${gcpInstance} offers high network throughput ideal for high-traffic ${est.appType} workloads. Rate: $${gcpHourly}/hr (₹${gcpCost}/mo at ₹${usdRate}/USD).`,
+      instanceType: gcpInstance,
+      matchType: gcpData?.matchType ?? 'EXACT_TIER',
+      matchedTier: gcpData?.matchedTier ?? null,
+      estimated: gcpData ? Boolean(gcpData.estimated) : true,
+      source: gcpData?.source ?? 'Static Fallback Model',
     },
     {
       id: 'azure-rec-3',
-      title: `Azure (Dsv5 — ${vcpu}vCPU/${ram}GB)`,
+      title: `Azure (${azureInstance} — ${vcpu}vCPU/${ram}GB)`,
       provider: 'Azure',
       badge: 'Alternative',
       specs: { vcpu, ram, storage: `${storage} GB Premium SSD`, network: '12 Gbps' },
       monthlyCost: azureCost,
-      hourlyCost: Math.round((azureCost / 720) * 100) / 100,
+      hourlyCost: azureHourly,
       reliability: '99.95% SLA',
       features: ['Azure Defender', 'Accelerated Networking', 'Hybrid Benefit', 'Zone Redundant Storage'],
-      reasoning: `Azure Dsv5 suits enterprise compliance and hybrid deployments for ${est.appType} in ${region}.`,
+      reasoning: `Azure ${azureInstance} suits enterprise compliance and hybrid deployments for ${est.appType} in ${region}. Rate: $${azureHourly}/hr (₹${azureCost}/mo at ₹${usdRate}/USD).`,
+      instanceType: azureInstance,
+      matchType: azureData?.matchType ?? 'EXACT_TIER',
+      matchedTier: azureData?.matchedTier ?? null,
+      estimated: azureData ? Boolean(azureData.estimated) : true,
+      source: azureData?.source ?? 'Static Fallback Model',
     },
   ];
 };
@@ -252,6 +291,10 @@ interface CloudWiseContextType {
   selectedRecommendation: RecommendationOption;
   setSelectedRecommendation: (rec: RecommendationOption) => void;
   availableRecommendations: RecommendationOption[];
+  pricingLoading: boolean;
+  pricingError: string | null;
+  pricingComparison: any | null;
+  refetchPricingComparison: () => Promise<void>;
   
   githubRepo?: { name: string; connectedAt: string; synced: boolean };
   connectGitHub: (repoName: string) => Promise<boolean>;
@@ -606,7 +649,37 @@ export const CloudWiseProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     updateActiveProject({ estimation: updatedEst, currentStep: 'estimation' });
   };
 
-  const availableRecommendations = buildRecommendations(estimation);
+  // Live multi-cloud pricing comparison
+  const [pricingComparison, setPricingComparison] = useState<any | null>(null);
+  const [pricingLoading, setPricingLoading] = useState<boolean>(true);
+  const [pricingError, setPricingError] = useState<string | null>(null);
+
+  const fetchPricingComparison = async () => {
+    setPricingLoading(true);
+    setPricingError(null);
+    try {
+      const res = await fetch(
+        `/api/pricing/compare?vcpu=${estimation.vcpu}&ram=${estimation.ram}&storage=${estimation.storage}&region=${encodeURIComponent(estimation.region)}`
+      );
+      const data = await res.json();
+      if (res.ok && data.success && data.data) {
+        setPricingComparison(data.data);
+      } else {
+        setPricingError(data.error || 'Failed to load live multi-cloud comparison');
+      }
+    } catch (err: any) {
+      console.warn('Pricing compare API error:', err);
+      setPricingError('Could not reach multi-cloud comparison API');
+    } finally {
+      setPricingLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchPricingComparison();
+  }, [estimation.vcpu, estimation.ram, estimation.storage, estimation.region]);
+
+  const availableRecommendations = buildRecommendations(estimation, pricingComparison);
   const selectedRecommendation = (() => {
     const saved = activeProject?.selectedRecommendation;
     if (!saved) return availableRecommendations[0];
@@ -830,6 +903,10 @@ export const CloudWiseProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         selectedRecommendation,
         setSelectedRecommendation,
         availableRecommendations,
+        pricingLoading,
+        pricingError,
+        pricingComparison,
+        refetchPricingComparison: fetchPricingComparison,
         githubRepo: activeProject?.githubRepo,
         connectGitHub,
         deployment,
