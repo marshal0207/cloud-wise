@@ -67,10 +67,7 @@ export const SlideTabs: React.FC<SlideTabsProps> = ({ items, className }) => {
     >
       <ul
         ref={containerRef}
-        onMouseLeave={() => {
-          updatePosition(selectedIndex);
-        }}
-        className="relative flex w-fit max-w-[calc(100vw-1rem)] overflow-x-auto rounded-full border-2 border-slate-700/80 bg-slate-950/90 p-1 shadow-2xl shadow-cyan-950/50 backdrop-blur-xl scrollbar-none"
+        className="relative flex w-fit max-w-[calc(100vw-1rem)] overflow-x-auto rounded-full bg-transparent p-1 scrollbar-none"
       >
         {items.map((item, index) => {
           const Icon = item.icon;
@@ -87,16 +84,13 @@ export const SlideTabs: React.FC<SlideTabsProps> = ({ items, className }) => {
               <Link
                 to={item.url}
                 title={item.name}
-                onMouseEnter={() => {
-                  updatePosition(index);
-                }}
                 className={cn(
-                  'relative flex cursor-pointer items-center gap-1.5 rounded-full px-2 py-1.5 text-xs font-medium transition-colors sm:gap-2 sm:px-3 sm:py-2 sm:text-sm',
-                  isActive ? 'text-white' : 'text-slate-400 hover:text-white',
+                  'relative flex cursor-pointer items-center gap-1.5 rounded-full px-2 py-1.5 text-xs font-semibold transition-colors sm:gap-2 sm:px-3 sm:py-2 sm:text-[13px]',
+                  isActive ? 'text-emerald-400' : 'text-slate-400 hover:text-emerald-400',
                 )}
               >
-                <Icon size={16} strokeWidth={isActive ? 2.5 : 2} />
-                <span className="hidden whitespace-nowrap md:inline">{item.name}</span>
+                <Icon size={14} strokeWidth={isActive ? 2.5 : 2} />
+                <span className="hidden whitespace-nowrap lg:inline">{item.name}</span>
               </Link>
             </li>
           );
@@ -105,8 +99,8 @@ export const SlideTabs: React.FC<SlideTabsProps> = ({ items, className }) => {
         <motion.li
           aria-hidden="true"
           animate={position}
-          transition={{ type: 'spring', stiffness: 320, damping: 28 }}
-          className="pointer-events-none absolute inset-y-1 z-0 rounded-full bg-cyan-400 shadow-[0_0_18px_rgba(34,211,238,0.45)]"
+          transition={{ duration: 0.35, ease: [0.22, 1, 0.36, 1] }}
+          className="pointer-events-none absolute inset-y-1 z-0 rounded-full bg-slate-800/60 border border-slate-700 shadow-[0_0_15px_rgba(16,185,129,0.05)]"
         />
       </ul>
     </nav>

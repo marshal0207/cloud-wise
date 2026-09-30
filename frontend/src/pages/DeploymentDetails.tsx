@@ -189,7 +189,7 @@ export const DeploymentDetails: React.FC = () => {
         </p>
         <button
           onClick={() => navigate('/deployment')}
-          className="px-4 py-2 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs"
+          className="px-4 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs"
         >
           Back to Deploy
         </button>
@@ -201,7 +201,7 @@ export const DeploymentDetails: React.FC = () => {
   const tone =
     STATUS_TONE[status] ||
     (IN_FLIGHT.has(status)
-      ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40 animate-pulse'
+      ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40 animate-pulse'
       : 'bg-slate-800 text-slate-300 border-slate-700');
 
   const canRetry = status === 'FAILED' || status === 'ROLLED_BACK';
@@ -219,7 +219,7 @@ export const DeploymentDetails: React.FC = () => {
 
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div className="space-y-2">
-          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-cyan-500/10 border border-cyan-500/30 text-cyan-300 text-xs font-semibold">
+          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs font-semibold">
             <Server className="w-3.5 h-3.5" />
             <span>Deployment {record.id}</span>
           </div>
@@ -249,9 +249,9 @@ export const DeploymentDetails: React.FC = () => {
               href={openableUrl}
               target="_blank"
               rel="noopener noreferrer"
-              className="text-lg font-extrabold text-white hover:text-cyan-300 flex items-center gap-2 underline underline-offset-4 break-all"
+              className="text-lg font-extrabold text-white hover:text-emerald-300 flex items-center gap-2 underline underline-offset-4 break-all"
             >
-              <Globe size={18} className="text-cyan-400 shrink-0" />
+              <Globe size={18} className="text-emerald-400 shrink-0" />
               <span>{openableUrl}</span>
             </a>
           </div>
@@ -271,7 +271,7 @@ export const DeploymentDetails: React.FC = () => {
         <button
           onClick={() => void act('health', 'health', 'Health check completed.')}
           disabled={!!busy}
-          className="px-3.5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-emerald-400 font-bold text-xs flex items-center gap-1.5 disabled:opacity-50"
+          className="px-3.5 py-2 rounded-xl bg-[#080D14] hover:bg-slate-800 border border-slate-700 text-emerald-400 font-bold text-xs flex items-center gap-1.5 disabled:opacity-50"
         >
           <Activity size={14} />
           <span>Run Health Check</span>
@@ -279,7 +279,7 @@ export const DeploymentDetails: React.FC = () => {
         <button
           onClick={() => void load()}
           disabled={!!busy}
-          className="px-3.5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-200 font-bold text-xs flex items-center gap-1.5 disabled:opacity-50"
+          className="px-3.5 py-2 rounded-xl bg-[#080D14] hover:bg-slate-800 border border-slate-700 text-slate-200 font-bold text-xs flex items-center gap-1.5 disabled:opacity-50"
         >
           <RefreshCw size={14} className={busy === 'refresh' ? 'animate-spin' : ''} />
           <span>Refresh</span>
@@ -288,7 +288,7 @@ export const DeploymentDetails: React.FC = () => {
           <button
             onClick={() => void act('retry', 'retry', 'Retry queued.')}
             disabled={!!busy}
-            className="px-3.5 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white font-bold text-xs flex items-center gap-1.5 disabled:opacity-50"
+            className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs flex items-center gap-1.5 disabled:opacity-50"
           >
             <RefreshCw size={14} />
             <span>Retry</span>
@@ -344,7 +344,7 @@ export const DeploymentDetails: React.FC = () => {
         {/* Facts */}
         <div className="glass-panel p-6 rounded-3xl border border-slate-800 space-y-4">
           <h3 className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
-            <ListChecks className="w-4 h-4 text-cyan-400" />
+            <ListChecks className="w-4 h-4 text-emerald-400" />
             Deployment Facts
           </h3>
           <div>
@@ -374,16 +374,16 @@ export const DeploymentDetails: React.FC = () => {
           <div className="pt-2 border-t border-slate-800 space-y-1.5">
             <div className="flex justify-between text-xs">
               <span className="text-slate-400">Progress</span>
-              <span className="text-cyan-400 font-bold">{record.progress ?? 0}%</span>
+              <span className="text-emerald-400 font-bold">{record.progress ?? 0}%</span>
             </div>
-            <div className="w-full h-2.5 rounded-full bg-slate-900 overflow-hidden border border-slate-800">
+            <div className="w-full h-2.5 rounded-full bg-[#080D14] overflow-hidden border border-slate-800">
               <div
                 className={`h-full rounded-full transition-all duration-500 ${
                   status === 'FAILED'
                     ? 'bg-rose-500'
                     : status === 'RUNNING'
                     ? 'bg-emerald-400'
-                    : 'bg-gradient-to-r from-cyan-500 to-blue-500'
+                    : 'bg-gradient-to-r from-emerald-500 to-blue-500'
                 }`}
                 style={{ width: `${record.progress ?? 0}%` }}
               />
@@ -392,11 +392,11 @@ export const DeploymentDetails: React.FC = () => {
 
           <div className="pt-2 border-t border-slate-800 space-y-1 text-[11px] text-slate-400">
             <p className="flex items-center gap-1.5">
-              <GitCommitHorizontal size={13} className="text-cyan-400" />
+              <GitCommitHorizontal size={13} className="text-emerald-400" />
               {record.commitSha ? `Resolved from commit ${record.commitSha.slice(0, 7)}` : 'Commit not recorded'}
             </p>
             <p className="flex items-center gap-1.5">
-              <Monitor size={13} className="text-cyan-400" />
+              <Monitor size={13} className="text-emerald-400" />
               {record.provider} provider · user-assumed IAM role
             </p>
           </div>
@@ -404,9 +404,9 @@ export const DeploymentDetails: React.FC = () => {
 
         {/* Logs */}
         <div className="lg:col-span-2 glass-panel rounded-3xl border border-slate-800 overflow-hidden">
-          <div className="bg-slate-900/90 px-6 py-3 border-b border-slate-800 flex items-center justify-between gap-3">
+          <div className="bg-[#080D14]/90 px-6 py-3 border-b border-slate-800 flex items-center justify-between gap-3">
             <h3 className="text-xs font-bold text-white flex items-center gap-2">
-              <Terminal className="w-4 h-4 text-cyan-400" />
+              <Terminal className="w-4 h-4 text-emerald-400" />
               <span>Deployment Logs</span>
             </h3>
             <div className="flex items-center gap-3">
@@ -415,7 +415,7 @@ export const DeploymentDetails: React.FC = () => {
               </span>
               <button
                 onClick={() => setShowLogs(v => !v)}
-                className="text-[11px] font-semibold text-cyan-400 hover:text-cyan-300"
+                className="text-[11px] font-semibold text-emerald-400 hover:text-emerald-300"
               >
                 {showLogs ? 'Hide' : 'Show'}
               </button>
@@ -423,7 +423,7 @@ export const DeploymentDetails: React.FC = () => {
           </div>
 
           {showLogs && (
-            <div className="p-5 bg-slate-950 font-mono text-[11px] leading-relaxed max-h-[32rem] overflow-y-auto space-y-1">
+            <div className="p-5 bg-[#05080D] font-mono text-[11px] leading-relaxed max-h-[32rem] overflow-y-auto space-y-1">
               {(record.logs || []).length === 0 ? (
                 <p className="text-slate-600 text-center py-8">
                   No log entries recorded yet.
@@ -451,10 +451,10 @@ export const DeploymentDetails: React.FC = () => {
             </div>
           )}
 
-          <div className="px-6 py-3 border-t border-slate-800 bg-slate-900/60 flex items-center gap-4 text-[11px] text-slate-400">
+          <div className="px-6 py-3 border-t border-slate-800 bg-[#080D14]/60 flex items-center gap-4 text-[11px] text-slate-400">
             <span className="flex items-center gap-1.5">
               {IN_FLIGHT.has(status) ? (
-                <RefreshCw size={12} className="animate-spin text-cyan-400" />
+                <RefreshCw size={12} className="animate-spin text-emerald-400" />
               ) : status === 'RUNNING' ? (
                 <CheckCircle2 size={12} className="text-emerald-400" />
               ) : (

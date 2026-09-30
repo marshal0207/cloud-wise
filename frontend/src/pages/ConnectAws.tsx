@@ -225,7 +225,7 @@ const CopyChip: React.FC<CopyChipProps> = ({
       className={`inline-flex shrink-0 items-center gap-1 rounded-lg border px-2 py-1 text-[11px] font-bold transition-colors ${
         copied
           ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
-          : 'border-cyan-500/30 bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20'
+          : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20'
       }`}
     >
       {copied ? <Check size={12} /> : <Copy size={12} />}
@@ -257,7 +257,7 @@ const PolicyBlock: React.FC<PolicyBlockProps> = ({
     <button
       type="button"
       onClick={onToggle}
-      className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-slate-400 transition-colors hover:text-cyan-300"
+      className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-slate-400 transition-colors hover:text-emerald-300"
     >
       <ChevronDown
         size={13}
@@ -266,7 +266,7 @@ const PolicyBlock: React.FC<PolicyBlockProps> = ({
       <span>{open ? 'Hide technical policy' : toggleLabel || 'View technical policy'}</span>
     </button>
     {open && (
-      <div className="space-y-2 rounded-2xl border border-slate-800 bg-slate-950/80 p-3">
+      <div className="space-y-2 rounded-2xl border border-slate-800 bg-[#05080D]/80 p-3">
         <div className="flex items-center justify-between">
           <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
             JSON policy
@@ -765,14 +765,14 @@ export const ConnectAws: React.FC = () => {
     return (
       <div className="min-h-screen max-w-3xl mx-auto px-4 py-16 text-center space-y-6">
         <div className="glass-panel p-10 rounded-3xl border border-slate-800 space-y-4">
-          <Cloud className="w-10 h-10 text-cyan-400 mx-auto" />
+          <Cloud className="w-10 h-10 text-emerald-400 mx-auto" />
           <h1 className="text-2xl font-extrabold text-white">Connect your AWS account</h1>
           <p className="text-sm text-slate-400">
             Sign in to authorize CloudWise to deploy into your AWS account.
           </p>
           <button
             onClick={() => navigate('/auth')}
-            className="px-6 py-3 rounded-xl bg-gradient-to-r from-cyan-400 to-blue-600 text-slate-950 font-bold text-sm"
+            className="px-6 py-3 rounded-xl bg-gradient-to-r from-emerald-400 to-blue-600 text-slate-950 font-bold text-sm"
           >
             Sign In / Register
           </button>
@@ -804,8 +804,8 @@ export const ConnectAws: React.FC = () => {
                 : step.status === 'failed'
                   ? 'border-rose-500/40 bg-rose-500/10'
                   : step.status === 'running'
-                    ? 'border-cyan-500/40 bg-cyan-500/5'
-                    : 'border-slate-800 bg-slate-900/40'
+                    ? 'border-emerald-500/40 bg-emerald-500/5'
+                    : 'border-slate-800 bg-[#080D14]/40'
             }`}
           >
             <span className="mt-0.5 shrink-0">
@@ -813,7 +813,7 @@ export const ConnectAws: React.FC = () => {
                 <CheckCircle2 size={16} className="text-emerald-400" />
               )}
               {step.status === 'running' && (
-                <Loader2 size={16} className="animate-spin text-cyan-300" />
+                <Loader2 size={16} className="animate-spin text-emerald-300" />
               )}
               {step.status === 'failed' && <X size={16} className="text-rose-400" />}
               {step.status === 'pending' && (
@@ -868,13 +868,13 @@ export const ConnectAws: React.FC = () => {
               type="button"
               onClick={() => void runVerification()}
               disabled={running}
-              className="rounded-lg border border-slate-600 bg-slate-900 px-3 py-1.5 text-[11px] font-bold text-slate-200 transition-colors hover:bg-slate-800 disabled:opacity-50"
+              className="rounded-lg border border-slate-600 bg-[#080D14] px-3 py-1.5 text-[11px] font-bold text-slate-200 transition-colors hover:bg-slate-800 disabled:opacity-50"
             >
               Try Again
             </button>
           </div>
           {connectError.technical && (
-            <details className="rounded-xl border border-slate-700/70 bg-slate-950/70 p-2.5">
+            <details className="rounded-xl border border-slate-700/70 bg-[#05080D]/70 p-2.5">
               <summary className="cursor-pointer text-[10px] font-bold uppercase tracking-wider text-slate-500">
                 Technical details (debugging)
               </summary>
@@ -906,7 +906,7 @@ export const ConnectAws: React.FC = () => {
       </div>
 
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-        <div className="rounded-2xl border border-slate-800 bg-slate-900/50 p-3.5">
+        <div className="rounded-2xl border border-slate-800 bg-[#080D14]/50 p-3.5">
           <span className="block text-[10px] font-bold uppercase tracking-wider text-slate-500">
             AWS Account
           </span>
@@ -914,7 +914,7 @@ export const ConnectAws: React.FC = () => {
             {connection?.accountId || '—'}
           </p>
         </div>
-        <div className="rounded-2xl border border-slate-800 bg-slate-900/50 p-3.5">
+        <div className="rounded-2xl border border-slate-800 bg-[#080D14]/50 p-3.5">
           <span className="block text-[10px] font-bold uppercase tracking-wider text-slate-500">
             Region
           </span>
@@ -922,21 +922,21 @@ export const ConnectAws: React.FC = () => {
             {connection?.region || '—'}
           </p>
         </div>
-        <div className="rounded-2xl border border-slate-800 bg-slate-900/50 p-3.5">
+        <div className="rounded-2xl border border-slate-800 bg-[#080D14]/50 p-3.5">
           <span className="block text-[10px] font-bold uppercase tracking-wider text-slate-500">
             Role
           </span>
-          <p className="mt-1 truncate font-mono text-sm font-bold text-cyan-300">
+          <p className="mt-1 truncate font-mono text-sm font-bold text-emerald-300">
             {roleShortName}
           </p>
         </div>
-        <div className="rounded-2xl border border-slate-800 bg-slate-900/50 p-3.5">
+        <div className="rounded-2xl border border-slate-800 bg-[#080D14]/50 p-3.5">
           <span className="block text-[10px] font-bold uppercase tracking-wider text-slate-500">
             Access
           </span>
           <p className="mt-1 text-sm font-bold text-white">Temporary STS credentials</p>
         </div>
-        <div className="rounded-2xl border border-slate-800 bg-slate-900/50 p-3.5 sm:col-span-2">
+        <div className="rounded-2xl border border-slate-800 bg-[#080D14]/50 p-3.5 sm:col-span-2">
           <span className="block text-[10px] font-bold uppercase tracking-wider text-slate-500">
             Last verified
           </span>
@@ -958,8 +958,8 @@ export const ConnectAws: React.FC = () => {
         ))}
       </ul>
 
-      <div className="rounded-2xl border border-cyan-500/25 bg-cyan-500/5 p-4">
-        <p className="text-xs leading-relaxed text-cyan-100/90">
+      <div className="rounded-2xl border border-emerald-500/25 bg-emerald-500/5 p-4">
+        <p className="text-xs leading-relaxed text-emerald-100/90">
           You don't need to configure EC2, Docker, networking, SSM, or servers
           manually. CloudWise handles the deployment infrastructure automatically.
         </p>
@@ -969,7 +969,7 @@ export const ConnectAws: React.FC = () => {
         <button
           type="button"
           onClick={() => navigate('/deployment')}
-          className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-cyan-400 to-blue-600 px-5 py-3 text-sm font-bold text-slate-950 shadow-lg shadow-cyan-500/20 transition-all hover:from-cyan-300 hover:to-blue-500"
+          className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-emerald-400 to-blue-600 px-5 py-3 text-sm font-bold text-slate-950 shadow-lg shadow-emerald-500/20 transition-all hover:from-emerald-300 hover:to-blue-500"
         >
           <span>Continue to Deployment</span>
           <ArrowRight size={16} />
@@ -978,7 +978,7 @@ export const ConnectAws: React.FC = () => {
           type="button"
           onClick={() => void handleDisconnect()}
           disabled={disconnecting}
-          className="inline-flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 text-xs font-semibold text-slate-300 transition-colors hover:border-rose-500/40 hover:text-rose-300 disabled:opacity-50"
+          className="inline-flex items-center gap-2 rounded-xl border border-slate-700 bg-[#080D14] px-4 py-3 text-xs font-semibold text-slate-300 transition-colors hover:border-rose-500/40 hover:text-rose-300 disabled:opacity-50"
         >
           <Unplug size={14} />
           <span>{disconnecting ? 'Disconnecting…' : 'Disconnect AWS'}</span>
@@ -1003,17 +1003,17 @@ export const ConnectAws: React.FC = () => {
       </div>
 
       <div className="flex flex-col items-center justify-center gap-3 sm:flex-row">
-        <div className="flex w-full items-center gap-3 rounded-2xl border border-slate-800 bg-slate-900/50 px-4 py-3 sm:w-auto">
+        <div className="flex w-full items-center gap-3 rounded-2xl border border-slate-800 bg-[#080D14]/50 px-4 py-3 sm:w-auto">
           <Github size={18} className="shrink-0 text-slate-300" />
           <span className="text-xs font-semibold text-slate-200">GitHub Repository</span>
         </div>
         <ArrowRight size={16} className="shrink-0 rotate-90 text-slate-500 sm:rotate-0" />
-        <div className="flex w-full items-center gap-3 rounded-2xl border border-cyan-500/30 bg-cyan-500/10 px-4 py-3 sm:w-auto">
-          <Cloud size={18} className="shrink-0 text-cyan-300" />
-          <span className="text-xs font-semibold text-cyan-200">CloudWise</span>
+        <div className="flex w-full items-center gap-3 rounded-2xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 sm:w-auto">
+          <Cloud size={18} className="shrink-0 text-emerald-300" />
+          <span className="text-xs font-semibold text-emerald-200">CloudWise</span>
         </div>
         <ArrowRight size={16} className="shrink-0 rotate-90 text-slate-500 sm:rotate-0" />
-        <div className="flex w-full items-center gap-3 rounded-2xl border border-slate-800 bg-slate-900/50 px-4 py-3 sm:w-auto">
+        <div className="flex w-full items-center gap-3 rounded-2xl border border-slate-800 bg-[#080D14]/50 px-4 py-3 sm:w-auto">
           <Server size={18} className="shrink-0 text-emerald-300" />
           <span className="text-xs font-semibold text-slate-200">Your AWS Account</span>
         </div>
@@ -1021,7 +1021,7 @@ export const ConnectAws: React.FC = () => {
 
       <div className="space-y-2.5">
         <Eyebrow>What you'll need</Eyebrow>
-        <div className="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-900/40 p-4">
+        <div className="flex items-start gap-3 rounded-2xl border border-slate-800 bg-[#080D14]/40 p-4">
           <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-emerald-500/10 border border-emerald-500/30">
             <Cloud size={15} className="text-emerald-300" />
           </span>
@@ -1037,7 +1037,7 @@ export const ConnectAws: React.FC = () => {
       <button
         type="button"
         onClick={() => setPhase('setup')}
-        className="w-full rounded-xl bg-gradient-to-r from-cyan-400 to-blue-600 px-6 py-3.5 text-sm font-bold text-slate-950 shadow-lg shadow-cyan-500/20 transition-all hover:from-cyan-300 hover:to-blue-500 sm:w-auto"
+        className="w-full rounded-xl bg-gradient-to-r from-emerald-400 to-blue-600 px-6 py-3.5 text-sm font-bold text-slate-950 shadow-lg shadow-emerald-500/20 transition-all hover:from-emerald-300 hover:to-blue-500 sm:w-auto"
       >
         Start AWS Setup
       </button>
@@ -1061,8 +1061,8 @@ export const ConnectAws: React.FC = () => {
                   state === 'done'
                     ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
                     : state === 'active'
-                      ? 'border-cyan-500/40 bg-cyan-500/10 text-cyan-300'
-                      : 'border-slate-700 bg-slate-900/60 text-slate-500'
+                      ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+                      : 'border-slate-700 bg-[#080D14]/60 text-slate-500'
                 }`}
               >
                 {state === 'done' ? <Check size={11} /> : <span>{idx + 1}</span>}
@@ -1106,7 +1106,7 @@ export const ConnectAws: React.FC = () => {
           </div>
         </div>
 
-        <div className="rounded-2xl border border-slate-800 bg-slate-900/40 p-4 space-y-3">
+        <div className="rounded-2xl border border-slate-800 bg-[#080D14]/40 p-4 space-y-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="space-y-1">
               <p className="text-xs font-bold text-white">Step 1 — Open AWS</p>
@@ -1118,7 +1118,7 @@ export const ConnectAws: React.FC = () => {
             <button
               type="button"
               onClick={openAwsConsole}
-              className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-cyan-500/40 bg-cyan-500/10 px-3.5 py-2 text-xs font-bold text-cyan-200 transition-colors hover:bg-cyan-500/20"
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-3.5 py-2 text-xs font-bold text-emerald-200 transition-colors hover:bg-emerald-500/20"
             >
               <span>Open AWS Console</span>
               <ExternalLink size={13} />
@@ -1142,7 +1142,7 @@ export const ConnectAws: React.FC = () => {
           </p>
         </div>
 
-        <div className="rounded-2xl border border-slate-800 bg-slate-900/40 p-4">
+        <div className="rounded-2xl border border-slate-800 bg-[#080D14]/40 p-4">
           <ol className="space-y-3">
             <li className="flex items-start gap-3">
               <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-md bg-slate-800 text-[10px] font-bold text-slate-300">
@@ -1150,7 +1150,7 @@ export const ConnectAws: React.FC = () => {
               </span>
               <div className="min-w-0">
                 <p className="text-[11px] text-slate-500">Go to</p>
-                <p className="font-mono text-xs text-cyan-200">
+                <p className="font-mono text-xs text-emerald-200">
                   IAM → Roles → Create role
                 </p>
               </div>
@@ -1181,7 +1181,7 @@ export const ConnectAws: React.FC = () => {
                 <p className="text-[11px] text-slate-500">
                   Enter this CloudWise account ID
                 </p>
-                <div className="mt-1 flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-950 px-3 py-2">
+                <div className="mt-1 flex items-center gap-2 rounded-xl border border-slate-700 bg-[#05080D] px-3 py-2">
                   <span className="min-w-0 flex-1 break-all font-mono text-xs font-bold text-white">
                     {trustedAccountId}
                   </span>
@@ -1195,13 +1195,13 @@ export const ConnectAws: React.FC = () => {
               </div>
             </li>
           </ol>
-          <p className="mt-3 rounded-xl bg-slate-950/70 p-3 text-[11px] leading-relaxed text-slate-400">
+          <p className="mt-3 rounded-xl bg-[#05080D]/70 p-3 text-[11px] leading-relaxed text-slate-400">
             CloudWise uses this account to request temporary access. Your AWS account
             remains yours.
           </p>
         </div>
 
-        <div className="rounded-2xl border border-slate-800 bg-slate-900/40 p-4 space-y-2">
+        <div className="rounded-2xl border border-slate-800 bg-[#080D14]/40 p-4 space-y-2">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div>
               <p className="text-[11px] text-slate-500">Role name</p>
@@ -1222,7 +1222,7 @@ export const ConnectAws: React.FC = () => {
         </div>
 
         {/* Trust policy */}
-        <div className="rounded-2xl border border-slate-800 bg-slate-900/40 p-4 space-y-3">
+        <div className="rounded-2xl border border-slate-800 bg-[#080D14]/40 p-4 space-y-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="space-y-1">
               <p className="text-xs font-bold text-white">Trust policy</p>
@@ -1233,7 +1233,7 @@ export const ConnectAws: React.FC = () => {
             <button
               type="button"
               onClick={() => void copyText(trustPolicyJson, 'trust')}
-              className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-cyan-500 px-3.5 py-2 text-xs font-bold text-slate-950 transition-colors hover:bg-cyan-400"
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-emerald-500 px-3.5 py-2 text-xs font-bold text-slate-950 transition-colors hover:bg-emerald-400"
             >
               {copiedField === 'trust' ? <Check size={13} /> : <Copy size={13} />}
               <span>{copiedField === 'trust' ? 'Copied' : 'Copy Trust Policy'}</span>
@@ -1250,7 +1250,7 @@ export const ConnectAws: React.FC = () => {
         </div>
 
         {/* Permissions policy */}
-        <div className="rounded-2xl border border-slate-800 bg-slate-900/40 p-4 space-y-4">
+        <div className="rounded-2xl border border-slate-800 bg-[#080D14]/40 p-4 space-y-4">
           <div className="space-y-1">
             <p className="text-xs font-bold text-white">Deployment permissions</p>
             <p className="text-xs text-slate-400">
@@ -1259,10 +1259,10 @@ export const ConnectAws: React.FC = () => {
           </p>
           </div>
 
-          <div className="rounded-2xl border border-cyan-500/25 bg-cyan-500/5 p-4 space-y-4">
+          <div className="rounded-2xl border border-emerald-500/25 bg-emerald-500/5 p-4 space-y-4">
             <div className="flex items-start gap-3">
-              <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-cyan-500/10 border border-cyan-500/30">
-                <FileJson size={15} className="text-cyan-300" />
+              <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-emerald-500/10 border border-emerald-500/30">
+                <FileJson size={15} className="text-emerald-300" />
               </span>
               <div className="min-w-0 space-y-1">
                 <p className="text-xs font-extrabold text-white">
@@ -1270,7 +1270,7 @@ export const ConnectAws: React.FC = () => {
                 </p>
                 <p className="text-[11px] leading-relaxed text-slate-400">
                   This is a separate IAM policy. Create it once, then attach it to{' '}
-                  <span className="font-mono text-cyan-200">{RECOMMENDED_ROLE_NAME}</span>.
+                  <span className="font-mono text-emerald-200">{RECOMMENDED_ROLE_NAME}</span>.
                 </p>
               </div>
             </div>
@@ -1293,7 +1293,7 @@ export const ConnectAws: React.FC = () => {
               ))}
             </ol>
 
-            <div className="rounded-xl border border-slate-700 bg-slate-950/80 p-3">
+            <div className="rounded-xl border border-slate-700 bg-[#05080D]/80 p-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div>
                   <p className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
@@ -1345,7 +1345,7 @@ export const ConnectAws: React.FC = () => {
             <button
               type="button"
               onClick={() => void copyText(permissionsPolicyJson, 'perms')}
-              className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-cyan-500 px-3.5 py-2 text-xs font-bold text-slate-950 transition-colors hover:bg-cyan-400"
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-emerald-500 px-3.5 py-2 text-xs font-bold text-slate-950 transition-colors hover:bg-emerald-400"
             >
               {copiedField === 'perms' ? <Check size={13} /> : <Copy size={13} />}
               <span>
@@ -1354,7 +1354,7 @@ export const ConnectAws: React.FC = () => {
             </button>
           </div>
 
-          <div className="rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2.5">
+          <div className="rounded-xl border border-slate-800 bg-[#05080D]/60 px-3 py-2.5">
             <p className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
               Paste location
             </p>
@@ -1385,7 +1385,7 @@ export const ConnectAws: React.FC = () => {
           </p>
         </div>
 
-        <div className="rounded-2xl border border-cyan-500/25 bg-cyan-500/5 p-4 space-y-4">
+        <div className="rounded-2xl border border-emerald-500/25 bg-emerald-500/5 p-4 space-y-4">
           <div className="space-y-1.5">
             <label htmlFor="role-arn" className="text-[11px] font-semibold text-slate-300">
               IAM Role ARN <span className="text-rose-400">*</span>
@@ -1399,7 +1399,7 @@ export const ConnectAws: React.FC = () => {
                 if (connectError?.kind === 'format') setConnectError(null);
               }}
               placeholder="arn:aws:iam::123456789012:role/CloudWiseDeployRole"
-              className="w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 font-mono text-xs text-white outline-none transition-colors focus:border-cyan-400"
+              className="w-full rounded-xl border border-slate-700 bg-[#05080D] px-4 py-3 font-mono text-xs text-white outline-none transition-colors focus:border-emerald-400"
             />
             {arnTouched && (
               <p
@@ -1417,17 +1417,17 @@ export const ConnectAws: React.FC = () => {
           </div>
 
           {/* Visual example of where the ARN lives in AWS */}
-          <div className="rounded-xl border border-slate-800 bg-slate-950/80 p-3 space-y-2">
+          <div className="rounded-xl border border-slate-800 bg-[#05080D]/80 p-3 space-y-2">
             <div className="flex items-center justify-between">
               <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
                 Role summary page (example)
               </span>
-              <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-cyan-300">
+              <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-emerald-300">
                 Copy this line
               </span>
             </div>
             <p className="text-[10px] text-slate-500">ARN</p>
-            <p className="break-all rounded-md bg-cyan-500/10 px-2 py-1.5 font-mono text-[11px] text-cyan-200">
+            <p className="break-all rounded-md bg-emerald-500/10 px-2 py-1.5 font-mono text-[11px] text-emerald-200">
               arn:aws:iam::<span className="text-white">123456789012</span>:
               <span className="text-emerald-300">role/CloudWiseDeployRole</span>
             </p>
@@ -1453,7 +1453,7 @@ export const ConnectAws: React.FC = () => {
                 onBlur={() => setRegionOpen(false)}
                 onChange={(e) => setRegionQuery(e.target.value)}
                 placeholder="Search regions…"
-                className="w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-xs text-white outline-none transition-colors focus:border-cyan-400"
+                className="w-full rounded-xl border border-slate-700 bg-[#05080D] px-4 py-3 text-xs text-white outline-none transition-colors focus:border-emerald-400"
               />
               <ChevronDown
                 size={14}
@@ -1463,7 +1463,7 @@ export const ConnectAws: React.FC = () => {
                 <ul
                   id="region-listbox"
                   role="listbox"
-                  className="absolute z-30 mt-1 max-h-56 w-full overflow-auto rounded-xl border border-slate-700 bg-slate-950 py-1 shadow-2xl shadow-black/60"
+                  className="absolute z-30 mt-1 max-h-56 w-full overflow-auto rounded-xl border border-slate-700 bg-[#05080D] py-1 shadow-2xl shadow-black/60"
                 >
                   {regionOptions.length === 0 && (
                     <li className="px-3 py-2 text-[11px] text-slate-500">
@@ -1481,8 +1481,8 @@ export const ConnectAws: React.FC = () => {
                           setRegionOpen(false);
                           if (connectError?.kind === 'region') setConnectError(null);
                         }}
-                        className={`flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-xs transition-colors hover:bg-cyan-500/10 ${
-                          r.code === region ? 'text-cyan-300' : 'text-slate-300'
+                        className={`flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-xs transition-colors hover:bg-emerald-500/10 ${
+                          r.code === region ? 'text-emerald-300' : 'text-slate-300'
                         }`}
                       >
                         <span>{r.name}</span>
@@ -1510,7 +1510,7 @@ export const ConnectAws: React.FC = () => {
             type="button"
             onClick={() => void runVerification()}
             disabled={running || !arnValid || !region}
-            className="flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-cyan-400 to-blue-600 px-5 py-3.5 text-sm font-bold text-slate-950 shadow-lg shadow-cyan-500/20 transition-all hover:from-cyan-300 hover:to-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
+            className="flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-emerald-400 to-blue-600 px-5 py-3.5 text-sm font-bold text-slate-950 shadow-lg shadow-emerald-500/20 transition-all hover:from-emerald-300 hover:to-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
           >
             {running ? (
               <>
@@ -1545,7 +1545,7 @@ export const ConnectAws: React.FC = () => {
       <div className="glass-panel rounded-3xl border border-slate-800 p-5 space-y-4">
         <div className="space-y-1">
           <div className="flex items-center gap-2">
-            <Rocket size={14} className="text-cyan-300" />
+            <Rocket size={14} className="text-emerald-300" />
             <h3 className="text-xs font-extrabold uppercase tracking-wider text-white">
               CloudWise handles the rest
             </h3>
@@ -1564,8 +1564,8 @@ export const ConnectAws: React.FC = () => {
           ))}
         </ul>
 
-        <div className="rounded-xl border border-cyan-500/25 bg-cyan-500/5 p-3">
-          <p className="text-[11px] font-semibold leading-relaxed text-cyan-200">
+        <div className="rounded-xl border border-emerald-500/25 bg-emerald-500/5 p-3">
+          <p className="text-[11px] font-semibold leading-relaxed text-emerald-200">
             You only need to authorize AWS once.
           </p>
         </div>
@@ -1611,7 +1611,7 @@ export const ConnectAws: React.FC = () => {
           <section className="glass-panel overflow-hidden rounded-3xl border border-slate-800">
             <div className="border-b border-slate-800/80 p-6 sm:p-7 space-y-1.5">
               <div className="flex flex-wrap items-center gap-2">
-                <span className="inline-flex items-center gap-1.5 rounded-full border border-cyan-500/30 bg-cyan-500/10 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-cyan-300">
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-emerald-300">
                   <Cloud size={11} />
                   Connect AWS
                 </span>
@@ -1681,7 +1681,7 @@ export const ConnectAws: React.FC = () => {
             <button
               type="button"
               onClick={() => setShowHowItWorks((v) => !v)}
-              className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-slate-400 transition-colors hover:text-cyan-300"
+              className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-slate-400 transition-colors hover:text-emerald-300"
             >
               <ChevronDown
                 size={13}
@@ -1690,7 +1690,7 @@ export const ConnectAws: React.FC = () => {
               <span>How AWS authorization works</span>
             </button>
             {showHowItWorks && (
-              <p className="rounded-2xl border border-slate-800 bg-slate-950/70 p-4 text-xs leading-relaxed text-slate-400">
+              <p className="rounded-2xl border border-slate-800 bg-[#05080D]/70 p-4 text-xs leading-relaxed text-slate-400">
                 When you click Verify &amp; Connect, CloudWise asks AWS for a{' '}
                 <span className="text-slate-200">short-lived session</span> using your
                 role (a handshake called STS AssumeRole). That handshake is locked to a{' '}
@@ -1705,7 +1705,7 @@ export const ConnectAws: React.FC = () => {
           {/* Help section */}
           <section className="glass-panel rounded-3xl border border-slate-800 p-6 space-y-4">
             <div className="flex items-center gap-2">
-              <HelpCircle size={15} className="text-cyan-300" />
+              <HelpCircle size={15} className="text-emerald-300" />
               <h3 className="text-sm font-extrabold text-white">
                 Having trouble connecting?
               </h3>
@@ -1730,7 +1730,7 @@ export const ConnectAws: React.FC = () => {
               ].map((card) => (
                 <div
                   key={card.title}
-                  className="rounded-2xl border border-slate-800 bg-slate-900/40 p-4 space-y-1.5"
+                  className="rounded-2xl border border-slate-800 bg-[#080D14]/40 p-4 space-y-1.5"
                 >
                   <p className="text-xs font-bold text-white">{card.title}</p>
                   <p className="text-[11px] leading-relaxed text-slate-400">
@@ -1750,7 +1750,7 @@ export const ConnectAws: React.FC = () => {
                         60,
                       );
                     }}
-                    className="text-[11px] font-bold text-cyan-300 transition-colors hover:text-cyan-200"
+                    className="text-[11px] font-bold text-emerald-300 transition-colors hover:text-emerald-200"
                   >
                     Show me where →
                   </button>
@@ -1762,7 +1762,7 @@ export const ConnectAws: React.FC = () => {
                 type="button"
                 onClick={handleVerifyAgain}
                 disabled={running}
-                className="inline-flex items-center gap-1.5 rounded-xl border border-cyan-500/40 bg-cyan-500/10 px-4 py-2 text-xs font-bold text-cyan-200 transition-colors hover:bg-cyan-500/20 disabled:opacity-50"
+                className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-4 py-2 text-xs font-bold text-emerald-200 transition-colors hover:bg-emerald-500/20 disabled:opacity-50"
               >
                 <RefreshCw size={13} />
                 <span>Verify Again</span>
@@ -1771,7 +1771,7 @@ export const ConnectAws: React.FC = () => {
                 <button
                   type="button"
                   onClick={() => setPhase('setup')}
-                  className="inline-flex items-center gap-1.5 rounded-xl border border-slate-700 bg-slate-900 px-4 py-2 text-xs font-semibold text-slate-300 transition-colors hover:bg-slate-800"
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-slate-700 bg-[#080D14] px-4 py-2 text-xs font-semibold text-slate-300 transition-colors hover:bg-slate-800"
                 >
                   <Terminal size={13} />
                   <span>Back to setup</span>
@@ -1804,7 +1804,7 @@ export const ConnectAws: React.FC = () => {
             {showAdvanced && (
               <div className="space-y-4">
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                  <div className="rounded-2xl border border-slate-800 bg-slate-950/70 p-3.5">
+                  <div className="rounded-2xl border border-slate-800 bg-[#05080D]/70 p-3.5">
                     <span className="block text-[10px] font-bold uppercase tracking-wider text-slate-500">
                       CloudWise AWS Account ID
                     </span>
@@ -1820,12 +1820,12 @@ export const ConnectAws: React.FC = () => {
                       />
                     </div>
                   </div>
-                  <div className="rounded-2xl border border-slate-800 bg-slate-950/70 p-3.5">
+                  <div className="rounded-2xl border border-slate-800 bg-[#05080D]/70 p-3.5">
                     <span className="block text-[10px] font-bold uppercase tracking-wider text-slate-500">
                       External ID (unique to you)
                     </span>
                     <div className="mt-1 flex items-center justify-between gap-2">
-                      <p className="min-w-0 truncate font-mono text-xs font-bold text-cyan-300">
+                      <p className="min-w-0 truncate font-mono text-xs font-bold text-emerald-300">
                         {info?.externalId || connection?.externalId || '—'}
                       </p>
                       {(info?.externalId || connection?.externalId) && (
@@ -1842,7 +1842,7 @@ export const ConnectAws: React.FC = () => {
 
                 <div className="space-y-2">
                   <p className="text-[11px] font-bold text-slate-300">Trust Policy</p>
-                  <div className="rounded-2xl border border-slate-800 bg-slate-950 p-3">
+                  <div className="rounded-2xl border border-slate-800 bg-[#05080D] p-3">
                     <div className="mb-2 flex items-center justify-between">
                       <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
                         JSON
@@ -1863,11 +1863,11 @@ export const ConnectAws: React.FC = () => {
                 <div className="space-y-2">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <p className="text-[11px] font-bold text-slate-300">Permissions Policy</p>
-                    <span className="font-mono text-[10px] text-cyan-300">
+                    <span className="font-mono text-[10px] text-emerald-300">
                       {RECOMMENDED_POLICY_NAME}
                     </span>
                   </div>
-                  <div className="rounded-2xl border border-slate-800 bg-slate-950 p-3">
+                  <div className="rounded-2xl border border-slate-800 bg-[#05080D] p-3">
                     <div className="mb-2 flex items-center justify-between">
                       <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
                         JSON
@@ -1879,7 +1879,7 @@ export const ConnectAws: React.FC = () => {
                         onCopy={copyText}
                       />
                     </div>
-                    <pre className="max-h-56 overflow-auto whitespace-pre-wrap break-all font-mono text-[10px] leading-relaxed text-cyan-100">
+                    <pre className="max-h-56 overflow-auto whitespace-pre-wrap break-all font-mono text-[10px] leading-relaxed text-emerald-100">
                       {permissionsPolicyJson}
                     </pre>
                   </div>

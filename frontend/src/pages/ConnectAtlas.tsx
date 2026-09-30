@@ -196,7 +196,7 @@ export const ConnectAtlas: React.FC = () => {
           <Database size={40} className="text-emerald-400" />
         </div>
         <h1 className="mb-4 text-3xl font-extrabold tracking-tight text-white sm:text-5xl">
-          MongoDB <span className="text-transparent bg-clip-text bg-gradient-to-r from-emerald-400 to-cyan-400">Atlas</span>
+          MongoDB <span className="text-transparent bg-clip-text bg-gradient-to-r from-emerald-400 to-emerald-400">Atlas</span>
         </h1>
         <p className="mx-auto max-w-2xl text-lg text-slate-400">
           One-time verification so CloudWise can add each new deployment's IP to your Atlas Network Access list.
@@ -205,8 +205,8 @@ export const ConnectAtlas: React.FC = () => {
 
       <div className="mx-auto max-w-2xl">
         {isConnected ? (
-          <div className="overflow-hidden rounded-2xl border border-slate-800 bg-slate-900/50 shadow-2xl backdrop-blur-xl">
-            <div className="border-b border-slate-800/50 bg-slate-900/80 p-6 sm:p-8">
+          <div className="overflow-hidden rounded-2xl border border-slate-800 bg-[#080D14]/50 shadow-2xl backdrop-blur-xl">
+            <div className="border-b border-slate-800/50 bg-[#080D14]/80 p-6 sm:p-8">
               <div className="flex items-center gap-4">
                 <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-emerald-500/10 ring-1 ring-emerald-500/20">
                   <CheckCircle2 size={28} className="text-emerald-400" />
@@ -219,7 +219,7 @@ export const ConnectAtlas: React.FC = () => {
             </div>
 
             <div className="p-6 sm:p-8">
-              <div className="mb-8 rounded-xl border border-slate-800/50 bg-slate-950/50 p-4">
+              <div className="mb-8 rounded-xl border border-slate-800/50 bg-[#05080D]/50 p-4">
                 <p className="text-sm text-slate-400">Project ID</p>
                 <p className="mt-1 font-mono text-lg font-bold text-emerald-400">{projectId}</p>
               </div>
@@ -249,8 +249,8 @@ export const ConnectAtlas: React.FC = () => {
             </div>
           </div>
         ) : (
-          <div className="overflow-hidden rounded-2xl border border-slate-800 bg-slate-900/50 shadow-2xl backdrop-blur-xl">
-            <div className="border-b border-slate-800/50 bg-slate-900/80 p-6 sm:p-8">
+          <div className="overflow-hidden rounded-2xl border border-slate-800 bg-[#080D14]/50 shadow-2xl backdrop-blur-xl">
+            <div className="border-b border-slate-800/50 bg-[#080D14]/80 p-6 sm:p-8">
               <h2 className="text-xl font-bold text-white">MongoDB Atlas Authorization Required</h2>
               <p className="mt-2 text-sm text-slate-400">
                 CloudWise verifies your Atlas configuration from its own backend settings, then stores it for this account.
@@ -258,7 +258,7 @@ export const ConnectAtlas: React.FC = () => {
             </div>
 
             <div className="p-6 sm:p-8">
-              <div className="mb-6 rounded-xl border border-slate-800/50 bg-slate-950/50 p-4">
+              <div className="mb-6 rounded-xl border border-slate-800/50 bg-[#05080D]/50 p-4">
                 <div className="mb-2 flex items-center gap-2">
                   <Server size={16} className="text-emerald-400" />
                   <h4 className="text-sm font-bold text-slate-200">Server-side configuration</h4>
@@ -319,7 +319,7 @@ export const ConnectAtlas: React.FC = () => {
                       value={formProjectId}
                       onChange={(e) => setFormProjectId(e.target.value)}
                       placeholder="e.g. 5f3d5b7a9b1c8a001b2c3d4e"
-                      className="w-full rounded-xl border border-slate-800 bg-slate-950 p-4 font-mono text-white placeholder-slate-600 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                      className="w-full rounded-xl border border-slate-800 bg-[#05080D] p-4 font-mono text-white placeholder-slate-600 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
                       required
                     />
                   </div>
@@ -331,7 +331,7 @@ export const ConnectAtlas: React.FC = () => {
                       value={formClientId}
                       onChange={(e) => setFormClientId(e.target.value)}
                       placeholder="e.g. wgkjdfsa"
-                      className="w-full rounded-xl border border-slate-800 bg-slate-950 p-4 font-mono text-white placeholder-slate-600 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                      className="w-full rounded-xl border border-slate-800 bg-[#05080D] p-4 font-mono text-white placeholder-slate-600 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
                       required
                     />
                   </div>
@@ -343,7 +343,7 @@ export const ConnectAtlas: React.FC = () => {
                       value={formClientSecret}
                       onChange={(e) => setFormClientSecret(e.target.value)}
                       placeholder="••••••••••••••••"
-                      className="w-full rounded-xl border border-slate-800 bg-slate-950 p-4 font-mono text-white placeholder-slate-600 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                      className="w-full rounded-xl border border-slate-800 bg-[#05080D] p-4 font-mono text-white placeholder-slate-600 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
                       required
                     />
                     <p className="mt-2 text-xs text-slate-500">

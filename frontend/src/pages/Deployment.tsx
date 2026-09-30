@@ -1009,7 +1009,7 @@ export const Deployment: React.FC = () => {
     <div className="min-h-screen max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10 space-y-10">
       {/* Header */}
       <div className="text-center space-y-3 max-w-3xl mx-auto">
-        <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-cyan-500/10 border border-cyan-500/30 text-cyan-300 text-xs font-semibold">
+        <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs font-semibold">
           <Rocket className="w-3.5 h-3.5" />
           <span>Step 4: AWS EC2 Deployment Pipeline</span>
         </div>
@@ -1026,10 +1026,10 @@ export const Deployment: React.FC = () => {
           {/* AWS connection */}
           <div className="glass-panel p-6 rounded-3xl space-y-4 border border-slate-800">
             <label className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
-              <Cloud className="w-4 h-4 text-cyan-400" />
+              <Cloud className="w-4 h-4 text-emerald-400" />
               <span>Target Platform</span>
             </label>
-            <div className="p-3 rounded-xl bg-cyan-500/10 border border-cyan-500/30 text-cyan-300 text-xs flex items-center gap-2">
+            <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs flex items-center gap-2">
               <ShieldCheck size={16} className="shrink-0" />
               <span>
                 <strong>AWS EC2 Free Tier</strong> — deploy in your own account via IAM role (no access keys).
@@ -1068,13 +1068,13 @@ export const Deployment: React.FC = () => {
           <div className="glass-panel p-6 rounded-3xl space-y-4 border border-slate-800">
             <div className="flex items-center justify-between">
               <h4 className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
-                <GitBranch className="w-4 h-4 text-cyan-400" />
+                <GitBranch className="w-4 h-4 text-emerald-400" />
                 Repository Analysis
               </h4>
               <button
                 onClick={runAnalysis}
                 disabled={missingRepo}
-                className="text-[11px] font-semibold text-cyan-400 hover:text-cyan-300 disabled:opacity-40"
+                className="text-[11px] font-semibold text-emerald-400 hover:text-emerald-300 disabled:opacity-40"
               >
                 {detection ? 'Re-analyze' : 'Analyze'}
               </button>
@@ -1087,7 +1087,7 @@ export const Deployment: React.FC = () => {
               <div className="space-y-2 text-xs">
                 <div className="flex justify-between">
                   <span className="text-slate-400">Stack</span>
-                  <span className="font-bold text-cyan-300">{detection.technology || '—'}</span>
+                  <span className="font-bold text-emerald-300">{detection.technology || '—'}</span>
                 </div>
                 {detection.frontend && (
                   <div className="flex justify-between">
@@ -1121,13 +1121,13 @@ export const Deployment: React.FC = () => {
           <div className="glass-panel p-6 rounded-3xl space-y-4 border border-slate-800">
             <div className="flex items-center justify-between">
               <h4 className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
-                <FileCode2 className="w-4 h-4 text-cyan-400" />
+                <FileCode2 className="w-4 h-4 text-emerald-400" />
                 Generated Files
               </h4>
               <button
                 onClick={runGenerateFiles}
                 disabled={missingRepo}
-                className="text-[11px] font-semibold text-cyan-400 hover:text-cyan-300 disabled:opacity-40"
+                className="text-[11px] font-semibold text-emerald-400 hover:text-emerald-300 disabled:opacity-40"
               >
                 {generatedFileList.length ? 'Regenerate' : 'Generate'}
               </button>
@@ -1148,7 +1148,7 @@ export const Deployment: React.FC = () => {
               <div className="pt-2 border-t border-slate-800 space-y-1 text-[11px]">
                 <div className="flex justify-between">
                   <span className="text-slate-400">Target</span>
-                  <span className="font-bold text-cyan-300">{deploymentPlan.target}</span>
+                  <span className="font-bold text-emerald-300">{deploymentPlan.target}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-slate-400">Containers</span>
@@ -1168,7 +1168,7 @@ export const Deployment: React.FC = () => {
           <div className="glass-panel p-6 rounded-3xl space-y-4 border border-slate-800">
             <div className="flex items-center justify-between">
               <h4 className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
-                <Database className="w-4 h-4 text-cyan-400" />
+                <Database className="w-4 h-4 text-emerald-400" />
                 Environment Variables
               </h4>
               <div className="flex items-center gap-2">
@@ -1179,7 +1179,7 @@ export const Deployment: React.FC = () => {
                 >
                   {envMasked ? <EyeOff size={14} /> : <Eye size={14} />}
                 </button>
-                <label className="text-[11px] font-semibold text-cyan-400 hover:text-cyan-300 cursor-pointer">
+                <label className="text-[11px] font-semibold text-emerald-400 hover:text-emerald-300 cursor-pointer">
                   Upload .env
                   <input
                     type="file"
@@ -1211,14 +1211,14 @@ export const Deployment: React.FC = () => {
                     value={row.key}
                     placeholder="KEY"
                     onChange={e => updateEnvRow(idx, 'key', e.target.value)}
-                    className="w-1/3 bg-slate-900 border border-slate-700/80 rounded-lg px-2 py-1.5 text-[11px] font-mono text-white focus:border-cyan-400 focus:outline-none"
+                    className="w-1/3 bg-[#080D14] border border-slate-700/80 rounded-lg px-2 py-1.5 text-[11px] font-mono text-white focus:border-emerald-400 focus:outline-none"
                   />
                   <input
                     type={envMasked ? 'password' : 'text'}
                     value={row.value}
                     placeholder="value"
                     onChange={e => updateEnvRow(idx, 'value', e.target.value)}
-                    className="flex-1 bg-slate-900 border border-slate-700/80 rounded-lg px-2 py-1.5 text-[11px] font-mono text-white focus:border-cyan-400 focus:outline-none"
+                    className="flex-1 bg-[#080D14] border border-slate-700/80 rounded-lg px-2 py-1.5 text-[11px] font-mono text-white focus:border-emerald-400 focus:outline-none"
                   />
                   <button
                     onClick={() => removeEnvRow(idx)}
@@ -1234,13 +1234,13 @@ export const Deployment: React.FC = () => {
             <div className="flex gap-2">
               <button
                 onClick={addEnvRow}
-                className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-300 text-[11px] font-semibold"
+                className="px-3 py-1.5 rounded-lg bg-[#080D14] hover:bg-slate-800 border border-slate-700 text-slate-300 text-[11px] font-semibold"
               >
                 + Add Variable
               </button>
               <button
                 onClick={markEnvComplete}
-                className="px-3 py-1.5 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-500/40 text-cyan-300 text-[11px] font-semibold"
+                className="px-3 py-1.5 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-emerald-300 text-[11px] font-semibold"
               >
                 Confirm Env ({envSource === 'upload' ? 'uploaded' : 'manual'})
               </button>
@@ -1249,17 +1249,17 @@ export const Deployment: React.FC = () => {
 
           {/* Config summary */}
           <div className="glass-panel p-6 rounded-3xl space-y-4 border border-slate-800">
-            <div className="bg-slate-900/80 p-3.5 rounded-xl border border-slate-800 space-y-1 text-xs">
+            <div className="bg-[#080D14]/80 p-3.5 rounded-xl border border-slate-800 space-y-1 text-xs">
               <span className="text-slate-400 block text-[10px]">Active Project</span>
               <p className="font-bold text-white text-sm">{activeProject?.name || 'CloudWise App'}</p>
-              <span className="text-cyan-400 font-bold block pt-1">
+              <span className="text-emerald-400 font-bold block pt-1">
                 {formatINR(selectedRecommendation.monthlyCost)} / mo
               </span>
             </div>
             <div className="space-y-2 text-xs">
               <div className="flex justify-between">
                 <span className="text-slate-400">Provider</span>
-                <span className="font-bold text-cyan-300">AWS EC2</span>
+                <span className="font-bold text-emerald-300">AWS EC2</span>
               </div>
               <div className="flex justify-between">
                 <span className="text-slate-400">Region</span>
@@ -1282,7 +1282,7 @@ export const Deployment: React.FC = () => {
                 disabled={liveDeployment.status !== 'idle'}
                 value={envName}
                 onChange={e => setEnvName(e.target.value)}
-                className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-3 py-2 text-xs text-white focus:border-cyan-400 focus:outline-none disabled:opacity-60"
+                className="w-full bg-[#080D14] border border-slate-700/80 rounded-xl px-3 py-2 text-xs text-white focus:border-emerald-400 focus:outline-none disabled:opacity-60"
               />
             </div>
 
@@ -1303,7 +1303,7 @@ export const Deployment: React.FC = () => {
                   </div>
                 )}
                 {!canDeploy && !missingRepo && awsConnection?.connected && activeStepIndex < 3 && (
-                  <div className="p-3 rounded-xl bg-slate-900/80 border border-slate-800 text-slate-400 text-xs">
+                  <div className="p-3 rounded-xl bg-[#080D14]/80 border border-slate-800 text-slate-400 text-xs">
                     Complete steps 1–3 (analyze → generate files → configure env) before deploying.
                   </div>
                 )}
@@ -1318,7 +1318,7 @@ export const Deployment: React.FC = () => {
                       <button
                         onClick={() => void runPreflight(true)}
                         disabled={preflightRunning}
-                        className="text-[10px] font-bold text-cyan-300 hover:text-cyan-200 disabled:opacity-50 flex items-center gap-1"
+                        className="text-[10px] font-bold text-emerald-300 hover:text-emerald-200 disabled:opacity-50 flex items-center gap-1"
                       >
                         <RefreshCw size={11} className={preflightRunning ? 'animate-spin' : ''} />
                         {preflightRunning ? 'Checking…' : 'Re-run full check'}
@@ -1360,7 +1360,7 @@ export const Deployment: React.FC = () => {
                 <button
                   onClick={handleDeploy}
                   disabled={!canDeploy || preflightRunning || preflightReady === false}
-                  className="w-full py-4 rounded-xl bg-gradient-to-r from-cyan-400 via-cyan-500 to-blue-600 hover:from-cyan-300 hover:to-blue-500 text-slate-950 font-bold text-sm transition-all shadow-xl shadow-cyan-500/25 flex items-center justify-center gap-2 active:scale-98 disabled:opacity-40 disabled:cursor-not-allowed"
+                  className="w-full py-4 rounded-xl bg-gradient-to-r from-emerald-400 via-emerald-500 to-blue-600 hover:from-emerald-300 hover:to-blue-500 text-slate-950 font-bold text-sm transition-all shadow-xl shadow-emerald-500/25 flex items-center justify-center gap-2 active:scale-98 disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   <Rocket className="w-5 h-5" />
                   <span>
@@ -1382,7 +1382,7 @@ export const Deployment: React.FC = () => {
                 </button>
                 <button
                   onClick={handleReset}
-                  className="w-full py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-300 font-semibold text-xs transition-colors flex items-center justify-center gap-1.5"
+                  className="w-full py-2.5 rounded-xl bg-[#080D14] hover:bg-slate-800 border border-slate-700 text-slate-300 font-semibold text-xs transition-colors flex items-center justify-center gap-1.5"
                 >
                   <RefreshCw className="w-3.5 h-3.5" />
                   <span>Reset Pipeline State</span>
@@ -1390,7 +1390,7 @@ export const Deployment: React.FC = () => {
                 {liveDeployment.status === 'deployed' && (
                   <button
                     onClick={handleHealthCheck}
-                    className="w-full py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-emerald-400 font-semibold text-xs transition-colors flex items-center justify-center gap-1.5"
+                    className="w-full py-2.5 rounded-xl bg-[#080D14] hover:bg-slate-800 border border-slate-700 text-emerald-400 font-semibold text-xs transition-colors flex items-center justify-center gap-1.5"
                   >
                     <Activity className="w-3.5 h-3.5" />
                     <span>Run Health Check</span>
@@ -1407,13 +1407,13 @@ export const Deployment: React.FC = () => {
           <div className="glass-panel p-6 rounded-3xl space-y-4 border border-slate-800">
             <div className="flex items-center justify-between gap-3">
               <h3 className="text-base font-bold text-white flex items-center gap-2">
-                <ListChecks className="w-5 h-5 text-cyan-400" />
+                <ListChecks className="w-5 h-5 text-emerald-400" />
                 <span>Deployment Readiness</span>
               </h3>
               {(deploymentId || lastDeploymentId) && (
                 <button
                   onClick={() => navigate(`/deployment/${deploymentId || lastDeploymentId}`)}
-                  className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-cyan-300 text-[11px] font-bold transition-colors flex items-center gap-1.5"
+                  className="px-3 py-1.5 rounded-lg bg-[#080D14] hover:bg-slate-800 border border-slate-700 text-emerald-300 text-[11px] font-bold transition-colors flex items-center gap-1.5"
                 >
                   <ExternalLink size={12} />
                   <span>Deployment Details</span>
@@ -1429,15 +1429,15 @@ export const Deployment: React.FC = () => {
                     item.status === 'done'
                       ? 'bg-emerald-950/20 border-emerald-500/40 text-emerald-300'
                       : item.status === 'active'
-                      ? 'bg-cyan-950/30 border-cyan-400 text-white shadow-lg shadow-cyan-950/50'
+                      ? 'bg-emerald-950/30 border-emerald-400 text-white shadow-lg shadow-emerald-950/50'
                       : item.status === 'failed'
                       ? 'bg-rose-950/20 border-rose-500/40 text-rose-300'
-                      : 'bg-slate-900/40 border-slate-800 text-slate-500'
+                      : 'bg-[#080D14]/40 border-slate-800 text-slate-500'
                   }`}
                 >
                   <div className="flex items-center gap-2 font-bold text-xs">
                     {item.status === 'done' && <CheckCircle2 size={15} className="text-emerald-400 shrink-0" />}
-                    {item.status === 'active' && <RefreshCw size={15} className="text-cyan-400 animate-spin shrink-0" />}
+                    {item.status === 'active' && <RefreshCw size={15} className="text-emerald-400 animate-spin shrink-0" />}
                     {item.status === 'failed' && <AlertTriangle size={15} className="text-rose-400 shrink-0" />}
                     {item.status === 'pending' && <Clock size={15} className="shrink-0" />}
                     <span>{item.label}</span>
@@ -1465,7 +1465,7 @@ export const Deployment: React.FC = () => {
                   <AlertTriangle size={15} />
                   <span>{stageError.stage} stage failed</span>
                 </div>
-                <p className="whitespace-pre-wrap bg-slate-900/60 rounded-xl p-3 border border-rose-500/20 text-slate-300">
+                <p className="whitespace-pre-wrap bg-[#080D14]/60 rounded-xl p-3 border border-rose-500/20 text-slate-300">
                   {stageError.message}
                 </p>
                 <div className="flex items-center gap-2 flex-wrap pt-1">
@@ -1480,7 +1480,7 @@ export const Deployment: React.FC = () => {
                   </button>
                   <button
                     onClick={() => setStageError(null)}
-                    className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-300 text-[11px] font-bold transition-colors"
+                    className="px-3 py-1.5 rounded-lg bg-[#080D14] hover:bg-slate-800 border border-slate-700 text-slate-300 text-[11px] font-bold transition-colors"
                   >
                     Dismiss
                   </button>
@@ -1492,7 +1492,7 @@ export const Deployment: React.FC = () => {
           <div className="glass-panel p-6 rounded-3xl space-y-6 border border-slate-800">
             <div className="flex items-center justify-between">
               <h3 className="text-base font-bold text-white flex items-center gap-2">
-                <Activity className="w-5 h-5 text-cyan-400" />
+                <Activity className="w-5 h-5 text-emerald-400" />
                 <span>AWS EC2 Deployment Pipeline (9 Steps)</span>
               </h3>
               <span
@@ -1503,7 +1503,7 @@ export const Deployment: React.FC = () => {
                     ? 'bg-rose-500/20 text-rose-300 border-rose-500/40'
                     : liveDeployment.status === 'idle'
                     ? 'bg-slate-800 text-slate-400 border-slate-700'
-                    : 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40 animate-pulse'
+                    : 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40 animate-pulse'
                 }`}
               >
                 {liveDeployment.status.toUpperCase()}
@@ -1513,16 +1513,16 @@ export const Deployment: React.FC = () => {
             <div className="space-y-2">
               <div className="flex justify-between text-xs font-semibold text-slate-400">
                 <span>Progress</span>
-                <span className="text-cyan-400">{liveDeployment.progress}%</span>
+                <span className="text-emerald-400">{liveDeployment.progress}%</span>
               </div>
-              <div className="w-full h-3 rounded-full bg-slate-900 overflow-hidden p-0.5 border border-slate-800">
+              <div className="w-full h-3 rounded-full bg-[#080D14] overflow-hidden p-0.5 border border-slate-800">
                 <motion.div
                   className={`h-full rounded-full transition-all duration-500 ${
                     liveDeployment.status === 'failed'
                       ? 'bg-rose-500'
                       : liveDeployment.status === 'deployed'
                       ? 'bg-emerald-400'
-                      : 'bg-gradient-to-r from-cyan-500 to-blue-500'
+                      : 'bg-gradient-to-r from-emerald-500 to-blue-500'
                   }`}
                   style={{ width: `${liveDeployment.progress}%` }}
                 />
@@ -1539,15 +1539,15 @@ export const Deployment: React.FC = () => {
                       st === 'complete'
                         ? 'bg-emerald-950/20 border-emerald-500/40 text-emerald-300'
                         : st === 'active'
-                        ? 'bg-cyan-950/30 border-cyan-400 text-white shadow-lg shadow-cyan-950/50'
+                        ? 'bg-emerald-950/30 border-emerald-400 text-white shadow-lg shadow-emerald-950/50'
                         : st === 'failed'
                         ? 'bg-rose-950/20 border-rose-500/40 text-rose-300'
-                        : 'bg-slate-900/40 border-slate-800 text-slate-500'
+                        : 'bg-[#080D14]/40 border-slate-800 text-slate-500'
                     }`}
                   >
                     <div className="flex items-center gap-2 font-bold text-[11px]">
                       {st === 'complete' && <CheckCircle2 size={14} className="text-emerald-400 shrink-0" />}
-                      {st === 'active' && <RefreshCw size={14} className="text-cyan-400 animate-spin shrink-0" />}
+                      {st === 'active' && <RefreshCw size={14} className="text-emerald-400 animate-spin shrink-0" />}
                       {st === 'failed' && <AlertTriangle size={14} className="text-rose-400 shrink-0" />}
                       {st === 'pending' ? <Clock size={14} className="shrink-0" /> : null}
                       <span className="truncate">{step.label}</span>
@@ -1569,9 +1569,9 @@ export const Deployment: React.FC = () => {
                       href={liveDeployment.endpointUrl || '#'}
                       target="_blank"
                       rel="noopener noreferrer"
-                      className="text-lg font-extrabold text-white hover:text-cyan-300 flex items-center gap-2 underline underline-offset-4"
+                      className="text-lg font-extrabold text-white hover:text-emerald-300 flex items-center gap-2 underline underline-offset-4"
                     >
-                      <Globe size={18} className="text-cyan-400" />
+                      <Globe size={18} className="text-emerald-400" />
                       <span>{liveDeployment.endpointUrl || 'No URL available yet'}</span>
                     </a>
                     {liveDeployment.ipAddress && (
@@ -1603,14 +1603,14 @@ export const Deployment: React.FC = () => {
                     )}
                     <button
                       onClick={() => navigate(`/deployment/${deploymentId || lastDeploymentId || ''}`)}
-                      className="px-4 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-cyan-300 font-bold text-xs transition-all flex items-center gap-1.5"
+                      className="px-4 py-2.5 rounded-xl bg-[#080D14] hover:bg-slate-800 border border-slate-700 text-emerald-300 font-bold text-xs transition-all flex items-center gap-1.5"
                     >
                       <ExternalLink className="w-3.5 h-3.5" />
                       <span>Deployment Details</span>
                     </button>
                     <button
                       onClick={handleProceedToMonitoring}
-                      className="px-4 py-2.5 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs transition-all shadow"
+                      className="px-4 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs transition-all shadow"
                     >
                       View Live Metrics
                     </button>
@@ -1641,7 +1641,7 @@ export const Deployment: React.FC = () => {
                 {liveDeployment.failureReason && (
                   <div className="space-y-2">
                     <span className="font-semibold text-rose-400">Error:</span>
-                    <p className="text-slate-300 whitespace-pre-wrap bg-slate-900/60 rounded-xl p-3 border border-rose-500/20 text-xs">
+                    <p className="text-slate-300 whitespace-pre-wrap bg-[#080D14]/60 rounded-xl p-3 border border-rose-500/20 text-xs">
                       {liveDeployment.failureReason}
                     </p>
                     <div className="flex items-center gap-2 flex-wrap">
@@ -1667,9 +1667,9 @@ export const Deployment: React.FC = () => {
                 {/* Scan progress steps */}
                 {scanProgress.length > 0 && (
                   <div className="space-y-1 mt-2">
-                    <span className="font-semibold text-cyan-400 text-xs">Scan Progress:</span>
+                    <span className="font-semibold text-emerald-400 text-xs">Scan Progress:</span>
                     {scanProgress.map((step, i) => (
-                      <div key={i} className={`flex items-center gap-1.5 text-[11px] ${i === scanProgress.length - 1 ? 'text-cyan-300' : 'text-slate-400'}`}>
+                      <div key={i} className={`flex items-center gap-1.5 text-[11px] ${i === scanProgress.length - 1 ? 'text-emerald-300' : 'text-slate-400'}`}>
                         {i < scanProgress.length - 1 ? <CheckCircle2 size={12} className="text-green-400 shrink-0" /> : <RefreshCw size={12} className="animate-spin shrink-0" />}
                         <span>{step.message}</span>
                       </div>
@@ -1687,7 +1687,7 @@ export const Deployment: React.FC = () => {
                       <span>View deployment logs ({liveDeployment.logs.length} lines)</span>
                     </button>
                     {showLogs && (
-                      <div className="mt-2 bg-slate-950 rounded-xl p-3 border border-slate-800 max-h-48 overflow-y-auto font-mono text-[10px] leading-relaxed space-y-0.5">
+                      <div className="mt-2 bg-[#05080D] rounded-xl p-3 border border-slate-800 max-h-48 overflow-y-auto font-mono text-[10px] leading-relaxed space-y-0.5">
                         {liveDeployment.logs.map((log, idx) => (
                           <div
                             key={idx}
@@ -1706,7 +1706,7 @@ export const Deployment: React.FC = () => {
                   <button
                     onClick={handleRetryDeployment}
                     disabled={retrying}
-                    className="px-4 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white font-bold text-xs transition-colors disabled:opacity-50 flex items-center gap-1.5"
+                    className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs transition-colors disabled:opacity-50 flex items-center gap-1.5"
                   >
                     <RefreshCw size={13} className={retrying ? 'animate-spin' : ''} />
                     <span>{retrying ? 'Retrying…' : 'Retry Failed Deployment'}</span>
@@ -1732,15 +1732,15 @@ export const Deployment: React.FC = () => {
 
           {/* Terminal */}
           <div className="glass-panel rounded-3xl border border-slate-800 overflow-hidden">
-            <div className="bg-slate-900/90 px-6 py-3 border-b border-slate-800 flex items-center justify-between">
+            <div className="bg-[#080D14]/90 px-6 py-3 border-b border-slate-800 flex items-center justify-between">
               <h4 className="text-xs font-bold text-white flex items-center gap-2">
-                <Terminal className="w-4 h-4 text-cyan-400" />
+                <Terminal className="w-4 h-4 text-emerald-400" />
                 <span>Live Provisioning Console Logs</span>
               </h4>
               <span className="text-[10px] text-slate-400 font-mono">{liveDeployment.logs?.length || 0} lines logged</span>
             </div>
 
-            <div className="p-5 bg-slate-950 font-mono text-xs text-slate-300 leading-relaxed max-h-72 overflow-y-auto space-y-1">
+            <div className="p-5 bg-[#05080D] font-mono text-xs text-slate-300 leading-relaxed max-h-72 overflow-y-auto space-y-1">
               {!liveDeployment.logs || liveDeployment.logs.length === 0 ? (
                 <p className="text-slate-600 text-center py-8">
                   Console idle. Run analysis, generate files, configure env, then deploy to AWS EC2.
