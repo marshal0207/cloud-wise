@@ -3,6 +3,8 @@ from decimal import Decimal
 import os
 import requests
 
+from .pricing_common import get_usd_to_inr_rate
+
 
 class GcpPricingError(RuntimeError):
     pass
@@ -104,7 +106,7 @@ def get_gcp_price_snapshot(
     gcp_region = GCP_REGION_MAP.get(norm_region, 'asia-south1')
 
     api_key = os.getenv('GCP_API_KEY', '').strip()
-    usd_to_inr = Decimal(os.getenv('USD_TO_INR_RATE', '83'))
+    usd_to_inr = get_usd_to_inr_rate()
     source = 'GCP Cloud Billing Catalog API'
     is_fallback = False
 

@@ -3,6 +3,8 @@ from decimal import Decimal
 import os
 import requests
 
+from .pricing_common import get_usd_to_inr_rate
+
 
 class AzurePricingError(RuntimeError):
     pass
@@ -122,7 +124,7 @@ def get_azure_price_snapshot(
     norm_region = region.strip().lower()
     arm_region = AZURE_REGION_MAP.get(norm_region, 'westindia')
 
-    usd_to_inr = Decimal(os.getenv('USD_TO_INR_RATE', '83'))
+    usd_to_inr = get_usd_to_inr_rate()
     source = 'Azure Retail Prices API'
     is_fallback = False
 

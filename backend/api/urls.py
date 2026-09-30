@@ -38,4 +38,5 @@ urlpatterns = [
     path('github/oauth/callback', views.github_oauth_callback_view, name='github_oauth_callback'),
     path('github/repos', views.github_repositories_view, name='github_repositories'),
     path('pricing/aws', views.aws_pricing_view, name='aws_pricing'),
+    path('pricing/compare', views.pricing_compare_view, name='pricing_compare'),
 ]

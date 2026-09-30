@@ -251,3 +251,167 @@ class BackendApiTests(TestCase):
         self.assertIn('activeNodes', res.json()['data'])
         self.assertIn('ipAddress', res.json()['data'])
         self.assertIn('endpointUrl', res.json()['data'])
+
+    def test_pricing_compare_exact_tier_match(self):
+        from api.models import CloudPricingCache
+        from decimal import Decimal
+
+        # Seed Tier 3 cache entries
+        CloudPricingCache.objects.create(
+            provider='AWS',
+            instance_type='c6i.xlarge',
+            region='Asia Pacific (Mumbai)',
+            price_per_month=Decimal('10300.00'),
+            hourly_usd=Decimal('0.1700'),
+            specs={'vcpu': 4, 'ramGB': 16, 'storageGB': 100},
+            source='AWS Pricing API',
+        )
+        CloudPricingCache.objects.create(
+            provider='Azure',
+            instance_type='Standard_D4s_v5',
+            region='Asia Pacific (Mumbai)',
+            price_per_month=Decimal('11633.00'),
+            hourly_usd=Decimal('0.1920'),
+            specs={'vcpu': 4, 'ramGB': 16, 'storageGB': 100},
+            source='Azure Retail Prices API',
+        )
+        CloudPricingCache.objects.create(
+            provider='GCP',
+            instance_type='e2-custom-4-16384',
+            region='Asia Pacific (Mumbai)',
+            price_per_month=Decimal('8846.00'),
+            hourly_usd=Decimal('0.1460'),
+            specs={'vcpu': 4, 'ramGB': 16, 'storageGB': 100},
+            source='GCP Pricing (Estimated Fallback)',
+        )
+
+        res = self.client.get('/api/pricing/compare?vcpu=4&ram=16&region=Asia%20Pacific%20(Mumbai)')
+        self.assertEqual(res.status_code, 200)
+        body = res.json()
+        self.assertTrue(body['success'])
+        data = body['data']
+        self.assertEqual(data['matchType'], 'EXACT_TIER')
+        self.assertEqual(data['matchedTier'], 'Tier 3 (Production Baseline)')
+        self.assertIn('AWS', data['providers'])
+        self.assertIn('Azure', data['providers'])
+        self.assertIn('GCP', data['providers'])
+        self.assertEqual(data['providers']['AWS']['monthlyInr'], 10300)
+        self.assertEqual(data['providers']['Azure']['monthlyInr'], 11633)
+        self.assertEqual(data['providers']['GCP']['monthlyInr'], 8846)
+
+    def test_pricing_compare_closest_match_within_20_percent(self):
+        from api.models import CloudPricingCache
+        from decimal import Decimal
+
+        # 4 vCPU / 15 GB RAM is within 6.25% of Tier 3 (4 vCPU / 16 GB)
+        CloudPricingCache.objects.create(
+            provider='AWS',
+            instance_type='c6i.xlarge',
+            region='Asia Pacific (Mumbai)',
+            price_per_month=Decimal('10300.00'),
+            hourly_usd=Decimal('0.1700'),
+            specs={'vcpu': 4, 'ramGB': 16},
+            source='AWS Pricing API',
+        )
+        CloudPricingCache.objects.create(
+            provider='Azure',
+            instance_type='Standard_D4s_v5',
+            region='Asia Pacific (Mumbai)',
+            price_per_month=Decimal('11633.00'),
+            hourly_usd=Decimal('0.1920'),
+            specs={'vcpu': 4, 'ramGB': 16},
+            source='Azure Retail Prices API',
+        )
+        CloudPricingCache.objects.create(
+            provider='GCP',
+            instance_type='e2-custom-4-16384',
+            region='Asia Pacific (Mumbai)',
+            price_per_month=Decimal('8846.00'),
+            hourly_usd=Decimal('0.1460'),
+            specs={'vcpu': 4, 'ramGB': 16},
+            source='GCP Pricing (Estimated Fallback)',
+        )
+
+        res = self.client.get('/api/pricing/compare?vcpu=4&ram=15&region=Asia%20Pacific%20(Mumbai)')
+        self.assertEqual(res.status_code, 200)
+        data = res.json()['data']
+        self.assertEqual(data['matchType'], 'CLOSEST_MATCH')
+        self.assertEqual(data['matchedTier'], 'Tier 3 (Production Baseline)')
+        self.assertEqual(data['providers']['AWS']['matchType'], 'CLOSEST_MATCH')
+
+    def test_pricing_compare_on_demand_lookup_beyond_tiers(self):
+        from unittest.mock import patch
+        from api.models import CloudPricingCache
+
+        # 32 vCPU / 128 GB RAM exceeds Tier 5 (16 vCPU / 64 GB) -> triggers ON_DEMAND_LOOKUP
+        with patch('api.services.pricing_comparison_service.get_aws_price_snapshot') as mock_aws, \
+             patch('api.services.pricing_comparison_service.get_azure_price_snapshot') as mock_az, \
+             patch('api.services.pricing_comparison_service.get_gcp_price_snapshot') as mock_gcp:
+
+            mock_aws.return_value = {
+                'provider': 'AWS',
+                'instanceType': 'c6i.8xlarge',
+                'region': 'Asia Pacific (Mumbai)',
+                'hourlyUsd': 1.36,
+                'monthlyUsd': 992.8,
+                'usdToInrRate': 83.0,
+                'monthlyInr': 82402,
+                'source': 'AWS Pricing API',
+                'specs': {'vcpu': 32, 'ramGB': 128},
+            }
+            mock_az.return_value = {
+                'provider': 'Azure',
+                'instanceType': 'Standard_D32s_v5',
+                'region': 'Asia Pacific (Mumbai)',
+                'hourlyUsd': 1.536,
+                'monthlyUsd': 1121.28,
+                'usdToInrRate': 83.0,
+                'monthlyInr': 93066,
+                'source': 'Azure Retail Prices API',
+                'specs': {'vcpu': 32, 'ramGB': 128},
+            }
+            mock_gcp.return_value = {
+                'provider': 'GCP',
+                'instanceType': 'e2-custom-32-131072',
+                'region': 'Asia Pacific (Mumbai)',
+                'hourlyUsd': 1.17,
+                'monthlyUsd': 854.1,
+                'usdToInrRate': 83.0,
+                'monthlyInr': 70890,
+                'source': 'GCP Pricing (Estimated Fallback)',
+                'specs': {'vcpu': 32, 'ramGB': 128},
+            }
+
+            res = self.client.get('/api/pricing/compare?vcpu=32&ram=128')
+            self.assertEqual(res.status_code, 200)
+            data = res.json()['data']
+            self.assertEqual(data['matchType'], 'ON_DEMAND_LOOKUP')
+            self.assertIsNone(data['matchedTier'])
+            self.assertEqual(data['providers']['AWS']['instanceType'], 'c6i.8xlarge')
+            self.assertEqual(data['providers']['Azure']['instanceType'], 'Standard_D32s_v5')
+            self.assertEqual(data['providers']['GCP']['instanceType'], 'e2-custom-32-131072')
+
+            # Verify cached in database on the fly
+            self.assertTrue(CloudPricingCache.objects.filter(instance_type='c6i.8xlarge').exists())
+            self.assertTrue(CloudPricingCache.objects.filter(instance_type='Standard_D32s_v5').exists())
+            self.assertTrue(CloudPricingCache.objects.filter(instance_type='e2-custom-32-131072').exists())
+
+    def test_legacy_aws_pricing_endpoint_backward_compatibility(self):
+        from unittest.mock import patch
+
+        with patch('api.views.get_aws_price_snapshot') as mock_aws:
+            mock_aws.return_value = {
+                'provider': 'AWS',
+                'instanceType': 'c6i.xlarge',
+                'region': 'Asia Pacific (Mumbai)',
+                'hourlyUsd': 0.17,
+                'monthlyUsd': 124.1,
+                'usdToInrRate': 83.0,
+                'monthlyInr': 10300,
+                'source': 'AWS Pricing API',
+            }
+
+            res = self.client.get('/api/pricing/aws?instanceType=c6i.xlarge')
+            self.assertEqual(res.status_code, 200)
+            self.assertTrue(res.json()['success'])
+            self.assertEqual(res.json()['data']['instanceType'], 'c6i.xlarge')

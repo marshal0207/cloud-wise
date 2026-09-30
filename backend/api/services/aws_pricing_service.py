@@ -6,6 +6,8 @@ import os
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
 
+from .pricing_common import get_usd_to_inr_rate
+
 
 class AwsPricingError(RuntimeError):
     pass
@@ -85,7 +87,7 @@ def get_aws_price_snapshot(
     fallback_on_error: bool = False,
 ):
     resolved_instance = instance_type or get_closest_aws_instance(vcpu, ram_gb)
-    usd_to_inr = Decimal(os.getenv('USD_TO_INR_RATE', '83'))
+    usd_to_inr = get_usd_to_inr_rate()
     source = 'AWS Pricing API'
     is_fallback = False
 

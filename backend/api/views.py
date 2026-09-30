@@ -46,6 +46,7 @@ from .services.github_service import GitHubApiError, push_files_to_repository
 from .services.github_repository_service import inspect_repository
 from .services.tech_stack_detector import UnsupportedTechStackError, detect_tech_stack
 from .services.aws_pricing_service import AwsPricingError, get_aws_price_snapshot
+from .services.pricing_comparison_service import compare_cloud_pricing
 from .services.free_tier_policy import FreeTierLimitError, validate_free_tier_deployment, evaluate_free_tier_eligibility
 from .services.deployment.mock_provider import MockDeploymentProvider, UnsupportedProviderError
 from .services.deployment.vercel_provider import VercelDeploymentService, VercelApiError
@@ -1329,6 +1330,40 @@ def aws_pricing_view(request):
         }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
     return Response({'success': True, 'data': snapshot}, status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+@permission_classes([permissions.AllowAny])
+def pricing_compare_view(request):
+    """
+    Unified multi-cloud pricing comparison endpoint (AWS, Azure, GCP).
+    Accepts vcpu, ram (or ramGB), storage (or storageGB), and region.
+    Returns standardized pricing comparison with matchType (EXACT_TIER, CLOSEST_MATCH, ON_DEMAND_LOOKUP).
+    """
+    try:
+        vcpu = int(request.query_params.get('vcpu', 4))
+    except (TypeError, ValueError):
+        vcpu = 4
+
+    try:
+        ram_gb = int(request.query_params.get('ram', request.query_params.get('ramGB', 16)))
+    except (TypeError, ValueError):
+        ram_gb = 16
+
+    try:
+        storage_gb = int(request.query_params.get('storage', request.query_params.get('storageGB', 100)))
+    except (TypeError, ValueError):
+        storage_gb = 100
+
+    region = request.query_params.get('region', 'Asia Pacific (Mumbai)')
+
+    data = compare_cloud_pricing(
+        vcpu=vcpu,
+        ram_gb=ram_gb,
+        storage_gb=storage_gb,
+        region=region,
+    )
+    return Response({'success': True, 'data': data}, status=status.HTTP_200_OK)
 
 
 # -------------------------------------------------------------
