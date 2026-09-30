@@ -156,3 +156,29 @@ class GitHubConnection(models.Model):
 
     def __str__(self):
         return f"GitHub connection for {self.user.email or self.user.username}"
+
+
+class CloudPricingCache(models.Model):
+    id = models.CharField(max_length=100, primary_key=True, editable=False)
+    provider = models.CharField(max_length=50)
+    instance_type = models.CharField(max_length=100)
+    region = models.CharField(max_length=100, default='Asia Pacific (Mumbai)')
+    price_per_month = models.DecimalField(max_digits=12, decimal_places=2)
+    hourly_usd = models.DecimalField(max_digits=10, decimal_places=4, default=0.0)
+    specs = models.JSONField(default=dict)
+    source = models.CharField(max_length=100, default='API')
+    last_updated = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['provider', 'instance_type', 'region']),
+        ]
+        unique_together = ('provider', 'instance_type', 'region')
+
+    def save(self, *args, **kwargs):
+        if not self.id:
+            self.id = generate_custom_id('cpc')
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.provider} - {self.instance_type} ({self.region}): INR {self.price_per_month}/mo"

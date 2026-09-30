@@ -1,6 +1,6 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin
-from .models import CustomUser, Project, ContactInquiry, EstimationRecord, DeploymentRecord, WaitlistSubscriber
+from .models import CustomUser, Project, ContactInquiry, EstimationRecord, DeploymentRecord, WaitlistSubscriber, CloudPricingCache
 
 @admin.register(CustomUser)
 class CustomUserAdmin(UserAdmin):
@@ -43,3 +43,10 @@ class DeploymentRecordAdmin(admin.ModelAdmin):
 class WaitlistSubscriberAdmin(admin.ModelAdmin):
     list_display = ['email', 'source', 'created_at']
     search_fields = ['email', 'source']
+
+
+@admin.register(CloudPricingCache)
+class CloudPricingCacheAdmin(admin.ModelAdmin):
+    list_display = ['provider', 'instance_type', 'region', 'price_per_month', 'hourly_usd', 'source', 'last_updated']
+    list_filter = ['provider', 'region', 'source']
+    search_fields = ['provider', 'instance_type', 'region']
