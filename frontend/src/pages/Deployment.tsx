@@ -1737,11 +1737,11 @@ export const Deployment: React.FC = () => {
                 <Terminal className="w-4 h-4 text-cyan-400" />
                 <span>Live Provisioning Console Logs</span>
               </h4>
-              <span className="text-[10px] text-slate-400 font-mono">{liveDeployment.logs.length} lines logged</span>
+              <span className="text-[10px] text-slate-400 font-mono">{liveDeployment.logs?.length || 0} lines logged</span>
             </div>
 
             <div className="p-5 bg-slate-950 font-mono text-xs text-slate-300 leading-relaxed max-h-72 overflow-y-auto space-y-1">
-              {liveDeployment.logs.length === 0 ? (
+              {!liveDeployment.logs || liveDeployment.logs.length === 0 ? (
                 <p className="text-slate-600 text-center py-8">
                   Console idle. Run analysis, generate files, configure env, then deploy to AWS EC2.
                 </p>

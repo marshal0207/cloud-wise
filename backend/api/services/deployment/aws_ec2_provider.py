@@ -742,6 +742,13 @@ class AwsEc2Provider(DeploymentProvider):
                 DeploymentStage.BUILDING,
                 "Provisioning EC2 capacity in your AWS account.",
             )
+            # The EC2 API rejects RunInstances when the configured IAM
+            # instance profile does not exist. Ensure it before either a
+            # normal launch or an automatic SSM-recovery replacement.
+            instance_profile = self._ensure_iam_instance_profile(
+                session, instance_profile, log
+            )
+
             reused = False
             instance = None
             if not self.config.get("force_new_instance"):
@@ -3727,6 +3734,141 @@ class AwsEc2Provider(DeploymentProvider):
         lines.append("echo '[CloudWise] User-data finished'\n")
         return "".join(lines)
 
+    def _ensure_iam_instance_profile(
+        self,
+        session,
+        instance_profile: str,
+        log: DeploymentLogService,
+    ) -> str:
+        """
+        Ensure the IAM instance profile used by EC2/SSM exists before
+        RunInstances is called.
+
+        CloudWise assumes a deployment role in the user's AWS account.
+        The assumed role must therefore have permission to inspect/create
+        the EC2 instance profile and to pass the profile's role to EC2.
+
+        If the configured profile already exists, nothing is changed. If
+        it does not exist, CloudWise creates the profile and attaches a
+        role with the same name. This keeps the normal EC2 convention
+        (role name == instance-profile name) while avoiding changes to any
+        unrelated IAM resources.
+        """
+        profile_name = (
+            str(instance_profile or "").strip()
+            or getattr(settings, "AWS_EC2_INSTANCE_PROFILE", "")
+            or "cloudwise-ec2-ssm"
+        ).strip() or "cloudwise-ec2-ssm"
+        # AWS API calls below take a profile *name*, not an ARN.
+        if ":instance-profile/" in profile_name:
+            profile_name = profile_name.rsplit("/", 1)[-1].strip()
+
+        iam = session.client("iam")
+        try:
+            response = iam.get_instance_profile(
+                InstanceProfileName=profile_name
+            )
+            profile = response.get("InstanceProfile") or {}
+            roles = profile.get("Roles") or []
+            if not roles:
+                # An empty instance profile cannot provide SSM permissions.
+                # Attach the conventionally matching role below.
+                role_name = profile_name
+                try:
+                    iam.get_role(RoleName=role_name)
+                    iam.add_role_to_instance_profile(
+                        InstanceProfileName=profile_name,
+                        RoleName=role_name,
+                    )
+                    log.info(
+                        DeploymentStage.PREPARING,
+                        f"Attached IAM role '{role_name}' to existing "
+                        f"instance profile '{profile_name}'.",
+                    )
+                except (ClientError, BotoCoreError) as exc:
+                    raise AwsEc2Error(
+                        f"IAM instance profile '{profile_name}' exists but "
+                        f"has no role. CloudWise could not attach role "
+                        f"'{role_name}'. Ensure the deployment role has "
+                        f"iam:GetRole and iam:AddRoleToInstanceProfile "
+                        f"permissions and that the role has "
+                        f"AmazonSSMManagedInstanceCore. ({exc})"
+                    ) from exc
+            log.info(
+                DeploymentStage.PREPARING,
+                f"Verified IAM instance profile '{profile_name}' for EC2/SSM.",
+            )
+            return profile_name
+        except iam.exceptions.NoSuchEntityException:
+            # Continue below and create the missing profile.
+            pass
+        except (ClientError, BotoCoreError) as exc:
+            raise AwsEc2Error(
+                f"CloudWise could not inspect IAM instance profile "
+                f"'{profile_name}'. Ensure the deployment role has "
+                f"iam:GetInstanceProfile permission. ({exc})"
+            ) from exc
+
+        role_name = profile_name
+        try:
+            iam.get_role(RoleName=role_name)
+        except (ClientError, BotoCoreError) as exc:
+            raise AwsEc2Error(
+                f"IAM instance profile '{profile_name}' does not exist, and "
+                f"CloudWise could not find IAM role '{role_name}'. Create an "
+                f"EC2 instance profile named '{profile_name}' containing "
+                f"this role with AmazonSSMManagedInstanceCore, or grant the "
+                f"deployment role iam:GetRole/CreateInstanceProfile/"
+                f"AddRoleToInstanceProfile permissions. ({exc})"
+            ) from exc
+
+        created = False
+        try:
+            # Do not pass Tags here. Tagging an IAM instance profile requires
+            # iam:TagInstanceProfile (and iam:ListInstanceProfileTags).
+            # CloudWise does not need an IAM-profile tag for deployment, so
+            # avoid requiring those extra permissions from the user's
+            # CloudWiseDeployRole.
+            iam.create_instance_profile(
+                InstanceProfileName=profile_name,
+            )
+            created = True
+            iam.add_role_to_instance_profile(
+                InstanceProfileName=profile_name,
+                RoleName=role_name,
+            )
+            log.info(
+                DeploymentStage.PREPARING,
+                f"Created IAM instance profile '{profile_name}' and attached "
+                f"role '{role_name}' for EC2/SSM.",
+            )
+            # IAM is eventually consistent. Give the new profile a short
+            # propagation window before RunInstances references it.
+            for _ in range(10):
+                try:
+                    iam.get_instance_profile(
+                        InstanceProfileName=profile_name
+                    )
+                    break
+                except (ClientError, BotoCoreError):
+                    time.sleep(2)
+            return profile_name
+        except (ClientError, BotoCoreError) as exc:
+            if created:
+                try:
+                    iam.delete_instance_profile(
+                        InstanceProfileName=profile_name
+                    )
+                except (ClientError, BotoCoreError):
+                    pass
+            raise AwsEc2Error(
+                f"CloudWise could not create/configure IAM instance profile "
+                f"'{profile_name}'. Ensure the deployment role has "
+                f"iam:CreateInstanceProfile, iam:AddRoleToInstanceProfile and "
+                f"iam:PassRole permissions, and that role '{role_name}' has "
+                f"AmazonSSMManagedInstanceCore. ({exc})"
+            ) from exc
+
     def _run_instances(
         self,
         ec2,
@@ -3783,6 +3925,11 @@ class AwsEc2Provider(DeploymentProvider):
             or getattr(settings, "AWS_EC2_INSTANCE_PROFILE", "")
             or "cloudwise-ec2-ssm"
         ).strip() or "cloudwise-ec2-ssm"
+        # _run_instances receives an EC2 client, so profile existence is
+        # normally ensured by provision() immediately before this call.
+        # Keep the final API payload name-only as required by EC2.
+        if ":instance-profile/" in profile_name:
+            profile_name = profile_name.rsplit("/", 1)[-1].strip()
         params["IamInstanceProfile"] = {"Name": profile_name}
         user_data = self._user_data()
         if user_data:
