@@ -1,6 +1,6 @@
 import React from 'react';
 import { Link } from 'react-router-dom';
-import { Cloud, Github, Twitter, Linkedin, ArrowUpRight } from 'lucide-react';
+import { Cloud, Github, Twitter, Linkedin, ArrowUpRight, Mail } from 'lucide-react';
 
 export const Footer: React.FC = () => {
   return (
@@ -23,6 +23,7 @@ export const Footer: React.FC = () => {
               <Link to="/about" className="hover:text-emerald-400 transition-colors" title="Twitter"><Twitter size={18} /></Link>
               <Link to="/about" className="hover:text-emerald-400 transition-colors" title="LinkedIn"><Linkedin size={18} /></Link>
               <Link to="/about" className="hover:text-emerald-400 transition-colors" title="GitHub"><Github size={18} /></Link>
+              <Link to="/contact" className="hover:text-cyan-400 transition-colors" title="Contact"><Mail size={18} /></Link>
             </div>
           </div>
 

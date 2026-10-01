@@ -28,7 +28,6 @@ export const Header: React.FC = () => {
     { name: 'Generate', url: '/generate' },
     { name: 'Deploy', url: '/deployment' },
     { name: 'Monitor', url: '/monitoring' },
-    { name: 'Contact', url: '/contact' },
   ];
 
   const getStatusDot = (url: string) => {

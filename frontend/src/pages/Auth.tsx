@@ -34,7 +34,7 @@ const LeftPanel: React.FC = () => {
   ];
 
   return (
-    <div className="hidden lg:flex flex-col justify-center w-[45%] h-full relative overflow-hidden bg-[#05080D] p-6 xl:p-8 gap-6">
+    <div className="hidden lg:flex w-1/2 flex-col justify-center h-full relative overflow-hidden bg-[#05080D] p-6 xl:p-8 gap-6">
       {/* Background texture */}
       <div className="absolute inset-0 pointer-events-none">
         <div className="absolute top-0 left-0 w-full h-full bg-[radial-gradient(ellipse_80%_50%_at_20%_-10%,rgba(16,185,129,0.08),transparent)]" />
@@ -229,7 +229,7 @@ export const Auth: React.FC = () => {
 
       {/* ── Right: form ── */}
       <div className="flex-1 overflow-y-auto h-full">
-        <div className="flex flex-col justify-center min-h-full px-6 xl:px-8 py-8 items-start">
+        <div className="flex min-h-full flex-col items-center justify-center px-6 py-8 xl:px-8">
           <div className="w-full max-w-md">
 
             {/* Mobile logo */}
