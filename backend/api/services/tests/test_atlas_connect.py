@@ -401,7 +401,7 @@ class ConnectAtlasEndpointTests(TestCase):
 
 
 class AtlasPipelineGateTests(TestCase):
-    """The deployment check at pipeline.py:661 keeps working."""
+    """Atlas allowlisting remains optional when the IP is manually configured."""
 
     def setUp(self):
         self.user = User.objects.create_user(
@@ -445,7 +445,7 @@ class AtlasPipelineGateTests(TestCase):
     @patch("api.services.deployment.pipeline.AwsEc2Provider")
     @patch("api.services.deployment.pipeline.assume_role_credentials")
     @patch("api.services.deployment.preflight.verify_permissions")
-    def test_pipeline_fails_without_connected_record(
+    def test_pipeline_continues_without_connected_record(
         self, mock_verify, mock_assume, mock_provider_class, mock_fail, mock_log
     ):
         provider, payload = self._prepare({"MONGO_URI": "mongodb://..."})
@@ -457,14 +457,8 @@ class AtlasPipelineGateTests(TestCase):
 
         _run_pipeline(self.deployment.id, payload)
 
-        mock_fail.assert_called_with(
-            self.deployment.id,
-            "BUILDING",
-            "MongoDB Atlas access is required for this deployment, but CloudWise "
-            "is not authorized to manage the Atlas project's network access "
-            "list. Configure the CloudWise Atlas integration and retry.",
-            error_code="ATLAS_AUTHORIZATION_REQUIRED",
-        )
+        mock_fail.assert_not_called()
+        provider.deploy.assert_called_once()
 
     @patch(ENSURE_PATCH)
     @patch("api.services.deployment.pipeline.append_log")
@@ -496,13 +490,7 @@ class AtlasPipelineGateTests(TestCase):
 
         _run_pipeline(self.deployment.id, payload)
 
-        mock_ensure.assert_called_once()
-        called_client, called_ip, called_dep = mock_ensure.call_args[0]
-        self.assertEqual(called_ip, "1.2.3.4")
-        self.assertEqual(called_dep, str(self.deployment.id))
-        self.assertEqual(called_client.client_id, "pub")
-        self.assertEqual(called_client.client_secret, "priv")
-
+        mock_ensure.assert_not_called()
         provider.deploy.assert_called_once()
         provider.terminate_instance.assert_not_called()
         self.deployment.refresh_from_db()

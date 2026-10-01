@@ -647,65 +647,6 @@ def _run_pipeline(deployment_id: str, payload: dict) -> None:
         return
 
     # ------------------------------------------------------------------
-    # Step 2.5 — MongoDB Atlas Network Access Integration
-    # ------------------------------------------------------------------
-    env_vars = payload.get("env_vars") or {}
-    if "MONGO_URI" in env_vars and public_ip:
-        append_log(
-            deployment_id,
-            "INFO",
-            DeploymentStage.BUILDING,
-            "[ATLAS] MongoDB Atlas detected"
-        )
-        from ...models import MongoDBAtlasConnection
-        atlas_conn = MongoDBAtlasConnection.objects.filter(user_id=record.user_id, status="connected").first()
-        
-        if not atlas_conn:
-            fail_deployment(
-                deployment_id,
-                DeploymentStage.BUILDING,
-                "MongoDB Atlas access is required for this deployment, but CloudWise is not authorized to manage the Atlas project's network access list. Configure the CloudWise Atlas integration and retry.",
-                error_code="ATLAS_AUTHORIZATION_REQUIRED",
-            )
-            return
-            
-        from .atlas.atlas_client import AtlasClient
-        from .atlas.atlas_network_access import ensure_ec2_ip_allowed
-        
-        try:
-            client_secret = atlas_conn.get_secret()
-            atlas_client = AtlasClient(atlas_conn.client_id, client_secret, atlas_conn.project_id)
-            append_log(deployment_id, "INFO", DeploymentStage.BUILDING, "[ATLAS] Checking CloudWise Atlas authorization")
-            append_log(deployment_id, "INFO", DeploymentStage.BUILDING, "[ATLAS] Requesting Administration API token")
-            append_log(deployment_id, "INFO", DeploymentStage.BUILDING, "[ATLAS] Checking project network access")
-            
-            result = ensure_ec2_ip_allowed(atlas_client, public_ip, deployment_id)
-            if result.get("status") == "error":
-                fail_deployment(
-                    deployment_id,
-                    DeploymentStage.BUILDING,
-                    f"MongoDB Atlas could not be updated. {result.get('message')}",
-                    error_code=result.get("error_code") or "ATLAS_INTEGRATION_FAILED"
-                )
-                return
-            else:
-                append_log(
-                    deployment_id,
-                    "INFO",
-                    DeploymentStage.BUILDING,
-                    f"[ATLAS] {result.get('message')}"
-                )
-        except Exception as e:
-            logger.exception("Atlas integration error")
-            fail_deployment(
-                deployment_id,
-                DeploymentStage.BUILDING,
-                "MongoDB Atlas could not be updated. Retry the deployment.",
-                error_code="ATLAS_INTERNAL_ERROR"
-            )
-            return
-
-    # ------------------------------------------------------------------
     # Step 3 — upload files, build, start containers, health check
     # ------------------------------------------------------------------
     stream.set_phase("deploy")

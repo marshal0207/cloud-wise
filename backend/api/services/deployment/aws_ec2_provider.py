@@ -2801,6 +2801,15 @@ class AwsEc2Provider(DeploymentProvider):
             )
             return report
 
+        log.info(
+            DeploymentStage.PREPARING,
+            "[ATLAS] MongoDB Atlas detected",
+        )
+        log.info(
+            DeploymentStage.PREPARING,
+            f"[ATLAS] EC2 public IP: {public_ip}",
+        )
+
         if not getattr(settings, "MONGODB_ATLAS_AUTO_ALLOWLIST", True):
             report.update(
                 action="disabled",
@@ -2842,6 +2851,24 @@ class AwsEc2Provider(DeploymentProvider):
             DeploymentStage.PREPARING,
             message or f"Atlas Network Access action: {action}.",
         )
+        if action == "exists":
+            log.info(
+                DeploymentStage.PREPARING,
+                "[ATLAS] EC2 IP is already allowed",
+            )
+            log.info(
+                DeploymentStage.PREPARING,
+                "[ATLAS] Skipping Atlas network-access modification",
+            )
+            log.info(
+                DeploymentStage.PREPARING,
+                "[ATLAS] Continuing deployment",
+            )
+        elif action in ("added", "updated"):
+            log.info(
+                DeploymentStage.PREPARING,
+                "[ATLAS] Continuing deployment",
+            )
         if not report.get("configured"):
             # Never pretend the address was allowlisted.
             log.warning(
@@ -2850,6 +2877,14 @@ class AwsEc2Provider(DeploymentProvider):
                 "(MONGODB_ATLAS_PUBLIC_KEY / MONGODB_ATLAS_PRIVATE_KEY / "
                 "MONGODB_ATLAS_PROJECT_ID): CloudWise did not modify Atlas "
                 "Network Access.",
+            )
+            log.info(
+                DeploymentStage.PREPARING,
+                "[ATLAS] Skipping Atlas network-access modification",
+            )
+            log.info(
+                DeploymentStage.PREPARING,
+                "[ATLAS] Continuing deployment",
             )
         return report
 

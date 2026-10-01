@@ -89,7 +89,7 @@ class AtlasIntegrationTestCase(TestCase):
     @patch("api.services.deployment.pipeline.AwsEc2Provider")
     @patch("api.services.deployment.pipeline.assume_role_credentials")
     @patch("api.services.deployment.preflight.verify_permissions")
-    def test_missing_atlas_configuration_fails_deployment(self, mock_verify, mock_assume, mock_provider_class, mock_fail, mock_log):
+    def test_missing_atlas_configuration_continues_to_deployment(self, mock_verify, mock_assume, mock_provider_class, mock_fail, mock_log):
         from api.models import AWSConnection
         conn = AWSConnection.objects.create(user=self.user, role_arn="arn", external_id="ext", status="active")
         self.deployment.aws_connection_id = conn.id
@@ -112,13 +112,8 @@ class AtlasIntegrationTestCase(TestCase):
         
         _run_pipeline(self.deployment.id, payload)
         
-        # Should call fail_deployment with ATLAS_AUTHORIZATION_REQUIRED
-        mock_fail.assert_called_with(
-            self.deployment.id,
-            "BUILDING",
-            "MongoDB Atlas access is required for this deployment, but CloudWise is not authorized to manage the Atlas project's network access list. Configure the CloudWise Atlas integration and retry.",
-            error_code="ATLAS_AUTHORIZATION_REQUIRED"
-        )
+        mock_fail.assert_not_called()
+        mock_provider.deploy.assert_called_once()
         
     @patch("api.services.deployment.pipeline.AwsEc2Provider")
     def test_no_0_0_0_0_is_ever_generated(self, mock_provider_class):

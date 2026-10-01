@@ -532,6 +532,18 @@ def _database_failure(
     host = str(dependency.get("host") or "")
     port = int(dependency.get("port") or 0)
 
+    if (
+        kind == KIND_MONGODB
+        and is_atlas_host(host)
+        and public_ip
+        and not atlas_configured()
+    ):
+        return ERROR_MONGODB_ATLAS_NOT_CONFIGURED, (
+            f"MongoDB Atlas is detected, but EC2 IP {public_ip}/32 is not "
+            "allowed. Add this IP to MongoDB Atlas Network Access and "
+            "retry."
+        )
+
     if probe.get("verdict") == database_probe.VERDICT_ENV_MISSING:
         return ERROR_DATABASE_ENV_MISSING, (
             f"Database preflight failed: environment variable {var_name} "
@@ -819,7 +831,10 @@ def atlas_blocked_message(public_ip: object, *, configured: bool) -> str:
         )
     if not configured:
         message += (
-            " MongoDB Atlas Network Access must allow the EC2 public IP. "
+            f" MongoDB Atlas is detected, but EC2 IP {address}/32 is not "
+            "allowed. Add this IP to MongoDB Atlas Network Access and "
+            "retry. "
+            "MongoDB Atlas Network Access must allow the EC2 public IP. "
             "MONGODB_ATLAS_PUBLIC_KEY, MONGODB_ATLAS_PRIVATE_KEY and "
             "MONGODB_ATLAS_PROJECT_ID are not configured, so CloudWise "
             "could not add the /32 entry automatically."

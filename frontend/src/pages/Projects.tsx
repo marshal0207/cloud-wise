@@ -3,9 +3,14 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { 
   Github, Search, ShieldCheck, ArrowRight, CheckCircle2, 
-  AlertCircle, LogOut, RefreshCw, Zap
+  AlertCircle, LogOut, RefreshCw, Zap, FolderPlus
 } from 'lucide-react';
 import { useCloudWise } from '@/context/CloudWiseContext';
+
+interface RepositoryDeployment {
+  liveUrl: string;
+  status: string;
+}
 
 export const Projects: React.FC = () => {
   const navigate = useNavigate();
@@ -15,6 +20,7 @@ export const Projects: React.FC = () => {
   const [isConnected, setIsConnected] = useState(false);
   const [loadingRepos, setLoadingRepos] = useState(true);
   const [repositories, setRepositories] = useState<any[]>([]);
+  const [repositoryDeployments, setRepositoryDeployments] = useState<Record<string, RepositoryDeployment>>({});
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedRepo, setSelectedRepo] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
@@ -41,17 +47,32 @@ export const Projects: React.FC = () => {
     setError('');
     try {
       const token = localStorage.getItem('cloudwise_token');
-      const response = await fetch('/api/github/repos', {
-        headers: { Authorization: token ? `Bearer ${token}` : '' },
-        credentials: 'include',
-      });
-      const data = await response.json().catch(() => null);
-      if (!response.ok || !data?.success) {
+      const headers = { Authorization: token ? `Bearer ${token}` : '' };
+      const [repositoriesResponse, deploymentsResponse] = await Promise.all([
+        fetch('/api/github/repos', { headers, credentials: 'include' }),
+        fetch('/api/deployments?limit=100', { headers, credentials: 'include' }),
+      ]);
+      const data = await repositoriesResponse.json().catch(() => null);
+      const deploymentsData = await deploymentsResponse.json().catch(() => null);
+      if (!repositoriesResponse.ok || !data?.success) {
         setIsConnected(false);
         setRepositories([]);
       } else {
         setIsConnected(true);
         setRepositories(data.data || []);
+        const deployments = Array.isArray(deploymentsData?.data) ? deploymentsData.data : [];
+        const deploymentMap = deployments.reduce((map: Record<string, RepositoryDeployment>, deployment: any) => {
+          const repository = String(deployment.repository || '').trim();
+          const liveUrl = String(deployment.liveUrl || deployment.openUrl || '').trim();
+          if (repository && liveUrl && !map[repository]) {
+            map[repository] = {
+              liveUrl,
+              status: String(deployment.deploymentStatus || '').toUpperCase(),
+            };
+          }
+          return map;
+        }, {});
+        setRepositoryDeployments(deploymentMap);
       }
     } catch (err: any) {
       setIsConnected(false);
@@ -100,10 +121,16 @@ export const Projects: React.FC = () => {
     }
   };
 
-  const filteredRepos = repositories.filter(r => 
-    r.name.toLowerCase().includes(searchQuery.toLowerCase()) || 
-    r.full_name.toLowerCase().includes(searchQuery.toLowerCase())
-  );
+  const filteredRepos = repositories
+    .filter(r => 
+      r.name.toLowerCase().includes(searchQuery.toLowerCase()) || 
+      r.full_name.toLowerCase().includes(searchQuery.toLowerCase())
+    )
+    .sort((first, second) => {
+      const firstDeployment = repositoryDeployments[first.full_name];
+      const secondDeployment = repositoryDeployments[second.full_name];
+      return Number(Boolean(secondDeployment?.liveUrl)) - Number(Boolean(firstDeployment?.liveUrl));
+    });
 
   return (
     <div className="w-full space-y-8 animate-in fade-in duration-500 max-w-5xl mx-auto px-4 sm:px-6">
@@ -221,6 +248,7 @@ export const Projects: React.FC = () => {
               {filteredRepos.length > 0 ? (
                 filteredRepos.map((repo) => {
                   const isSelected = selectedRepo === repo.full_name;
+                  const deployment = repositoryDeployments[repo.full_name];
                   return (
                     <motion.div
                       key={repo.id}
@@ -251,11 +279,22 @@ export const Projects: React.FC = () => {
                         <p className="text-[11px] text-slate-500 mt-1 truncate">
                           {repo.full_name}
                         </p>
+                        {deployment?.liveUrl && (
+                          <a
+                            href={deployment.liveUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            onClick={(event) => event.stopPropagation()}
+                            className="mt-2 block truncate text-[11px] font-semibold text-cyan-300 hover:text-cyan-200"
+                          >
+                            Live: {deployment.liveUrl}
+                          </a>
+                        )}
                       </div>
 
                       <div className="mt-4 pt-4 border-t border-slate-800/60 flex items-center justify-between">
                         <span className="text-[10px] text-emerald-400/80 flex items-center gap-1 font-semibold uppercase tracking-wider">
-                          <Zap size={10} /> Compatible
+                          <Zap size={10} /> {deployment?.liveUrl ? 'Deployed' : 'Compatible'}
                         </span>
                         {isSelected ? (
                           <span className="text-[11px] font-bold text-emerald-400">SELECTED</span>
