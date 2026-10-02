@@ -38,8 +38,8 @@ class EstimationRecordAdmin(admin.ModelAdmin):
 
 @admin.register(DeploymentRecord)
 class DeploymentRecordAdmin(admin.ModelAdmin):
-    list_display = ['id', 'environment_name', 'provider', 'monthly_cost', 'status', 'ip_address', 'created_at']
-    list_filter = ['provider', 'status', 'region']
+    list_display = ['id', 'environment_name', 'repository', 'provider', 'aws_account_id', 'instance_id', 'monthly_cost', 'deployment_status', 'ip_address', 'created_at']
+    list_filter = ['provider', 'deployment_status', 'region']
 
 
 @admin.register(WaitlistSubscriber)

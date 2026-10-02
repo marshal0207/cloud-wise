@@ -65,13 +65,13 @@ export const Optimization: React.FC = () => {
         </div>
 
         {/* Card 3: Optimized Cost */}
-        <div className="glass-card p-6 rounded-3xl space-y-2 border border-cyan-500/40 bg-cyan-950/10">
-          <div className="flex justify-between items-center text-xs font-semibold text-cyan-400">
+        <div className="glass-card p-6 rounded-3xl space-y-2 border border-emerald-500/40 bg-emerald-950/10">
+          <div className="flex justify-between items-center text-xs font-semibold text-emerald-400">
             <span>Tuned Monthly Cost</span>
             <Sparkles className="w-4 h-4" />
           </div>
-          <p className="text-3xl font-extrabold text-cyan-300">{formatINR(effectiveMonthlyCost)} <span className="text-xs font-normal text-cyan-400">/ mo</span></p>
-          <p className="text-xs text-cyan-400 font-medium">Optimized multi-cloud execution</p>
+          <p className="text-3xl font-extrabold text-emerald-300">{formatINR(effectiveMonthlyCost)} <span className="text-xs font-normal text-emerald-400">/ mo</span></p>
+          <p className="text-xs text-emerald-400 font-medium">Optimized multi-cloud execution</p>
         </div>
 
       </div>
@@ -80,7 +80,7 @@ export const Optimization: React.FC = () => {
       <div className="space-y-6">
         <div className="flex items-center justify-between">
           <h2 className="text-xl font-bold text-white flex items-center gap-2">
-            <Sliders className="w-5 h-5 text-cyan-400" />
+            <Sliders className="w-5 h-5 text-emerald-400" />
             <span>Actionable Optimization Opportunities</span>
           </h2>
           <span className="text-xs text-slate-400">
@@ -109,7 +109,7 @@ export const Optimization: React.FC = () => {
                     <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
                       item.impact === 'High' 
                         ? 'bg-amber-500/20 text-amber-300' 
-                        : 'bg-cyan-500/20 text-cyan-300'
+                        : 'bg-emerald-500/20 text-emerald-300'
                     }`}>
                       {item.impact} Impact
                     </span>
@@ -124,7 +124,7 @@ export const Optimization: React.FC = () => {
                     </p>
                   </div>
 
-                  <div className="bg-slate-950/60 p-3 rounded-2xl border border-slate-800 flex items-center justify-between text-xs">
+                  <div className="bg-[#05080D]/60 p-3 rounded-2xl border border-slate-800 flex items-center justify-between text-xs">
                     <span className="text-slate-400">Estimated Monthly Impact</span>
                     <span className="font-extrabold text-emerald-400 text-sm">
                       Save {formatINR(item.savings)} / month
@@ -139,7 +139,7 @@ export const Optimization: React.FC = () => {
                     className={`flex-1 py-3 rounded-xl font-bold text-xs transition-all flex items-center justify-center gap-1.5 active:scale-95 ${
                       item.applied
                         ? 'bg-emerald-500 text-slate-950 shadow-md shadow-emerald-500/20'
-                        : 'bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-slate-950 shadow-md shadow-cyan-500/20'
+                        : 'bg-gradient-to-r from-emerald-500 to-blue-600 hover:from-emerald-400 hover:to-blue-500 text-slate-950 shadow-md shadow-emerald-500/20'
                     }`}
                   >
                     {item.applied ? <Check size={16} /> : <Zap size={16} />}
@@ -148,7 +148,7 @@ export const Optimization: React.FC = () => {
 
                   <button
                     onClick={() => setDetailItem(item)}
-                    className="px-3.5 py-3 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 font-semibold text-xs transition-colors flex items-center justify-center gap-1"
+                    className="px-3.5 py-3 rounded-xl bg-[#080D14] hover:bg-slate-800 border border-slate-800 text-slate-300 font-semibold text-xs transition-colors flex items-center justify-center gap-1"
                   >
                     <Info size={14} />
                     <span>Details</span>
@@ -164,7 +164,7 @@ export const Optimization: React.FC = () => {
       {/* Details Modal */}
       <AnimatePresence>
         {detailItem && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-[#05080D]/80 backdrop-blur-md">
             <motion.div
               initial={{ opacity: 0, scale: 0.95 }}
               animate={{ opacity: 1, scale: 1 }}
@@ -173,17 +173,17 @@ export const Optimization: React.FC = () => {
             >
               <button
                 onClick={() => setDetailItem(null)}
-                className="absolute top-5 right-5 text-slate-400 hover:text-white p-1 rounded-lg bg-slate-900 border border-slate-800"
+                className="absolute top-5 right-5 text-slate-400 hover:text-white p-1 rounded-lg bg-[#080D14] border border-slate-800"
               >
                 <X size={18} />
               </button>
 
               <div className="space-y-1">
-                <span className="text-xs font-bold text-cyan-400 uppercase tracking-wider">{detailItem.category} Optimization</span>
+                <span className="text-xs font-bold text-emerald-400 uppercase tracking-wider">{detailItem.category} Optimization</span>
                 <h3 className="text-xl font-extrabold text-white">{detailItem.title}</h3>
               </div>
 
-              <div className="bg-slate-900/80 p-4 rounded-2xl border border-slate-800 space-y-2 text-xs">
+              <div className="bg-[#080D14]/80 p-4 rounded-2xl border border-slate-800 space-y-2 text-xs">
                 <div className="flex justify-between">
                   <span className="text-slate-400">Original Item Spend:</span>
                   <span className="font-bold text-white">{formatINR(detailItem.currentCost)}/mo</span>
@@ -194,7 +194,7 @@ export const Optimization: React.FC = () => {
                 </div>
                 <div className="flex justify-between">
                   <span className="text-slate-400">Tuned Cost:</span>
-                  <span className="font-bold text-cyan-300">{formatINR(detailItem.currentCost - detailItem.savings)}/mo</span>
+                  <span className="font-bold text-emerald-300">{formatINR(detailItem.currentCost - detailItem.savings)}/mo</span>
                 </div>
               </div>
 
@@ -208,13 +208,13 @@ export const Optimization: React.FC = () => {
                     applyOptimization(detailItem.id);
                     setDetailItem(null);
                   }}
-                  className="flex-1 py-3 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs transition-all shadow-md shadow-cyan-500/20"
+                  className="flex-1 py-3 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs transition-all shadow-md shadow-emerald-500/20"
                 >
                   {detailItem.applied ? 'Revert Optimization' : 'Apply Now'}
                 </button>
                 <button
                   onClick={() => setDetailItem(null)}
-                  className="px-4 py-3 rounded-xl bg-slate-900 border border-slate-800 text-slate-300 font-semibold text-xs hover:bg-slate-800"
+                  className="px-4 py-3 rounded-xl bg-[#080D14] border border-slate-800 text-slate-300 font-semibold text-xs hover:bg-slate-800"
                 >
                   Close
                 </button>

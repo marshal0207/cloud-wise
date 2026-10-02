@@ -20,14 +20,24 @@ urlpatterns = [
     path('contact', views.contact_view, name='contact'),
     path('estimate', views.estimate_view, name='estimate'),
     path('deploy', views.deploy_view, name='deploy'),
+    # Part 21 — pre-deployment preflight (no record is created)
+    path('deploy/preflight', views.deploy_preflight_view, name='deploy_preflight'),
     path('waitlist', views.waitlist_view, name='waitlist'),
     path('monitoring', views.monitoring_view, name='monitoring'),
     
     # Deployment Management
+    path('deployments', views.deployments_list_view, name='deployments_list'),
+    path('deployments/<str:deployment_id>', views.deployment_detail_view, name='deployment_detail'),
     path('deployments/<str:deployment_id>/status', views.deployment_status_view, name='deployment_status'),
     path('deployments/<str:deployment_id>/logs', views.deployment_logs_view, name='deployment_logs'),
     path('deployments/<str:deployment_id>/health', views.deployment_health_view, name='deployment_health'),
-    path('deployments/<str:deployment_id>/fail', views.deployment_fail_view, name='deployment_fail'),
+    path('deployments/<str:deployment_id>/retry', views.deployment_retry_view, name='deployment_retry'),
+    # Part 14 — lifecycle actions (always explicit user actions):
+    # stop = StopInstances (instance retained), start = StartInstances,
+    # terminate = TerminateInstances (destroy), rollback = keep instance.
+    path('deployments/<str:deployment_id>/stop', views.deployment_stop_view, name='deployment_stop'),
+    path('deployments/<str:deployment_id>/start', views.deployment_start_view, name='deployment_start'),
+    path('deployments/<str:deployment_id>/terminate', views.deployment_terminate_view, name='deployment_terminate'),
     path('deployments/<str:deployment_id>/rollback', views.deployment_rollback_view, name='deployment_rollback'),
     
     # Stubs
@@ -37,11 +47,18 @@ urlpatterns = [
     path('github/oauth/start', views.github_oauth_start_view, name='github_oauth_start'),
     path('github/oauth/callback', views.github_oauth_callback_view, name='github_oauth_callback'),
     path('github/repos', views.github_repositories_view, name='github_repositories'),
+    path('github/repos/<path:repo_path>/inspect', views.github_repository_inspect_view, name='github_repository_inspect'),
     path('pricing/aws', views.aws_pricing_view, name='aws_pricing'),
 
     # AWS account connection (Part 3 — IAM role, temporary credentials)
-    path('aws/connect-info', views.aws_connect_info_view, name='aws_connect_info'),
-    path('aws/connect', views.aws_connect_view, name='aws_connect'),
+path('aws/connect-info', views.aws_connect_info_view, name='aws_connect_info'),
+path('aws/verify', views.aws_verify_view, name='aws_verify'),
+path('aws/connect', views.aws_connect_view, name='aws_connect'),
     path('aws/connection', views.aws_connection_view, name='aws_connection'),
     path('aws/disconnect', views.aws_disconnect_view, name='aws_disconnect'),
+
+    # MongoDB Atlas Connection
+    path('atlas/connection', views.atlas_connection_view, name='atlas_connection'),
+    path('atlas/connect', views.atlas_connect_view, name='atlas_connect'),
+    path('atlas/disconnect', views.atlas_disconnect_view, name='atlas_disconnect'),
 ]

@@ -119,22 +119,44 @@ SIMPLE_JWT = {
     'AUTH_HEADER_TYPES': ('Bearer', 'cw_token'),
 }
 
+# ---------------------------------------------------------------------------
 # GitHub OAuth configuration. Keep the client secret server-side only.
+#
+# Every value comes from the environment (see backend/.env.example). Nothing
+# about a GitHub account, token, repository or CloudWise user id is hardcoded.
+#
+# GITHUB_REDIRECT_URI must EXACTLY match the "Authorization callback URL"
+# configured on the GitHub OAuth App (GitHub rejects any other value with
+# `redirect_uri_mismatch`). For local development the canonical value is:
+#     http://localhost:8000/api/github/oauth/callback
+# ---------------------------------------------------------------------------
 GITHUB_CLIENT_ID = os.getenv('GITHUB_CLIENT_ID', '')
 GITHUB_CLIENT_SECRET = os.getenv('GITHUB_CLIENT_SECRET', '')
 GITHUB_REDIRECT_URI = os.getenv(
     'GITHUB_REDIRECT_URI',
-    'http://127.0.0.1:8000/api/github/oauth/callback'
-)
-FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:5173')
+    'http://localhost:8000/api/github/oauth/callback'
+).strip()
+# Space separated OAuth scopes requested from GitHub.
+#   repo         -> read/write private + public repositories
+#   workflow     -> push files into .github/workflows
+GITHUB_OAUTH_SCOPES = os.getenv('GITHUB_OAUTH_SCOPES', 'repo workflow').strip() or 'repo workflow'
+FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:5173').rstrip('/')
+# Symmetric key used to encrypt stored GitHub access tokens.
+# Falls back to SECRET_KEY when unset (see api.services.token_encryption).
+GITHUB_TOKEN_ENCRYPTION_KEY = os.getenv('GITHUB_TOKEN_ENCRYPTION_KEY', '')
+# OAuth state (CSRF) validity window, in seconds.
+GITHUB_OAUTH_STATE_MAX_AGE = int(os.getenv('GITHUB_OAUTH_STATE_MAX_AGE', '600'))
 
-# Vercel deployment credentials (server-side only — never expose to frontend)
-VERCEL_TOKEN = os.getenv('VERCEL_TOKEN', '')
-VERCEL_TEAM_ID = os.getenv('VERCEL_TEAM_ID', '')  # optional, for team-owned projects
+# Retired deployment targets (Vercel, Render) are no longer supported.
+# CloudWise deploys to AWS EC2 only; their credentials are intentionally
+# not read anywhere in the application.
 
-# Render deployment credentials (server-side only — never expose to frontend)
-RENDER_API_KEY = os.getenv('RENDER_API_KEY', '')
-RENDER_OWNER_ID = os.getenv('RENDER_OWNER_ID', '')  # user or team owner ID from Render dashboard
+# When True the AWS deployment pipeline runs synchronously inside the
+# request thread instead of on a background thread. The test suite sets
+# this so deployment outcomes are deterministic; production leaves it
+# False so POST /api/deploy returns immediately and the client polls
+# GET /api/deployments/<id>/status.
+DEPLOYMENT_RUN_INLINE = os.getenv('DEPLOYMENT_RUN_INLINE', '').lower() in ('1', 'true', 'yes')
 
 # ------------------------------------------------------------------
 # AWS account connection (Part 3) — IAM role + STS temporary credentials
@@ -165,9 +187,35 @@ AWS_EC2_AMI_SSM_PARAMETER = os.getenv(
 )
 AWS_EC2_KEY_NAME = os.getenv('AWS_EC2_KEY_NAME', '')
 AWS_EC2_INSTANCE_PROFILE = os.getenv('AWS_EC2_INSTANCE_PROFILE', '')
-AWS_EC2_ROOT_VOLUME_GB = int(os.getenv('AWS_EC2_ROOT_VOLUME_GB', '20'))
+AWS_EC2_ROOT_VOLUME_GB = int(os.getenv('AWS_EC2_ROOT_VOLUME_GB', '30'))
 AWS_EC2_WAIT_FOR_RUNNING = os.getenv('AWS_EC2_WAIT_FOR_RUNNING', 'true').lower() in ('1', 'true', 't')
 AWS_EC2_WAIT_TIMEOUT_SECONDS = int(os.getenv('AWS_EC2_WAIT_TIMEOUT_SECONDS', '300'))
+
+# Stable public IP: attach an Elastic IP to each deployment instance so the
+# address stays the same across rebuilds and a database network access list
+# (MongoDB Atlas, Postgres, ...) keeps matching. Optional — when disabled,
+# or when the role lacks the ec2:*Address permissions, the pipeline keeps
+# using the instance's dynamic public IP.
+AWS_USE_ELASTIC_IP = os.getenv('AWS_USE_ELASTIC_IP', 'true').lower() in ('1', 'true', 't')
+
+# ---------------------------------------------------------------------------
+# MongoDB Atlas Network Access (optional automation)
+#
+# These are *Atlas administration* credentials for the CloudWise operator —
+# they are completely separate from the application's MongoDB connection
+# string, which stays in the deployment environment and is never logged.
+#
+# When all three are set, CloudWise adds a narrow <public-ip>/32 entry to the
+# project's Atlas access list after the instance gets its address. When they
+# are not set, nothing is faked: the deployment reports that Atlas Network
+# Access must allow the EC2 public IP instead.
+# ---------------------------------------------------------------------------
+MONGODB_ATLAS_PUBLIC_KEY = os.getenv('MONGODB_ATLAS_PUBLIC_KEY', '')
+MONGODB_ATLAS_PRIVATE_KEY = os.getenv('MONGODB_ATLAS_PRIVATE_KEY', '')
+MONGODB_ATLAS_PROJECT_ID = os.getenv('MONGODB_ATLAS_PROJECT_ID', '')
+MONGODB_ATLAS_AUTO_ALLOWLIST = os.getenv(
+    'MONGODB_ATLAS_AUTO_ALLOWLIST', 'true'
+).lower() in ('1', 'true', 't')
 
 # Security group — only these ports are ever opened publicly (80/443/22).
 # Application ports (3000/8000/8080...) are intentionally NOT exposed.
@@ -207,9 +255,31 @@ MAX_FILES = int(os.getenv('MAX_FILES', '10000'))
 MAX_SINGLE_FILE_MB = int(os.getenv('MAX_SINGLE_FILE_MB', '10'))
 MAX_ANALYSIS_TIME_MINUTES = int(os.getenv('MAX_ANALYSIS_TIME_MINUTES', '5'))
 
-# CORS Configuration
-CORS_ALLOW_ALL_ORIGINS = True
+# ---------------------------------------------------------------------------
+# CORS / CSRF
+#
+# In local development the Vite dev server proxies /api/* to Django, so the
+# browser talks to a single origin and no CORS headers are needed. When the
+# React app is served from a *different* origin (production build, second
+# dev machine, ...) its origin must be listed explicitly.
+#
+# CORS_ALLOW_ALL_ORIGINS=True together with CORS_ALLOW_CREDENTIALS=True is
+# rejected by browsers (the spec forbids `Access-Control-Allow-Origin: *` on
+# credentialed responses), so the default is an explicit origin whitelist.
+# ---------------------------------------------------------------------------
+DEFAULT_CORS_ORIGINS = [
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+]
+_env_cors_origins = [o.strip() for o in os.getenv('CORS_ALLOWED_ORIGINS', '').split(',') if o.strip()]
+CORS_ALLOWED_ORIGINS = list(dict.fromkeys(
+    _env_cors_origins or ([FRONTEND_URL] if FRONTEND_URL else []) + DEFAULT_CORS_ORIGINS
+))
+CORS_ALLOW_ALL_ORIGINS = os.getenv('CORS_ALLOW_ALL_ORIGINS', 'false').lower() in ('true', '1', 't')
 CORS_ALLOW_CREDENTIALS = True
+CSRF_TRUSTED_ORIGINS = list(CORS_ALLOWED_ORIGINS)
 CORS_ALLOW_HEADERS = [
     'accept',
     'accept-encoding',

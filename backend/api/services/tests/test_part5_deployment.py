@@ -130,37 +130,64 @@ class DeployEnvValidationTests(TestCase):
     @override_settings(
         AWS_ALLOWED_DB_URL_SCHEMES=("postgres://", "postgresql://", "mysql://")
     )
-    def test_valid_database_url_scheme_passes_validation(self):
+    @override_settings(DEPLOYMENT_RUN_INLINE=True)
+    @patch("api.services.deployment.pipeline.assume_role_credentials")
+    @patch("api.services.deployment.pipeline.AwsEc2Provider")
+    def test_valid_database_url_scheme_passes_validation(
+        self, mock_provider_cls, _sts
+    ):
         files = {
             "package.json": '{"dependencies":{"react":"18.3.1"}}',
             ".env.example": "DATABASE_URL=postgres://user:pass@db:5432/app\n",
         }
-        with patch("api.views.AwsEc2Provider") as mock_provider_cls:
-            mock_provider = MagicMock()
-            mock_provider.start.side_effect = AwsEc2Error("no permissions for ec2")
-            mock_provider_cls.return_value = mock_provider
-            with patch(
-                "api.services.github_repository_service.inspect_repository"
-            ) as mock_inspect:
-                mock_inspect.return_value = {"files": files, "tree": []}
-                response = self.client.post(
-                    "/api/deploy",
-                    {
-                        "projectId": self.project.id,
-                        "environmentName": "env-prod",
-                        "provider": "AWS",
-                        "envVars": {
-                            "DATABASE_URL": "postgres://user:pass@db:5432/app"
-                        },
+        mock_provider = MagicMock()
+        mock_provider.start.return_value = {
+            "instance_id": "i-0dbok",
+            "deployment_id": "i-0dbok",
+            "status": "RUNNING",
+            "public_ip": "13.232.1.77",
+            "instance_type": "t3.micro",
+            "region": "ap-south-1",
+            "reused": False,
+            "logs": [],
+        }
+        mock_provider.deploy.return_value = {
+            "instance_id": "i-0dbok",
+            "deployment_id": "i-0dbok",
+            "status": "RUNNING",
+            "endpoint_url": "http://13.232.1.77",
+            "public_ip": "13.232.1.77",
+            "region": "ap-south-1",
+            "logs": [],
+        }
+        mock_provider_cls.return_value = mock_provider
+
+        with patch(
+            "api.services.github_repository_service.inspect_repository"
+        ) as mock_inspect:
+            mock_inspect.return_value = {"files": files, "tree": []}
+            response = self.client.post(
+                "/api/deploy",
+                {
+                    "projectId": self.project.id,
+                    "environmentName": "env-prod",
+                    "provider": "AWS",
+                    "envVars": {
+                        "DATABASE_URL": "postgres://user:pass@db:5432/app"
                     },
-                    format="json",
-                )
-        # Passes env validation; fails later at provision (502) — not 400
-        self.assertEqual(response.status_code, 502)
+                },
+                format="json",
+            )
+        # Env validation passed, so the record was created and queued —
+        # a validation failure would have returned 400 with no record.
+        self.assertEqual(response.status_code, 201)
+        record = DeploymentRecord.objects.get(user=self.user)
+        self.assertEqual(record.deployment_status, "RUNNING")
+        self.assertEqual(record.live_url, "http://13.232.1.77")
 
 
 class DeployFailurePathTests(TestCase):
-    """Provision and container-deploy failures return 502 with FAILED record."""
+    """Provision and container-deploy failures are recorded by the pipeline."""
 
     def setUp(self):
         self.client = APIClient()
@@ -207,8 +234,10 @@ class DeployFailurePathTests(TestCase):
                 format="json",
             )
 
-    @patch("api.views.AwsEc2Provider")
-    def test_provision_failure_returns_502_and_failed_record(self, mock_provider_cls):
+    @override_settings(DEPLOYMENT_RUN_INLINE=True)
+    @patch("api.services.deployment.pipeline.assume_role_credentials")
+    @patch("api.services.deployment.pipeline.AwsEc2Provider")
+    def test_provision_failure_marks_record_failed(self, mock_provider_cls, _sts):
         mock_provider = MagicMock()
         mock_provider.start.side_effect = AwsEc2Error(
             "missing a required EC2 permission"
@@ -217,18 +246,23 @@ class DeployFailurePathTests(TestCase):
 
         response = self._deploy()
 
-        self.assertEqual(response.status_code, 502)
-        self.assertFalse(response.data["success"])
-        self.assertIn("EC2 permission", response.data["error"])
-        record = DeploymentRecord.objects.filter(
-            user=self.user, provider="AWS", status="FAILED"
-        ).first()
-        self.assertIsNotNone(record)
+        self.assertEqual(response.status_code, 201)
+        record = DeploymentRecord.objects.get(user=self.user)
+        self.assertEqual(record.deployment_status, "FAILED")
+        self.assertEqual(record.provider, "AWS")
+        self.assertTrue(
+            any(
+                "missing a required EC2 permission" in e.get("message", "")
+                for e in record.logs
+            )
+        )
         mock_provider.deploy.assert_not_called()
 
-    @patch("api.views.AwsEc2Provider")
-    def test_container_deploy_failure_returns_502_and_failed_record(
-        self, mock_provider_cls
+    @override_settings(DEPLOYMENT_RUN_INLINE=True)
+    @patch("api.services.deployment.pipeline.assume_role_credentials")
+    @patch("api.services.deployment.pipeline.AwsEc2Provider")
+    def test_container_deploy_failure_marks_record_failed(
+        self, mock_provider_cls, _sts
     ):
         mock_provider = MagicMock()
         mock_provider.start.return_value = {
@@ -246,13 +280,16 @@ class DeployFailurePathTests(TestCase):
 
         response = self._deploy()
 
-        self.assertEqual(response.status_code, 502)
-        self.assertFalse(response.data["success"])
-        self.assertIn("docker compose failed", response.data["error"])
-        record = DeploymentRecord.objects.filter(
-            user=self.user, provider="AWS", status="FAILED"
-        ).first()
-        self.assertIsNotNone(record)
+        self.assertEqual(response.status_code, 201)
+        record = DeploymentRecord.objects.get(user=self.user)
+        self.assertEqual(record.deployment_status, "FAILED")
+        self.assertEqual(record.instance_id, "i-0fail1")
+        self.assertTrue(
+            any(
+                "docker compose failed" in e.get("message", "")
+                for e in record.logs
+            )
+        )
         mock_provider.start.assert_called_once()
 
 
@@ -267,40 +304,78 @@ class DeployOwnershipTests(TestCase):
         self.intruder = User.objects.create_user(
             username="intruder", password="pass1234", email="intruder@example.com"
         )
+        self.connection = AWSConnection.objects.create(
+            user=self.owner,
+            role_arn="arn:aws:iam::111122223333:role/CloudWiseDeployRole",
+            external_id="cloudwise-own",
+            account_id="111122223333",
+            region="ap-south-1",
+            status="active",
+        )
         self.record = DeploymentRecord.objects.create(
             user=self.owner,
             environment_name="own-prod",
             provider="AWS",
             provider_deployment_id="i-own1",
-            status="RUNNING",
+            instance_id="i-own1",
+            aws_account_id="111122223333",
+            deployment_status="RUNNING",
             ip_address="13.232.1.1",
         )
 
     def test_status_hidden_from_non_owner(self):
         self.client.force_authenticate(user=self.intruder)
-        response = self.client.get("/api/deployments/i-own1/status")
-        self.assertEqual(response.status_code, 404)
+        for path in (
+            "/api/deployments/i-own1",
+            "/api/deployments/i-own1/status",
+            "/api/deployments/i-own1/logs",
+        ):
+            self.assertEqual(self.client.get(path).status_code, 404, path)
 
     def test_status_requires_authentication(self):
         response = self.client.get("/api/deployments/i-own1/status")
         self.assertIn(response.status_code, (401, 403))
 
-    def test_owner_can_read_status(self):
+    @patch("api.views.AwsEc2Provider")
+    def test_owner_can_read_status(self, mock_provider_cls):
+        mock_provider = MagicMock()
+        mock_provider.get_status.return_value = {
+            "deployment_id": "i-own1",
+            "status": "RUNNING",
+            "progress": 100,
+            "provider_type": "AWS",
+            "ip_address": "13.232.1.1",
+            "instance_state": "running",
+            "region": "ap-south-1",
+            "message": "ok",
+        }
+        mock_provider_cls.return_value = mock_provider
         self.client.force_authenticate(user=self.owner)
-        with patch("api.views.AwsEc2Provider") as mock_provider_cls:
-            mock_provider = MagicMock()
-            mock_provider.get_status.return_value = {
-                "deployment_id": "i-own1",
-                "status": "RUNNING",
-                "progress": 100,
-                "provider_type": "AWS",
-                "endpoint_url": None,
-                "ip_address": "13.232.1.1",
-                "instance_state": "running",
-                "region": "ap-south-1",
-                "message": "ok",
-            }
-            mock_provider_cls.return_value = mock_provider
-            response = self.client.get("/api/deployments/i-own1/status")
+        response = self.client.get("/api/deployments/i-own1/status")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["data"]["status"], "RUNNING")
+        data = response.data["data"]
+        self.assertEqual(data["deploymentStatus"], "RUNNING")
+        self.assertEqual(data["instanceState"], "running")
+        self.assertEqual(data["awsAccountId"], "111122223333")
+
+    def test_owner_can_read_detail_and_list(self):
+        self.client.force_authenticate(user=self.owner)
+        detail = self.client.get("/api/deployments/i-own1")
+        self.assertEqual(detail.status_code, 200)
+        data = detail.data["data"]
+        for key in (
+            "id",
+            "deploymentStatus",
+            "liveUrl",
+            "repository",
+            "awsAccountId",
+            "region",
+            "instanceId",
+            "progress",
+            "openUrl",
+        ):
+            self.assertIn(key, data)
+
+        listing = self.client.get("/api/deployments")
+        self.assertEqual(listing.status_code, 200)
+        self.assertEqual(listing.data["count"], 1)

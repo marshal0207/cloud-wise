@@ -48,7 +48,7 @@ def detect_tech_stack(files: Mapping[str, str]) -> TechStack:
 
 
 # ---------------------------------------------------------------------------
-# Frontend detection for Vercel deployment
+# Frontend detection (build/runtime facts consumed by the AWS EC2 flow)
 # ---------------------------------------------------------------------------
 
 # Directories that commonly contain frontend code in full-stack repos
@@ -70,16 +70,16 @@ def detect_frontend_stack(
     tree: list[dict] | None = None,
 ) -> dict:
     """
-    Detect the frontend application in a repository for Vercel deployment.
+    Detect the frontend application in a repository.
 
     Returns a dict with keys:
         technology       — e.g. "REACT", "NEXTJS", "NODE_JS"
-        framework        — Vercel framework slug: "vite", "nextjs", "create-react-app", etc.
+        framework        — framework slug: "vite", "nextjs", "create-react-app", etc.
         build_command    — e.g. "npm run build"
         install_command  — e.g. "npm install"
-        output_directory — e.g. "dist", ".next", or None (Vercel default)
+        output_directory — e.g. "dist", ".next", or None (framework default)
         root_directory   — e.g. "frontend", "client", or None (repo root)
-        start_command    — e.g. "npm start" (used by Render, ignored by Vercel)
+        start_command    — e.g. "npm start"
         port             — e.g. 3000
     """
     import json as _json
@@ -118,7 +118,7 @@ def detect_frontend_stack(
                 break
 
     if frontend_pkg_key is None:
-        # No package.json anywhere — cannot deploy a JS frontend to Vercel
+        # No package.json anywhere — no JS frontend to build
         return {
             "technology": "UNKNOWN",
             "framework": None,
@@ -157,7 +157,7 @@ def detect_frontend_stack(
 
     # Detect framework
     technology = "NODE_JS"
-    framework = None  # Vercel framework slug
+    framework = None  # framework slug
     output_dir = None
     port = 3000
 
@@ -166,7 +166,7 @@ def detect_frontend_stack(
         framework = "nextjs"
         if not build_cmd:
             build_cmd = "next build"
-        output_dir = None  # Vercel handles Next.js output automatically
+        output_dir = None  # Next.js keeps its build output in .next
         port = 3000
     elif "@vitejs/plugin-react" in deps or "vite" in deps:
         technology = "REACT"

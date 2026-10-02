@@ -18,6 +18,9 @@ import {
   FileCode2,
   Database,
   GitBranch,
+  ListChecks,
+  ExternalLink,
+  Square,
 } from 'lucide-react';
 import { useCloudWise, formatINR } from '@/context/CloudWiseContext';
 
@@ -52,6 +55,18 @@ interface DeploymentPlanInfo {
   requiresNginx?: boolean;
 }
 
+// One row of the preflight response (POST /api/deploy/preflight).
+// ok: true = passed, false = failed, null = could not be evaluated.
+interface PreflightCheck {
+  key: string;
+  label: string;
+  action?: string;
+  ok: boolean | null;
+  critical?: boolean;
+  detail?: string;
+  remedy?: string;
+}
+
 const authHeaders = (): Record<string, string> => {
   const token = localStorage.getItem('cloudwise_token');
   return { Authorization: token ? `Bearer ${token}` : '' };
@@ -68,6 +83,28 @@ const NINE_STEPS = [
   { key: 'compose', label: '8. Upload & Compose Up', desc: 'SSM upload · docker compose up' },
   { key: 'health', label: '9. Health Check & Live URL', desc: 'Verify HTTP · expose endpoint' },
 ];
+
+// Four user-facing gates. Backend stage codes map onto these directly:
+//   PROJECT / GITHUB → Repository / GitHub, ENVIRONMENT → Deployment,
+//   AWS → AWS, and the pipeline's own failureStage → Deployment.
+const CHECKLIST_STAGES = [
+  { key: 'GITHUB', label: 'GitHub', desc: 'OAuth authorization accepted, token readable' },
+  { key: 'REPOSITORY', label: 'Repository', desc: 'Repository linked, files readable, commit resolved' },
+  { key: 'AWS', label: 'AWS', desc: 'IAM role assumed via STS, account validated' },
+  { key: 'DEPLOYMENT', label: 'Deployment', desc: 'EC2 provisioned · containers up · health check · live URL' },
+] as const;
+
+type ChecklistStatus = 'pending' | 'active' | 'done' | 'failed';
+type ChecklistKey = (typeof CHECKLIST_STAGES)[number]['key'];
+
+const stageKeyFromBackendStage = (stage?: string, message?: string): ChecklistKey => {
+  const s = (stage || '').toUpperCase();
+  const m = (message || '').trim();
+  if (s === 'GITHUB') return 'GITHUB';
+  if (s === 'PROJECT') return 'REPOSITORY';
+  if (s === 'AWS' || m.startsWith('AWS:') || m.startsWith('BLOCKED')) return 'AWS';
+  return 'DEPLOYMENT';
+};
 
 const PHASE_TO_STEP: Record<PipelinePhase, number> = {
   idle: -1,
@@ -127,10 +164,20 @@ export const Deployment: React.FC = () => {
   const [envRows, setEnvRows] = useState<EnvVarRow[]>([]);
   const [envMasked, setEnvMasked] = useState(true);
   const [envSource, setEnvSource] = useState<'manual' | 'upload' | null>(null);
-  const [activeStepIndex, setActiveStepIndex] = useState(-1);
+   const [activeStepIndex, setActiveStepIndex] = useState(-1);
+   const [scanProgress, setScanProgress] = useState<Array<{stage: string; message: string; progress: number}>>([]);
+   const [tokenExpired, setTokenExpired] = useState(false);
+   const [rateLimited, setRateLimited] = useState(false);
 
-  const repoName = activeProject?.githubRepo?.name;
+   const repoName = activeProject?.githubRepo?.name;
   const missingRepo = !repoName;
+
+  // Stage-tagged failure returned by POST /api/deploy or by the pipeline
+  const [stageError, setStageError] = useState<{ stage: string; message: string } | null>(null);
+  const [pipelineFailure, setPipelineFailure] = useState<{ stage: string; message: string } | null>(null);
+  const [retrying, setRetrying] = useState(false);
+  const [stopping, setStopping] = useState(false);
+  const [lastDeploymentId, setLastDeploymentId] = useState<string | null>(null);
 
   const refreshAwsConnection = async () => {
     try {
@@ -146,6 +193,57 @@ export const Deployment: React.FC = () => {
     void refreshAwsConnection();
   }, []);
 
+  // ------------------------------------------------------------------
+  // Part 21 — preflight: real backend checks run *before* Start.
+  // Nothing is created; the backend only answers "is it ready?".
+  // ------------------------------------------------------------------
+  const [preflightChecks, setPreflightChecks] = useState<PreflightCheck[] | null>(null);
+  const [preflightRunning, setPreflightRunning] = useState(false);
+  const [preflightReady, setPreflightReady] = useState<boolean | null>(null);
+
+  const runPreflight = async (includeRepository = false) => {
+    if (!awsConnection?.connected) {
+      setPreflightChecks(null);
+      setPreflightReady(null);
+      return;
+    }
+    setPreflightRunning(true);
+    try {
+      const res = await fetch('/api/deploy/preflight', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({
+          projectId: activeProject?.id,
+          includeRepository,
+        }),
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        setPreflightChecks(Array.isArray(data.checks) ? data.checks : []);
+        setPreflightReady(Boolean(data.ready));
+      } else {
+        setPreflightChecks(null);
+        setPreflightReady(false);
+      }
+    } catch {
+      setPreflightChecks(null);
+      setPreflightReady(false);
+    } finally {
+      setPreflightRunning(false);
+    }
+  };
+
+  // No auto-start: this only *checks* readiness, it never deploys.
+  useEffect(() => {
+    if (awsConnection?.connected && liveDeployment.status === 'idle') {
+      void runPreflight(false);
+    } else if (!awsConnection?.connected) {
+      setPreflightChecks(null);
+      setPreflightReady(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [awsConnection?.connected, liveDeployment.status]);
+
   // Restore analysis info from context if available
   useEffect(() => {
     const anyProject = activeProject as any;
@@ -156,6 +254,12 @@ export const Deployment: React.FC = () => {
     }
   }, [activeProject]);
 
+  const handleRetryAnalysis = async () => {
+    setScanProgress([]);
+    setActiveStepIndex(0);
+    await runAnalysis();
+  };
+
   // Step 1: Analyze repository (inspect via backend)
   const runAnalysis = async () => {
     if (missingRepo) {
@@ -163,6 +267,7 @@ export const Deployment: React.FC = () => {
       return;
     }
     setActiveStepIndex(0);
+    setScanProgress([]);
     setLiveDeployment(prev => ({
       ...prev,
       status: 'preparing' as PipelinePhase,
@@ -175,9 +280,23 @@ export const Deployment: React.FC = () => {
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ repoName }),
       });
-      const data = await res.json();
-      if (!res.ok || !data.success) {
-        throw new Error(data.error || 'Repository analysis failed.');
+      const data = await res.json().catch(() => null);
+
+      // Show progress stages from the server
+      if (data?.progress && Array.isArray(data.progress)) {
+        setScanProgress(data.progress);
+      }
+
+      if (data?.token_expired) setTokenExpired(true);
+      if (data?.rate_limited) setRateLimited(true);
+
+      if (!res.ok || !data?.success) {
+        throw new Error(
+          data?.error || data?.message || data?.detail ||
+          (res.status === 401
+            ? 'Your CloudWise session has expired. Please sign in again.'
+            : 'Repository analysis failed.')
+        );
       }
       const detected = data.data.technology || {};
       setDetection({
@@ -187,6 +306,7 @@ export const Deployment: React.FC = () => {
         database: data.data.detection?.database,
         applicationType: data.data.detection?.applicationType,
       });
+      setScanProgress(data.progress || []);
       setLiveDeployment(prev => ({
         ...prev,
         progress: 15,
@@ -222,9 +342,19 @@ export const Deployment: React.FC = () => {
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ repoName }),
       });
-      const inspectData = await inspectRes.json();
-      if (!inspectRes.ok || !inspectData.success) {
-        throw new Error(inspectData.error || 'Repository inspection failed.');
+      const inspectData = await inspectRes.json().catch(() => null);
+      if (inspectData?.progress && Array.isArray(inspectData.progress)) {
+        setScanProgress(inspectData.progress);
+      }
+      if (inspectData?.token_expired) setTokenExpired(true);
+      if (inspectData?.rate_limited) setRateLimited(true);
+      if (!inspectRes.ok || !inspectData?.success) {
+        throw new Error(
+          inspectData?.error || inspectData?.message || inspectData?.detail ||
+          (inspectRes.status === 401
+            ? 'Your CloudWise session has expired. Please sign in again.'
+            : 'Repository inspection failed.')
+        );
       }
       const genRes = await fetch('/api/deployment/generate-files', {
         method: 'POST',
@@ -314,6 +444,79 @@ export const Deployment: React.FC = () => {
     return required.every(k => (map.get(k) || '').length > 0);
   }, [envRows, deploymentPlan]);
 
+  // Derived from real signals only: what the user actually linked, what
+  // the backend actually accepted, and the record's own deployment status.
+  const checklist = useMemo(() => {
+    const failedKey: ChecklistKey | null = stageError
+      ? stageKeyFromBackendStage(stageError.stage, stageError.message)
+      : liveDeployment.status === 'failed' && pipelineFailure
+      ? stageKeyFromBackendStage(pipelineFailure.stage, pipelineFailure.message)
+      : null;
+
+    const githubStatus: ChecklistStatus = failedKey === 'GITHUB'
+      ? 'failed'
+      : repoName
+      ? 'done'
+      : 'pending';
+
+    const repositoryStatus: ChecklistStatus = failedKey === 'REPOSITORY'
+      ? 'failed'
+      : repoName && detection
+      ? 'done'
+      : repoName
+      ? 'active'
+      : 'pending';
+
+    const awsStatus: ChecklistStatus = failedKey === 'AWS'
+      ? 'failed'
+      : awsConnection?.connected
+      ? 'done'
+      : 'pending';
+
+    let deploymentStatus: ChecklistStatus = 'pending';
+    if (failedKey === 'DEPLOYMENT' || (failedKey !== 'GITHUB' && failedKey !== 'REPOSITORY' && failedKey !== 'AWS' && liveDeployment.status === 'failed')) {
+      deploymentStatus = 'failed';
+    } else if (liveDeployment.status === 'deployed') {
+      deploymentStatus = 'done';
+    } else if (liveDeployment.status !== 'idle') {
+      deploymentStatus = 'active';
+    }
+
+    const deploymentLabel = (() => {
+      switch (liveDeployment.status) {
+        case 'preparing':
+          return 'Validating repository and environment';
+        case 'provisioning':
+          return 'Provisioning EC2 capacity';
+        case 'configuring':
+          return 'Uploading files and starting containers';
+        case 'deployed':
+          return `Live at ${liveDeployment.endpointUrl || 'health-checked URL'}`;
+        case 'failed':
+          return 'Failed — inspect the error and retry';
+        default:
+          return 'Queued for deployment';
+      }
+    })();
+
+    return [
+      { ...CHECKLIST_STAGES[0], status: githubStatus, detail: githubStatus === 'done' ? (repoName || '') : (missingRepo ? 'No repository linked yet' : '') },
+      { ...CHECKLIST_STAGES[1], status: repositoryStatus, detail: detection?.technology || (repositoryStatus === 'active' ? 'Awaiting analysis' : '') },
+      { ...CHECKLIST_STAGES[2], status: awsStatus, detail: awsConnection?.connected ? `Account ${awsConnection.accountId || 'connected'} · ${awsConnection.region || estimation.region}` : 'IAM role not connected' },
+      { ...CHECKLIST_STAGES[3], status: deploymentStatus, detail: deploymentLabel },
+    ];
+  }, [
+    stageError,
+    pipelineFailure,
+    liveDeployment.status,
+    liveDeployment.endpointUrl,
+    repoName,
+    detection,
+    awsConnection,
+    missingRepo,
+    estimation.region,
+  ]);
+
   const markEnvComplete = () => {
     if (!envVarsReady) {
       showToast('Fill all required environment variables first.', 'error');
@@ -371,6 +574,7 @@ export const Deployment: React.FC = () => {
       const data = await res.json();
 
       if (res.status === 503 && data.status === 'BLOCKED') {
+        setStageError({ stage: data.stage || 'AWS', message: data.error || '' });
         setLiveDeployment(prev => ({
           ...prev,
           status: 'failed',
@@ -383,11 +587,13 @@ export const Deployment: React.FC = () => {
       }
 
       if (res.status === 400 && data.status === 'RETIRED') {
+        setStageError({ stage: data.stage || 'PROJECT', message: data.error || '' });
         showToast(data.error || 'Provider retired. AWS only.', 'error');
         return;
       }
 
-      if (res.status === 400 && data.errorCode === 'MISSING_ENV_VARS') {
+      if (!res.ok && data.code === 'MISSING_ENV_VARS') {
+        setStageError({ stage: data.stage || 'ENVIRONMENT', message: data.error || '' });
         setLiveDeployment(prev => ({
           ...prev,
           status: 'failed',
@@ -399,7 +605,8 @@ export const Deployment: React.FC = () => {
         return;
       }
 
-      if (res.status === 400 && data.errorCode === 'INVALID_DATABASE_URL') {
+      if (!res.ok && data.code === 'INVALID_DATABASE_URL') {
+        setStageError({ stage: data.stage || 'ENVIRONMENT', message: data.error || '' });
         setLiveDeployment(prev => ({
           ...prev,
           status: 'failed',
@@ -411,48 +618,37 @@ export const Deployment: React.FC = () => {
         return;
       }
 
-      if (data.success && data.data?.deployment_id) {
-        setDeploymentId(data.data.deployment_id);
-        if (data.data.status === 'FAILED') {
-          const failureMsg = data.error || 'Deployment failed.';
-          setLiveDeployment(prev => ({
-            ...prev,
-            status: 'failed',
-            progress: data.data.progress || 45,
-            failureReason: failureMsg,
-            logs: data.data.logs?.map((l: any) => `[${l.timestamp}] [${l.level}] ${l.message}`) || prev.logs,
-          }));
-          setPolling(true);
-        } else if (data.data.status === 'RUNNING') {
-          const realUrl = data.data.endpoint_url;
-          setActiveStepIndex(8);
-          setLiveDeployment(prev => ({
-            ...prev,
-            status: 'deployed',
-            progress: 100,
-            endpointUrl: realUrl,
-            ipAddress: data.data.ip_address || prev.ipAddress,
-            logs: data.data.logs?.map((l: any) => `[${l.timestamp}] [${l.level}] ${l.message}`) || prev.logs,
-          }));
-          updateActiveProject({
-            currentStep: 'deployment',
-            deployment: {
-              status: 'deployed',
-              progress: 100,
-              logs: data.data.logs?.map((l: any) => `[${l.timestamp}] [${l.level}] ${l.message}`) || [],
-              deployedAt: new Date().toISOString(),
-              endpointUrl: realUrl,
-              providerDeploymentId: data.data.deployment_id,
-              ipAddress: data.data.ip_address || data.data.public_ip || null,
-              environmentName: envName,
-              failureReason: null,
-            },
-          });
-          showToast(`Deployed to AWS EC2! URL: ${realUrl}`, 'success');
-        } else {
-          setPolling(true);
-        }
-      } else if (!res.ok) {
+      if (res.ok && data.success && (data.deployment_id || data.data?.id)) {
+        const record = data.data || {};
+        const id: string = data.deployment_id || record.id;
+        const initialLogs: string[] = Array.isArray(record.logs)
+          ? record.logs.map((l: any) => `[${l.timestamp}] [${l.level}] ${l.message}`)
+          : liveDeployment.logs;
+
+        setDeploymentId(id);
+        setLastDeploymentId(id);
+        setStageError(null);
+        setPipelineFailure(null);
+        setActiveStepIndex(4);
+        setLiveDeployment(prev => ({
+          ...prev,
+          status: 'preparing',
+          progress: 5,
+          failureReason: null,
+          endpointUrl: record.liveUrl || null,
+          ipAddress: record.ipAddress || prev.ipAddress,
+          logs: initialLogs,
+        }));
+        setPolling(true);
+        showToast(
+          `Deployment ${id} queued for ${record.repository || repoName} in ${record.region || estimation.region}.`,
+          'success'
+        );
+        return;
+      }
+
+      if (!res.ok) {
+        setStageError({ stage: data.stage || 'PROJECT', message: data.error || 'Deployment failed to initialize.' });
         setLiveDeployment(prev => ({
           ...prev,
           status: 'failed',
@@ -467,6 +663,106 @@ export const Deployment: React.FC = () => {
         failureReason: err.message,
         logs: [...prev.logs, `ERROR: ${err.message}`],
       }));
+    }
+  };
+
+  // Re-run a failed deployment on the same record. CloudWise never stores
+  // secret values, so env vars are re-submitted with the retry request.
+  const handleRetryDeployment = async () => {
+    const id = deploymentId || lastDeploymentId;
+    if (!id) {
+      void handleDeploy();
+      return;
+    }
+
+    const envMap: Record<string, string> = {};
+    for (const row of envRows) {
+      if (row.key) envMap[row.key] = row.value;
+    }
+
+    try {
+      setRetrying(true);
+      const res = await fetch(`/api/deployments/${id}/retry`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ envVars: envMap, environmentName: envName }),
+      });
+      const data = await res.json();
+
+      if (res.status === 409) {
+        showToast(data.error || 'Only a failed deployment can be retried.', 'error');
+        return;
+      }
+      if (!res.ok || !data.success) {
+        setStageError({ stage: data.stage || 'DEPLOYMENT', message: data.error || 'Retry failed.' });
+        showToast(data.error || 'Retry failed.', 'error');
+        return;
+      }
+
+      const record = data.data || {};
+      setDeploymentId(id);
+      setLastDeploymentId(id);
+      setStageError(null);
+      setPipelineFailure(null);
+      setActiveStepIndex(4);
+      setLiveDeployment(prev => ({
+        ...prev,
+        status: 'preparing',
+        progress: 5,
+        failureReason: null,
+        endpointUrl: null,
+        logs: Array.isArray(record.logs)
+          ? record.logs.map((l: any) => `[${l.timestamp}] [${l.level}] ${l.message}`)
+          : [...prev.logs, `[CloudWise] Retry requested for ${record.repository || repoName}.`],
+      }));
+      setPolling(true);
+      showToast(`Retry queued for deployment ${id}.`, 'success');
+    } catch (err: any) {
+      showToast(err.message || 'Retry failed.', 'error');
+    } finally {
+      setRetrying(false);
+    }
+  };
+
+  // Part 14 — stop / cancel: POST /api/deployments/<id>/stop.
+  // Cancels an in-flight pipeline; a live deployment has its EC2
+  // instance STOPPED (retained — it is never terminated; destroying it
+  // is the separate /terminate action).
+  const handleStopDeployment = async () => {
+    const id = deploymentId || lastDeploymentId;
+    if (!id || stopping) return;
+    try {
+      setStopping(true);
+      const res = await fetch(`/api/deployments/${id}/stop`, {
+        method: 'POST',
+        headers: authHeaders(),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        showToast(data.error || 'Could not stop the deployment.', 'error');
+        return;
+      }
+      const stoppedLogs: string[] = Array.isArray(data.data?.logs)
+        ? data.data.logs.map((l: any) => `[${l.timestamp}] [${l.level}] ${l.message}`)
+        : liveDeployment.logs;
+      setPolling(false);
+      setStageError(null);
+      setPipelineFailure(null);
+      setActiveStepIndex(-1);
+      setDeploymentId(null);
+      setLiveDeployment(prev => ({
+        ...prev,
+        status: 'idle' as PipelinePhase,
+        progress: 0,
+        failureReason: null,
+        endpointUrl: null,
+        logs: stoppedLogs,
+      }));
+      showToast(data.data?.message || 'Deployment stopped.', 'success');
+    } catch (err: any) {
+      showToast(err.message || 'Stop failed.', 'error');
+    } finally {
+      setStopping(false);
     }
   };
 
@@ -485,7 +781,7 @@ export const Deployment: React.FC = () => {
         const logsData = await logsRes.json();
 
         if (statusData.success && logsData.success) {
-          const rawStatus: string = statusData.data.status.toUpperCase();
+          const rawStatus: string = String(statusData.data.deploymentStatus || '').toUpperCase();
 
           const statusMap: Record<string, string> = {
             QUEUED: 'preparing',
@@ -497,25 +793,43 @@ export const Deployment: React.FC = () => {
             FAILED: 'failed',
             ROLLING_BACK: 'failed',
             ROLLED_BACK: 'idle',
+            // stopped by the user — instance retained (not terminated)
+            STOPPED: 'idle',
+            // destroyed by an explicit user action
+            TERMINATED: 'idle',
+            // legacy lowercase records created before migration 0007
+            DEPLOYED: 'deployed',
+            DONE: 'deployed',
           };
           const uiStatus = statusMap[rawStatus] ?? 'preparing';
 
+          const serverProgress = Number(statusData.data.progress);
           const progressMap: Record<string, number> = {
-            preparing: statusData.data.progress || 40,
-            provisioning: statusData.data.progress || 55,
-            configuring: statusData.data.progress || 80,
+            preparing: Number.isFinite(serverProgress) ? serverProgress : 15,
+            provisioning: Number.isFinite(serverProgress) ? serverProgress : 45,
+            configuring: Number.isFinite(serverProgress) ? serverProgress : 70,
             deployed: 100,
-            failed: statusData.data.progress || 45,
+            failed: Number.isFinite(serverProgress) ? serverProgress : 60,
             idle: 0,
           };
+
+          const formattedLogs = logsData.data.map((l: any) => `[${l.timestamp}] [${l.level}] ${l.message}`);
+
+          if (uiStatus === 'failed') {
+            const lastError = [...logsData.data].reverse().find((l: any) => l.level === 'ERROR');
+            setPipelineFailure(
+              lastError ? { stage: String(lastError.stage || ''), message: String(lastError.message || '') } : null
+            );
+            setActiveStepIndex(-2);
+          }
 
           setLiveDeployment(prev => ({
             ...prev,
             status: uiStatus as any,
             progress: progressMap[uiStatus] ?? prev.progress,
-            logs: logsData.data.map((l: any) => `[${l.timestamp}] [${l.level}] ${l.message}`),
-            ipAddress: statusData.data.ip_address || prev.ipAddress,
-            endpointUrl: statusData.data.endpoint_url || prev.endpointUrl,
+            logs: formattedLogs,
+            ipAddress: statusData.data.ipAddress || prev.ipAddress,
+            endpointUrl: statusData.data.liveUrl || prev.endpointUrl,
             failureReason:
               uiStatus === 'failed'
                 ? (logsData.data.filter((l: any) => l.level === 'ERROR').pop()?.message ?? prev.failureReason)
@@ -526,23 +840,22 @@ export const Deployment: React.FC = () => {
             setPolling(false);
             if (uiStatus === 'deployed') {
               setActiveStepIndex(8);
+              setPipelineFailure(null);
               updateActiveProject({
                 currentStep: 'deployment',
                 deployment: {
                   status: 'deployed',
                   progress: 100,
-                  logs: logsData.data.map((l: any) => `[${l.timestamp}] [${l.level}] ${l.message}`),
+                  logs: formattedLogs,
                   deployedAt: new Date().toISOString(),
-                  endpointUrl: statusData.data.endpoint_url || null,
+                  endpointUrl: statusData.data.liveUrl || null,
                   providerDeploymentId: deploymentId,
-                  ipAddress: statusData.data.ip_address || null,
+                  ipAddress: statusData.data.ipAddress || null,
                   environmentName: envName,
                   failureReason: null,
                 },
               });
               showToast('Deployment live on AWS EC2!', 'success');
-            } else if (uiStatus === 'failed') {
-              setActiveStepIndex(-2);
             }
           }
         }
@@ -568,6 +881,8 @@ export const Deployment: React.FC = () => {
       const data = await res.json();
       if (data.success) {
         const rollbackLogs = (data.data.logs ?? []).map((l: any) => `[${l.timestamp}] [${l.level}] ${l.message}`);
+        setStageError(null);
+        setPipelineFailure(null);
         setLiveDeployment(prev => ({
           ...prev,
           status: 'idle',
@@ -624,7 +939,7 @@ export const Deployment: React.FC = () => {
       const logsData = await logsRes.json();
 
       if (statusData.success) {
-        const newUrl = statusData.data.endpoint_url;
+        const newUrl = statusData.data.liveUrl;
         setLiveDeployment(prev => ({
           ...prev,
           endpointUrl: newUrl || prev.endpointUrl,
@@ -653,6 +968,8 @@ export const Deployment: React.FC = () => {
 
   const handleReset = () => {
     setDeploymentId(null);
+    setStageError(null);
+    setPipelineFailure(null);
     setLiveDeployment({ ...contextDeployment, status: 'idle', progress: 0, logs: [] });
     setActiveStepIndex(-1);
     setPolling(false);
@@ -692,7 +1009,7 @@ export const Deployment: React.FC = () => {
     <div className="min-h-screen max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10 space-y-10">
       {/* Header */}
       <div className="text-center space-y-3 max-w-3xl mx-auto">
-        <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-cyan-500/10 border border-cyan-500/30 text-cyan-300 text-xs font-semibold">
+        <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs font-semibold">
           <Rocket className="w-3.5 h-3.5" />
           <span>Step 4: AWS EC2 Deployment Pipeline</span>
         </div>
@@ -709,10 +1026,10 @@ export const Deployment: React.FC = () => {
           {/* AWS connection */}
           <div className="glass-panel p-6 rounded-3xl space-y-4 border border-slate-800">
             <label className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
-              <Cloud className="w-4 h-4 text-cyan-400" />
+              <Cloud className="w-4 h-4 text-emerald-400" />
               <span>Target Platform</span>
             </label>
-            <div className="p-3 rounded-xl bg-cyan-500/10 border border-cyan-500/30 text-cyan-300 text-xs flex items-center gap-2">
+            <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs flex items-center gap-2">
               <ShieldCheck size={16} className="shrink-0" />
               <span>
                 <strong>AWS EC2 Free Tier</strong> — deploy in your own account via IAM role (no access keys).
@@ -751,13 +1068,13 @@ export const Deployment: React.FC = () => {
           <div className="glass-panel p-6 rounded-3xl space-y-4 border border-slate-800">
             <div className="flex items-center justify-between">
               <h4 className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
-                <GitBranch className="w-4 h-4 text-cyan-400" />
+                <GitBranch className="w-4 h-4 text-emerald-400" />
                 Repository Analysis
               </h4>
               <button
                 onClick={runAnalysis}
                 disabled={missingRepo}
-                className="text-[11px] font-semibold text-cyan-400 hover:text-cyan-300 disabled:opacity-40"
+                className="text-[11px] font-semibold text-emerald-400 hover:text-emerald-300 disabled:opacity-40"
               >
                 {detection ? 'Re-analyze' : 'Analyze'}
               </button>
@@ -770,7 +1087,7 @@ export const Deployment: React.FC = () => {
               <div className="space-y-2 text-xs">
                 <div className="flex justify-between">
                   <span className="text-slate-400">Stack</span>
-                  <span className="font-bold text-cyan-300">{detection.technology || '—'}</span>
+                  <span className="font-bold text-emerald-300">{detection.technology || '—'}</span>
                 </div>
                 {detection.frontend && (
                   <div className="flex justify-between">
@@ -804,13 +1121,13 @@ export const Deployment: React.FC = () => {
           <div className="glass-panel p-6 rounded-3xl space-y-4 border border-slate-800">
             <div className="flex items-center justify-between">
               <h4 className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
-                <FileCode2 className="w-4 h-4 text-cyan-400" />
+                <FileCode2 className="w-4 h-4 text-emerald-400" />
                 Generated Files
               </h4>
               <button
                 onClick={runGenerateFiles}
                 disabled={missingRepo}
-                className="text-[11px] font-semibold text-cyan-400 hover:text-cyan-300 disabled:opacity-40"
+                className="text-[11px] font-semibold text-emerald-400 hover:text-emerald-300 disabled:opacity-40"
               >
                 {generatedFileList.length ? 'Regenerate' : 'Generate'}
               </button>
@@ -831,7 +1148,7 @@ export const Deployment: React.FC = () => {
               <div className="pt-2 border-t border-slate-800 space-y-1 text-[11px]">
                 <div className="flex justify-between">
                   <span className="text-slate-400">Target</span>
-                  <span className="font-bold text-cyan-300">{deploymentPlan.target}</span>
+                  <span className="font-bold text-emerald-300">{deploymentPlan.target}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-slate-400">Containers</span>
@@ -851,7 +1168,7 @@ export const Deployment: React.FC = () => {
           <div className="glass-panel p-6 rounded-3xl space-y-4 border border-slate-800">
             <div className="flex items-center justify-between">
               <h4 className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
-                <Database className="w-4 h-4 text-cyan-400" />
+                <Database className="w-4 h-4 text-emerald-400" />
                 Environment Variables
               </h4>
               <div className="flex items-center gap-2">
@@ -862,7 +1179,7 @@ export const Deployment: React.FC = () => {
                 >
                   {envMasked ? <EyeOff size={14} /> : <Eye size={14} />}
                 </button>
-                <label className="text-[11px] font-semibold text-cyan-400 hover:text-cyan-300 cursor-pointer">
+                <label className="text-[11px] font-semibold text-emerald-400 hover:text-emerald-300 cursor-pointer">
                   Upload .env
                   <input
                     type="file"
@@ -894,14 +1211,14 @@ export const Deployment: React.FC = () => {
                     value={row.key}
                     placeholder="KEY"
                     onChange={e => updateEnvRow(idx, 'key', e.target.value)}
-                    className="w-1/3 bg-slate-900 border border-slate-700/80 rounded-lg px-2 py-1.5 text-[11px] font-mono text-white focus:border-cyan-400 focus:outline-none"
+                    className="w-1/3 bg-[#080D14] border border-slate-700/80 rounded-lg px-2 py-1.5 text-[11px] font-mono text-white focus:border-emerald-400 focus:outline-none"
                   />
                   <input
                     type={envMasked ? 'password' : 'text'}
                     value={row.value}
                     placeholder="value"
                     onChange={e => updateEnvRow(idx, 'value', e.target.value)}
-                    className="flex-1 bg-slate-900 border border-slate-700/80 rounded-lg px-2 py-1.5 text-[11px] font-mono text-white focus:border-cyan-400 focus:outline-none"
+                    className="flex-1 bg-[#080D14] border border-slate-700/80 rounded-lg px-2 py-1.5 text-[11px] font-mono text-white focus:border-emerald-400 focus:outline-none"
                   />
                   <button
                     onClick={() => removeEnvRow(idx)}
@@ -917,13 +1234,13 @@ export const Deployment: React.FC = () => {
             <div className="flex gap-2">
               <button
                 onClick={addEnvRow}
-                className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-300 text-[11px] font-semibold"
+                className="px-3 py-1.5 rounded-lg bg-[#080D14] hover:bg-slate-800 border border-slate-700 text-slate-300 text-[11px] font-semibold"
               >
                 + Add Variable
               </button>
               <button
                 onClick={markEnvComplete}
-                className="px-3 py-1.5 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-500/40 text-cyan-300 text-[11px] font-semibold"
+                className="px-3 py-1.5 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-emerald-300 text-[11px] font-semibold"
               >
                 Confirm Env ({envSource === 'upload' ? 'uploaded' : 'manual'})
               </button>
@@ -932,17 +1249,17 @@ export const Deployment: React.FC = () => {
 
           {/* Config summary */}
           <div className="glass-panel p-6 rounded-3xl space-y-4 border border-slate-800">
-            <div className="bg-slate-900/80 p-3.5 rounded-xl border border-slate-800 space-y-1 text-xs">
+            <div className="bg-[#080D14]/80 p-3.5 rounded-xl border border-slate-800 space-y-1 text-xs">
               <span className="text-slate-400 block text-[10px]">Active Project</span>
               <p className="font-bold text-white text-sm">{activeProject?.name || 'CloudWise App'}</p>
-              <span className="text-cyan-400 font-bold block pt-1">
+              <span className="text-emerald-400 font-bold block pt-1">
                 {formatINR(selectedRecommendation.monthlyCost)} / mo
               </span>
             </div>
             <div className="space-y-2 text-xs">
               <div className="flex justify-between">
                 <span className="text-slate-400">Provider</span>
-                <span className="font-bold text-cyan-300">AWS EC2</span>
+                <span className="font-bold text-emerald-300">AWS EC2</span>
               </div>
               <div className="flex justify-between">
                 <span className="text-slate-400">Region</span>
@@ -965,7 +1282,7 @@ export const Deployment: React.FC = () => {
                 disabled={liveDeployment.status !== 'idle'}
                 value={envName}
                 onChange={e => setEnvName(e.target.value)}
-                className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-3 py-2 text-xs text-white focus:border-cyan-400 focus:outline-none disabled:opacity-60"
+                className="w-full bg-[#080D14] border border-slate-700/80 rounded-xl px-3 py-2 text-xs text-white focus:border-emerald-400 focus:outline-none disabled:opacity-60"
               />
             </div>
 
@@ -986,17 +1303,69 @@ export const Deployment: React.FC = () => {
                   </div>
                 )}
                 {!canDeploy && !missingRepo && awsConnection?.connected && activeStepIndex < 3 && (
-                  <div className="p-3 rounded-xl bg-slate-900/80 border border-slate-800 text-slate-400 text-xs">
+                  <div className="p-3 rounded-xl bg-[#080D14]/80 border border-slate-800 text-slate-400 text-xs">
                     Complete steps 1–3 (analyze → generate files → configure env) before deploying.
                   </div>
                 )}
+
+                {/* Part 21 — preflight: real checks, nothing created yet */}
+                {awsConnection?.connected && (
+                  <div className="pt-2 border-t border-slate-800 space-y-1.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[11px] font-semibold text-slate-400">
+                        Preflight checks
+                      </span>
+                      <button
+                        onClick={() => void runPreflight(true)}
+                        disabled={preflightRunning}
+                        className="text-[10px] font-bold text-emerald-300 hover:text-emerald-200 disabled:opacity-50 flex items-center gap-1"
+                      >
+                        <RefreshCw size={11} className={preflightRunning ? 'animate-spin' : ''} />
+                        {preflightRunning ? 'Checking…' : 'Re-run full check'}
+                      </button>
+                    </div>
+                    {!preflightChecks && (
+                      <div className="text-[11px] text-slate-500">
+                        {preflightRunning ? 'Running preflight…' : 'Preflight has not run yet.'}
+                      </div>
+                    )}
+                    {preflightChecks?.map(check => (
+                      <div
+                        key={check.key}
+                        className="flex items-start gap-2 text-[11px] leading-snug"
+                      >
+                        {check.ok === true ? (
+                          <CheckCircle2 size={13} className="text-emerald-400 shrink-0 mt-px" />
+                        ) : check.ok === false ? (
+                          <AlertTriangle size={13} className="text-rose-400 shrink-0 mt-px" />
+                        ) : (
+                          <Clock size={13} className="text-slate-500 shrink-0 mt-px" />
+                        )}
+                        <span className={check.ok === false ? 'text-rose-300' : 'text-slate-300'}>
+                          {check.label}
+                          {check.ok === false && check.remedy && (
+                            <span className="block text-[10px] text-slate-500">{check.remedy}</span>
+                          )}
+                        </span>
+                      </div>
+                    ))}
+                    {preflightReady === false && preflightChecks && (
+                      <div className="pt-1 text-[11px] text-rose-300">
+                        Fix the failed checks above before starting the deployment.
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 <button
                   onClick={handleDeploy}
-                  disabled={!canDeploy}
-                  className="w-full py-4 rounded-xl bg-gradient-to-r from-cyan-400 via-cyan-500 to-blue-600 hover:from-cyan-300 hover:to-blue-500 text-slate-950 font-bold text-sm transition-all shadow-xl shadow-cyan-500/25 flex items-center justify-center gap-2 active:scale-98 disabled:opacity-40 disabled:cursor-not-allowed"
+                  disabled={!canDeploy || preflightRunning || preflightReady === false}
+                  className="w-full py-4 rounded-xl bg-gradient-to-r from-emerald-400 via-emerald-500 to-blue-600 hover:from-emerald-300 hover:to-blue-500 text-slate-950 font-bold text-sm transition-all shadow-xl shadow-emerald-500/25 flex items-center justify-center gap-2 active:scale-98 disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   <Rocket className="w-5 h-5" />
-                  <span>Deploy {repoName ? `"${repoName.split('/')[1]}"` : 'Project'} to AWS EC2</span>
+                  <span>
+                    Start Deployment{repoName ? ` — ${repoName.split('/')[1]}` : ''}
+                  </span>
                 </button>
               </div>
             )}
@@ -1004,8 +1373,16 @@ export const Deployment: React.FC = () => {
             {liveDeployment.status !== 'idle' && (
               <div className="space-y-2 pt-2">
                 <button
+                  onClick={() => void handleStopDeployment()}
+                  disabled={stopping || !(deploymentId || lastDeploymentId)}
+                  className="w-full py-2.5 rounded-xl bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/40 text-rose-300 font-semibold text-xs transition-colors flex items-center justify-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <Square className="w-3.5 h-3.5" />
+                  <span>{stopping ? 'Stopping…' : 'Stop Deployment'}</span>
+                </button>
+                <button
                   onClick={handleReset}
-                  className="w-full py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-300 font-semibold text-xs transition-colors flex items-center justify-center gap-1.5"
+                  className="w-full py-2.5 rounded-xl bg-[#080D14] hover:bg-slate-800 border border-slate-700 text-slate-300 font-semibold text-xs transition-colors flex items-center justify-center gap-1.5"
                 >
                   <RefreshCw className="w-3.5 h-3.5" />
                   <span>Reset Pipeline State</span>
@@ -1013,7 +1390,7 @@ export const Deployment: React.FC = () => {
                 {liveDeployment.status === 'deployed' && (
                   <button
                     onClick={handleHealthCheck}
-                    className="w-full py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-emerald-400 font-semibold text-xs transition-colors flex items-center justify-center gap-1.5"
+                    className="w-full py-2.5 rounded-xl bg-[#080D14] hover:bg-slate-800 border border-slate-700 text-emerald-400 font-semibold text-xs transition-colors flex items-center justify-center gap-1.5"
                   >
                     <Activity className="w-3.5 h-3.5" />
                     <span>Run Health Check</span>
@@ -1026,10 +1403,96 @@ export const Deployment: React.FC = () => {
 
         {/* Right Column: 9-step pipeline + logs */}
         <div className="space-y-6 lg:col-span-2">
+          {/* Readiness checklist — every row reflects a real signal */}
+          <div className="glass-panel p-6 rounded-3xl space-y-4 border border-slate-800">
+            <div className="flex items-center justify-between gap-3">
+              <h3 className="text-base font-bold text-white flex items-center gap-2">
+                <ListChecks className="w-5 h-5 text-emerald-400" />
+                <span>Deployment Readiness</span>
+              </h3>
+              {(deploymentId || lastDeploymentId) && (
+                <button
+                  onClick={() => navigate(`/deployment/${deploymentId || lastDeploymentId}`)}
+                  className="px-3 py-1.5 rounded-lg bg-[#080D14] hover:bg-slate-800 border border-slate-700 text-emerald-300 text-[11px] font-bold transition-colors flex items-center gap-1.5"
+                >
+                  <ExternalLink size={12} />
+                  <span>Deployment Details</span>
+                </button>
+              )}
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              {checklist.map(item => (
+                <div
+                  key={item.key}
+                  className={`p-3.5 rounded-2xl border transition-all ${
+                    item.status === 'done'
+                      ? 'bg-emerald-950/20 border-emerald-500/40 text-emerald-300'
+                      : item.status === 'active'
+                      ? 'bg-emerald-950/30 border-emerald-400 text-white shadow-lg shadow-emerald-950/50'
+                      : item.status === 'failed'
+                      ? 'bg-rose-950/20 border-rose-500/40 text-rose-300'
+                      : 'bg-[#080D14]/40 border-slate-800 text-slate-500'
+                  }`}
+                >
+                  <div className="flex items-center gap-2 font-bold text-xs">
+                    {item.status === 'done' && <CheckCircle2 size={15} className="text-emerald-400 shrink-0" />}
+                    {item.status === 'active' && <RefreshCw size={15} className="text-emerald-400 animate-spin shrink-0" />}
+                    {item.status === 'failed' && <AlertTriangle size={15} className="text-rose-400 shrink-0" />}
+                    {item.status === 'pending' && <Clock size={15} className="shrink-0" />}
+                    <span>{item.label}</span>
+                    <span className="ml-auto text-[10px] uppercase tracking-wider font-extrabold opacity-80">
+                      {item.status === 'done'
+                        ? '✓'
+                        : item.status === 'active'
+                        ? 'in progress'
+                        : item.status === 'failed'
+                        ? 'failed'
+                        : 'waiting'}
+                    </span>
+                  </div>
+                  <p className="text-[10px] text-slate-400 pt-1 leading-snug">{item.desc}</p>
+                  {item.detail && (
+                    <p className="text-[10px] text-slate-300/80 pt-1 font-mono truncate">{item.detail}</p>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            {stageError && (
+              <div className="p-4 rounded-2xl bg-rose-500/10 border border-rose-500/30 space-y-2 text-xs text-rose-300">
+                <div className="flex items-center gap-2 font-bold text-rose-400">
+                  <AlertTriangle size={15} />
+                  <span>{stageError.stage} stage failed</span>
+                </div>
+                <p className="whitespace-pre-wrap bg-[#080D14]/60 rounded-xl p-3 border border-rose-500/20 text-slate-300">
+                  {stageError.message}
+                </p>
+                <div className="flex items-center gap-2 flex-wrap pt-1">
+                  <button
+                    onClick={() => (stageKeyFromBackendStage(stageError.stage) === 'GITHUB' ? navigate('/files') : handleRetryDeployment())}
+                    className="px-3 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-200 border border-rose-500/40 text-[11px] font-bold transition-colors flex items-center gap-1.5"
+                  >
+                    <RefreshCw size={12} />
+                    <span>
+                      {stageKeyFromBackendStage(stageError.stage) === 'GITHUB' ? 'Fix GitHub Connection' : 'Retry'}
+                    </span>
+                  </button>
+                  <button
+                    onClick={() => setStageError(null)}
+                    className="px-3 py-1.5 rounded-lg bg-[#080D14] hover:bg-slate-800 border border-slate-700 text-slate-300 text-[11px] font-bold transition-colors"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+
           <div className="glass-panel p-6 rounded-3xl space-y-6 border border-slate-800">
             <div className="flex items-center justify-between">
               <h3 className="text-base font-bold text-white flex items-center gap-2">
-                <Activity className="w-5 h-5 text-cyan-400" />
+                <Activity className="w-5 h-5 text-emerald-400" />
                 <span>AWS EC2 Deployment Pipeline (9 Steps)</span>
               </h3>
               <span
@@ -1040,7 +1503,7 @@ export const Deployment: React.FC = () => {
                     ? 'bg-rose-500/20 text-rose-300 border-rose-500/40'
                     : liveDeployment.status === 'idle'
                     ? 'bg-slate-800 text-slate-400 border-slate-700'
-                    : 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40 animate-pulse'
+                    : 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40 animate-pulse'
                 }`}
               >
                 {liveDeployment.status.toUpperCase()}
@@ -1050,16 +1513,16 @@ export const Deployment: React.FC = () => {
             <div className="space-y-2">
               <div className="flex justify-between text-xs font-semibold text-slate-400">
                 <span>Progress</span>
-                <span className="text-cyan-400">{liveDeployment.progress}%</span>
+                <span className="text-emerald-400">{liveDeployment.progress}%</span>
               </div>
-              <div className="w-full h-3 rounded-full bg-slate-900 overflow-hidden p-0.5 border border-slate-800">
+              <div className="w-full h-3 rounded-full bg-[#080D14] overflow-hidden p-0.5 border border-slate-800">
                 <motion.div
                   className={`h-full rounded-full transition-all duration-500 ${
                     liveDeployment.status === 'failed'
                       ? 'bg-rose-500'
                       : liveDeployment.status === 'deployed'
                       ? 'bg-emerald-400'
-                      : 'bg-gradient-to-r from-cyan-500 to-blue-500'
+                      : 'bg-gradient-to-r from-emerald-500 to-blue-500'
                   }`}
                   style={{ width: `${liveDeployment.progress}%` }}
                 />
@@ -1076,15 +1539,15 @@ export const Deployment: React.FC = () => {
                       st === 'complete'
                         ? 'bg-emerald-950/20 border-emerald-500/40 text-emerald-300'
                         : st === 'active'
-                        ? 'bg-cyan-950/30 border-cyan-400 text-white shadow-lg shadow-cyan-950/50'
+                        ? 'bg-emerald-950/30 border-emerald-400 text-white shadow-lg shadow-emerald-950/50'
                         : st === 'failed'
                         ? 'bg-rose-950/20 border-rose-500/40 text-rose-300'
-                        : 'bg-slate-900/40 border-slate-800 text-slate-500'
+                        : 'bg-[#080D14]/40 border-slate-800 text-slate-500'
                     }`}
                   >
                     <div className="flex items-center gap-2 font-bold text-[11px]">
                       {st === 'complete' && <CheckCircle2 size={14} className="text-emerald-400 shrink-0" />}
-                      {st === 'active' && <RefreshCw size={14} className="text-cyan-400 animate-spin shrink-0" />}
+                      {st === 'active' && <RefreshCw size={14} className="text-emerald-400 animate-spin shrink-0" />}
                       {st === 'failed' && <AlertTriangle size={14} className="text-rose-400 shrink-0" />}
                       {st === 'pending' ? <Clock size={14} className="shrink-0" /> : null}
                       <span className="truncate">{step.label}</span>
@@ -1106,9 +1569,9 @@ export const Deployment: React.FC = () => {
                       href={liveDeployment.endpointUrl || '#'}
                       target="_blank"
                       rel="noopener noreferrer"
-                      className="text-lg font-extrabold text-white hover:text-cyan-300 flex items-center gap-2 underline underline-offset-4"
+                      className="text-lg font-extrabold text-white hover:text-emerald-300 flex items-center gap-2 underline underline-offset-4"
                     >
-                      <Globe size={18} className="text-cyan-400" />
+                      <Globe size={18} className="text-emerald-400" />
                       <span>{liveDeployment.endpointUrl || 'No URL available yet'}</span>
                     </a>
                     {liveDeployment.ipAddress && (
@@ -1127,9 +1590,27 @@ export const Deployment: React.FC = () => {
                         <span>Fetch Live URL</span>
                       </button>
                     )}
+                    {liveDeployment.endpointUrl && (
+                      <a
+                        href={liveDeployment.endpointUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="px-4 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs transition-all shadow flex items-center gap-1.5"
+                      >
+                        <Globe className="w-3.5 h-3.5" />
+                        <span>Open Live Website</span>
+                      </a>
+                    )}
+                    <button
+                      onClick={() => navigate(`/deployment/${deploymentId || lastDeploymentId || ''}`)}
+                      className="px-4 py-2.5 rounded-xl bg-[#080D14] hover:bg-slate-800 border border-slate-700 text-emerald-300 font-bold text-xs transition-all flex items-center gap-1.5"
+                    >
+                      <ExternalLink className="w-3.5 h-3.5" />
+                      <span>Deployment Details</span>
+                    </button>
                     <button
                       onClick={handleProceedToMonitoring}
-                      className="px-4 py-2.5 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs transition-all shadow"
+                      className="px-4 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs transition-all shadow"
                     >
                       View Live Metrics
                     </button>
@@ -1158,11 +1639,41 @@ export const Deployment: React.FC = () => {
                 </div>
 
                 {liveDeployment.failureReason && (
-                  <div className="space-y-1">
+                  <div className="space-y-2">
                     <span className="font-semibold text-rose-400">Error:</span>
-                    <p className="text-slate-300 whitespace-pre-wrap bg-slate-900/60 rounded-xl p-3 border border-rose-500/20">
+                    <p className="text-slate-300 whitespace-pre-wrap bg-[#080D14]/60 rounded-xl p-3 border border-rose-500/20 text-xs">
                       {liveDeployment.failureReason}
                     </p>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <button
+                        onClick={handleRetryAnalysis}
+                        className="px-3 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-200 border border-rose-500/40 text-[11px] font-bold transition-colors flex items-center gap-1.5"
+                      >
+                        <RefreshCw size={12} />
+                        <span>Retry Analysis</span>
+                      </button>
+                      {tokenExpired && (
+                        <button
+                          onClick={handleRetryAnalysis}
+                          className="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/40 text-[11px] font-bold transition-colors flex items-center gap-1.5"
+                        >
+                          <span>Re-authenticate GitHub</span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Scan progress steps */}
+                {scanProgress.length > 0 && (
+                  <div className="space-y-1 mt-2">
+                    <span className="font-semibold text-emerald-400 text-xs">Scan Progress:</span>
+                    {scanProgress.map((step, i) => (
+                      <div key={i} className={`flex items-center gap-1.5 text-[11px] ${i === scanProgress.length - 1 ? 'text-emerald-300' : 'text-slate-400'}`}>
+                        {i < scanProgress.length - 1 ? <CheckCircle2 size={12} className="text-green-400 shrink-0" /> : <RefreshCw size={12} className="animate-spin shrink-0" />}
+                        <span>{step.message}</span>
+                      </div>
+                    ))}
                   </div>
                 )}
 
@@ -1176,7 +1687,7 @@ export const Deployment: React.FC = () => {
                       <span>View deployment logs ({liveDeployment.logs.length} lines)</span>
                     </button>
                     {showLogs && (
-                      <div className="mt-2 bg-slate-950 rounded-xl p-3 border border-slate-800 max-h-48 overflow-y-auto font-mono text-[10px] leading-relaxed space-y-0.5">
+                      <div className="mt-2 bg-[#05080D] rounded-xl p-3 border border-slate-800 max-h-48 overflow-y-auto font-mono text-[10px] leading-relaxed space-y-0.5">
                         {liveDeployment.logs.map((log, idx) => (
                           <div
                             key={idx}
@@ -1191,19 +1702,29 @@ export const Deployment: React.FC = () => {
                   </div>
                 )}
 
-                <div className="pt-2 flex items-center gap-2">
+                <div className="pt-2 flex items-center gap-2 flex-wrap">
+                  <button
+                    onClick={handleRetryDeployment}
+                    disabled={retrying}
+                    className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs transition-colors disabled:opacity-50 flex items-center gap-1.5"
+                  >
+                    <RefreshCw size={13} className={retrying ? 'animate-spin' : ''} />
+                    <span>{retrying ? 'Retrying…' : 'Retry Failed Deployment'}</span>
+                  </button>
                   <button
                     onClick={handleRollback}
                     className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs transition-colors"
                   >
                     Initiate Instant Rollback
                   </button>
-                  <button
-                    onClick={handleDeploy}
-                    className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs border border-slate-700 transition-colors"
-                  >
-                    Retry Deployment
-                  </button>
+                  {(deploymentId || lastDeploymentId) && (
+                    <button
+                      onClick={() => navigate(`/deployment/${deploymentId || lastDeploymentId}`)}
+                      className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs border border-slate-700 transition-colors"
+                    >
+                      Deployment Details
+                    </button>
+                  )}
                 </div>
               </div>
             )}
@@ -1211,16 +1732,16 @@ export const Deployment: React.FC = () => {
 
           {/* Terminal */}
           <div className="glass-panel rounded-3xl border border-slate-800 overflow-hidden">
-            <div className="bg-slate-900/90 px-6 py-3 border-b border-slate-800 flex items-center justify-between">
+            <div className="bg-[#080D14]/90 px-6 py-3 border-b border-slate-800 flex items-center justify-between">
               <h4 className="text-xs font-bold text-white flex items-center gap-2">
-                <Terminal className="w-4 h-4 text-cyan-400" />
+                <Terminal className="w-4 h-4 text-emerald-400" />
                 <span>Live Provisioning Console Logs</span>
               </h4>
-              <span className="text-[10px] text-slate-400 font-mono">{liveDeployment.logs.length} lines logged</span>
+              <span className="text-[10px] text-slate-400 font-mono">{liveDeployment.logs?.length || 0} lines logged</span>
             </div>
 
-            <div className="p-5 bg-slate-950 font-mono text-xs text-slate-300 leading-relaxed max-h-72 overflow-y-auto space-y-1">
-              {liveDeployment.logs.length === 0 ? (
+            <div className="p-5 bg-[#05080D] font-mono text-xs text-slate-300 leading-relaxed max-h-72 overflow-y-auto space-y-1">
+              {!liveDeployment.logs || liveDeployment.logs.length === 0 ? (
                 <p className="text-slate-600 text-center py-8">
                   Console idle. Run analysis, generate files, configure env, then deploy to AWS EC2.
                 </p>

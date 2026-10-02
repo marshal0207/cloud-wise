@@ -77,7 +77,7 @@ export const Contact: React.FC = () => {
         transition={{ duration: 0.45, delay: 0.08, ease: [0.22, 1, 0.36, 1] }}
         className="text-center space-y-3 max-w-3xl mx-auto"
       >
-        <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-cyan-500/10 border border-cyan-500/30 text-cyan-300 text-xs font-semibold">
+        <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs font-semibold">
           <Mail className="w-3.5 h-3.5" />
           <span>Contact CloudWise</span>
         </div>
@@ -101,15 +101,15 @@ export const Contact: React.FC = () => {
           
           <div className="glass-panel p-6 rounded-3xl space-y-6 border border-slate-800">
             <h3 className="text-base font-bold text-white flex items-center gap-2">
-              <MessageSquare className="w-5 h-5 text-cyan-400" />
+              <MessageSquare className="w-5 h-5 text-emerald-400" />
               <span>Direct Channels</span>
             </h3>
 
             <div className="space-y-4 text-xs">
               
               <div className="flex items-start gap-3">
-                <div className="w-8 h-8 rounded-lg bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center shrink-0">
-                  <Mail className="w-4 h-4 text-cyan-400" />
+                <div className="w-8 h-8 rounded-lg bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center shrink-0">
+                  <Mail className="w-4 h-4 text-emerald-400" />
                 </div>
                 <div>
                   <span className="text-slate-400 block">Email Support</span>
@@ -118,8 +118,8 @@ export const Contact: React.FC = () => {
               </div>
 
               <div className="flex items-start gap-3">
-                <div className="w-8 h-8 rounded-lg bg-indigo-500/10 border border-indigo-500/30 flex items-center justify-center shrink-0">
-                  <Phone className="w-4 h-4 text-indigo-400" />
+                <div className="w-8 h-8 rounded-lg bg-teal-500/10 border border-teal-500/30 flex items-center justify-center shrink-0">
+                  <Phone className="w-4 h-4 text-teal-400" />
                 </div>
                 <div>
                   <span className="text-slate-400 block">Enterprise Sales</span>
@@ -142,7 +142,7 @@ export const Contact: React.FC = () => {
 
           <div className="glass-card p-6 rounded-3xl space-y-3 border border-slate-800">
             <h4 className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
-              <HelpCircle size={16} className="text-cyan-400" />
+              <HelpCircle size={16} className="text-emerald-400" />
               <span>Response Time</span>
             </h4>
             <p className="text-xs text-slate-400 leading-relaxed">
@@ -173,11 +173,11 @@ export const Contact: React.FC = () => {
               <div className="space-y-2 max-w-md mx-auto">
                 <h3 className="text-2xl font-bold text-white">Message Transmitted!</h3>
                 <p className="text-xs text-slate-300 leading-relaxed">
-                  Thank you, <strong className="text-cyan-300">{formData.name}</strong>. Your inquiry regarding <strong className="text-white">"{formData.subject}"</strong> has been successfully received by our backend storage.
+                  Thank you, <strong className="text-emerald-300">{formData.name}</strong>. Your inquiry regarding <strong className="text-white">"{formData.subject}"</strong> has been successfully received by our backend storage.
                 </p>
                 {responseId && (
                   <p className="text-[11px] text-slate-400 font-mono pt-1">
-                    Ticket Reference ID: <span className="text-cyan-400">{responseId}</span>
+                    Ticket Reference ID: <span className="text-emerald-400">{responseId}</span>
                   </p>
                 )}
               </div>
@@ -185,7 +185,7 @@ export const Contact: React.FC = () => {
               <div className="pt-4">
                 <button
                   onClick={handleReset}
-                  className="px-6 py-3 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-200 font-semibold text-xs transition-colors inline-flex items-center gap-2"
+                  className="px-6 py-3 rounded-xl bg-[#080D14] hover:bg-slate-800 border border-slate-700 text-slate-200 font-semibold text-xs transition-colors inline-flex items-center gap-2"
                 >
                   <RefreshCw size={14} />
                   <span>Send Another Message</span>
@@ -212,7 +212,7 @@ export const Contact: React.FC = () => {
                     placeholder="e.g. Rohan Mehta"
                     value={formData.name}
                     onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-                    className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-cyan-400"
+                    className="w-full bg-[#080D14] border border-slate-700/80 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-emerald-400"
                   />
                 </div>
 
@@ -224,7 +224,7 @@ export const Contact: React.FC = () => {
                     placeholder="rohan.mehta@company.in"
                     value={formData.email}
                     onChange={(e) => setFormData({ ...formData, email: e.target.value })}
-                    className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-cyan-400"
+                    className="w-full bg-[#080D14] border border-slate-700/80 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-emerald-400"
                   />
                 </div>
 
@@ -235,7 +235,7 @@ export const Contact: React.FC = () => {
                 <select
                   value={formData.subject}
                   onChange={(e) => setFormData({ ...formData, subject: e.target.value })}
-                  className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-cyan-400"
+                  className="w-full bg-[#080D14] border border-slate-700/80 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-emerald-400"
                 >
                   <option value="Cloud Resource Consultation">Cloud Resource Consultation</option>
                   <option value="Multi-Cloud Pricing Benchmark">Multi-Cloud Pricing Benchmark</option>
@@ -252,14 +252,14 @@ export const Contact: React.FC = () => {
                   placeholder="Describe your cloud architecture requirements or questions..."
                   value={formData.message}
                   onChange={(e) => setFormData({ ...formData, message: e.target.value })}
-                  className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-cyan-400"
+                  className="w-full bg-[#080D14] border border-slate-700/80 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-emerald-400"
                 />
               </div>
 
               <button
                 type="submit"
                 disabled={loading}
-                className="w-full py-4 rounded-xl bg-gradient-to-r from-cyan-400 to-blue-600 hover:from-cyan-300 hover:to-blue-500 text-slate-950 font-bold text-sm transition-all shadow-xl shadow-cyan-500/20 flex items-center justify-center gap-2 active:scale-98 disabled:opacity-50"
+                className="w-full py-4 rounded-xl bg-gradient-to-r from-emerald-400 to-blue-600 hover:from-emerald-300 hover:to-blue-500 text-slate-950 font-bold text-sm transition-all shadow-xl shadow-emerald-500/20 flex items-center justify-center gap-2 active:scale-98 disabled:opacity-50"
               >
                 {loading ? <RefreshCw size={18} className="animate-spin" /> : <Send size={18} />}
                 <span>{loading ? 'Transmitting to Server...' : 'Submit Message'}</span>

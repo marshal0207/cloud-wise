@@ -10,7 +10,7 @@ container deploy, and that no credentials leak into logs/returns.
 from unittest.mock import MagicMock, patch
 
 from django.contrib.auth import get_user_model
-from django.test import TestCase, override_settings
+from django.test import SimpleTestCase, TestCase, override_settings
 
 from api.models import AWSConnection, EC2Instance
 from api.services.deployment.aws_ec2_provider import AwsEc2Error, AwsEc2Provider
@@ -541,3 +541,156 @@ class NoSecretLeakTests(TestCase):
             "credential",
         ):
             self.assertNotIn(keyword, blob)
+
+
+class ComposeLifecycleTests(SimpleTestCase):
+    """A redeploy must not leave the previous containers behind."""
+
+    REMOTE_DIR = "/opt/cloudwise/projects/proj_1/example-prod"
+
+    def setUp(self):
+        self.provider = object.__new__(AwsEc2Provider)
+
+    def test_stale_containers_are_removed_before_the_new_start(self):
+        joined = " ".join(self.provider._build_compose_commands(self.REMOTE_DIR))
+
+        self.assertLess(
+            joined.index("down --remove-orphans"),
+            joined.index("up -d --build"),
+        )
+        self.assertIn(f"cd '{self.REMOTE_DIR}'", joined)
+        self.assertNotIn("docker rm -f", joined)
+        self.assertNotIn("docker system prune", joined)
+
+    def test_diagnostics_are_read_only_and_report_container_state(self):
+        commands = self.provider._build_compose_diagnostic_commands(
+            self.REMOTE_DIR, backend_port=5000
+        )
+        joined = "\n".join(commands)
+
+        self.assertIn("CLOUDWISE_BACKEND_LISTENING port=5000", joined)
+        self.assertIn("BACKEND LOGS (TAIL 40)", joined)
+        self.assertIn("ERROR LINES (TAIL 40)", joined)
+        self.assertIn("CLOUDWISE_CONTAINER service=", joined)
+        # The markers must be the last section so they survive the SSM
+        # output limit when the log tails are long.
+        self.assertGreater(
+            joined.rindex("CLOUDWISE CONTAINER STATE"),
+            joined.index("BACKEND LOGS"),
+        )
+        for mutating in (
+            "docker rm",
+            "docker stop",
+            "docker restart",
+            "up -d",
+            "down --remove",
+        ):
+            self.assertNotIn(mutating, joined)
+
+
+class BackendServiceGateTests(SimpleTestCase):
+    """The gate fails a deploy only on positive evidence from the instance."""
+
+    REMOTE_DIR = "/opt/cloudwise/projects/proj_1/example-prod"
+    PUBLIC_IP = "203.0.113.10"
+    ATLAS = {"configured": False, "atlas": True, "host": "c0.abc.mongodb.net"}
+
+    def setUp(self):
+        self.provider = object.__new__(AwsEc2Provider)
+        self.ssm = MagicMock()
+        self.log = MagicMock()
+
+    def _gate(self, output):
+        with patch.object(self.provider, "_run_ssm_commands", return_value=output):
+            return self.provider._check_backend_service(
+                self.ssm,
+                "i-0abc123",
+                self.REMOTE_DIR,
+                self.log,
+                backend_port=5000,
+                atlas=self.ATLAS,
+                public_ip=self.PUBLIC_IP,
+            )
+
+    def test_gate_is_one_read_only_command_that_prints_the_markers(self):
+        commands = self.provider._backend_gate_commands(self.REMOTE_DIR, 5000)
+
+        self.assertEqual(len(commands), 1)
+        text = commands[0]
+        self.assertIn(f"cd '{self.REMOTE_DIR}'", text)
+        self.assertIn("CLOUDWISE_GATE_RESULT", text)
+        self.assertIn("CLOUDWISE_CONTAINER service=backend", text)
+        self.assertIn("BACKEND LOGS", text)
+        for mutating in (
+            "docker rm",
+            "docker stop",
+            "docker restart",
+            "up -d",
+            "down --remove",
+        ):
+            self.assertNotIn(mutating, text)
+
+    def test_no_evidence_leaves_the_health_check_in_charge(self):
+        report = self._gate("")
+
+        self.assertEqual(report["status"], "SKIPPED")
+        self.assertEqual(report["errorCode"], "")
+
+    def test_a_listening_backend_passes_the_gate(self):
+        report = self._gate(
+            "CLOUDWISE_CONTAINER service=backend status=running restarts=0 exit=0\n"
+            "CLOUDWISE_GATE_RESULT listening\n"
+        )
+
+        self.assertEqual(report["status"], "SUCCESS")
+
+    def test_a_blocked_database_fails_with_the_instance_address(self):
+        report = self._gate(
+            "CLOUDWISE_CONTAINER service=backend status=running restarts=3 exit=1\n"
+            "CLOUDWISE_GATE_RESULT crashloop\n"
+            "MongooseServerSelectionError: Could not connect to any servers "
+            "in your MongoDB Atlas cluster (ReplicaSetNoPrimary)\n"
+        )
+
+        self.assertEqual(report["status"], "FAILED")
+        self.assertEqual(report["errorCode"], "MONGODB_ATLAS_NOT_CONFIGURED")
+        self.assertIn(f"{self.PUBLIC_IP}/32", report["message"])
+        self.assertIn("never 0.0.0.0/0", report["message"])
+
+    def test_a_dead_container_fails_with_the_container_state(self):
+        report = self._gate(
+            "CLOUDWISE_CONTAINER service=backend status=exited restarts=1 exit=1\n"
+            "CLOUDWISE_GATE_RESULT exited\n"
+            "Error: listen EADDRINUSE: address already in use :::5000\n"
+        )
+
+        self.assertEqual(report["status"], "FAILED")
+        self.assertEqual(report["errorCode"], "CONTAINER_FAILED")
+        self.assertIn("exited", report["message"])
+
+    def test_a_slow_start_is_not_a_failure(self):
+        report = self._gate(
+            "CLOUDWISE_CONTAINER service=backend status=running restarts=0 exit=0\n"
+            "CLOUDWISE_GATE_RESULT starting\n"
+        )
+
+        self.assertEqual(report["status"], "SKIPPED")
+
+    def test_a_gate_that_cannot_run_is_not_a_failure(self):
+        with patch.object(
+            self.provider,
+            "_run_ssm_commands",
+            side_effect=RuntimeError("ssm unavailable"),
+        ):
+            report = self.provider._check_backend_service(
+                self.ssm,
+                "i-0abc123",
+                self.REMOTE_DIR,
+                self.log,
+                backend_port=5000,
+                atlas=self.ATLAS,
+                public_ip=self.PUBLIC_IP,
+            )
+
+        self.assertEqual(report["status"], "SKIPPED")
+        self.log.warning.assert_called_once()

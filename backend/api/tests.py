@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 from django.test import TestCase, Client
 from django.contrib.auth import get_user_model
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -244,10 +246,59 @@ class BackendApiTests(TestCase):
         self.assertTrue(res.json()['success'])
 
     def test_monitoring(self):
-        res = self.client.get('/api/monitoring')
+        # Monitoring is authenticated: anonymous callers get 401.
+        self.assertEqual(self.client.get('/api/monitoring').status_code, 401)
+
+        user, token = self._create_user_and_token('ops@cloudwise.io', 'Pass1234', 'Ops')
+        headers = {'HTTP_AUTHORIZATION': f'Bearer {token}'}
+
+        # A brand new user has no deployments — reported, not invented.
+        res = self.client.get('/api/monitoring', **headers)
         self.assertEqual(res.status_code, 200)
-        self.assertEqual(res.json()['data']['healthStatus'], 'Healthy')
-        self.assertIn('clusterUptime', res.json()['data'])
-        self.assertIn('activeNodes', res.json()['data'])
-        self.assertIn('ipAddress', res.json()['data'])
-        self.assertIn('endpointUrl', res.json()['data'])
+        data = res.json()['data']
+        self.assertFalse(data['metricsCollected'])
+        self.assertIsNone(data['cpuUsage'])
+        self.assertEqual(data['healthStatus'], 'Not deployed')
+        self.assertEqual(data['activeNodes'], 0)
+        for key in ('clusterUptime', 'activeNodes', 'ipAddress', 'endpointUrl', 'deploymentId'):
+            self.assertIn(key, data)
+
+        # Real record → real telemetry derived from it.
+        DeploymentRecord.objects.create(
+            user=user,
+            environment_name='ops-prod',
+            provider='AWS',
+            provider_deployment_id='i-ops1',
+            instance_id='i-ops1',
+            instance_type='t3.micro',
+            deployment_status='RUNNING',
+            live_url='https://ops.example.com',
+            ip_address='13.232.1.44',
+        )
+        with patch('api.views._probe_url', return_value=(True, 200)):
+            res = self.client.get('/api/monitoring', **headers)
+        data = res.json()['data']
+        self.assertEqual(data['deploymentStatus'], 'RUNNING')
+        self.assertEqual(data['instanceId'], 'i-ops1')
+        self.assertEqual(data['healthStatus'], 'Healthy')
+        self.assertEqual(data['activeNodes'], 1)
+        self.assertEqual(data['endpointUrl'], 'https://ops.example.com')
+
+    def test_monitoring_is_scoped_to_the_calling_user(self):
+        owner, _ = self._create_user_and_token('owner2@cloudwise.io', 'Pass1234', 'Owner')
+        DeploymentRecord.objects.create(
+            user=owner,
+            environment_name='secret-prod',
+            provider='AWS',
+            provider_deployment_id='i-secret1',
+            instance_id='i-secret1',
+            deployment_status='RUNNING',
+            live_url='https://secret.example.com',
+        )
+        other, token = self._create_user_and_token('other2@cloudwise.io', 'Pass1234', 'Other')
+        res = self.client.get(
+            '/api/monitoring', HTTP_AUTHORIZATION=f'Bearer {token}'
+        )
+        data = res.json()['data']
+        self.assertIsNone(data['deploymentId'])
+        self.assertEqual(data['healthStatus'], 'Not deployed')

@@ -132,7 +132,7 @@ export const Estimation: React.FC = () => {
       
       {/* Header */}
       <div className="text-center space-y-3 max-w-3xl mx-auto">
-        <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-cyan-500/10 border border-cyan-500/30 text-cyan-300 text-xs font-semibold">
+        <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs font-semibold">
           <Calculator className="w-3.5 h-3.5" />
           <span>Step 1: Resource Estimator & Free Tier Validator</span>
         </div>
@@ -154,13 +154,13 @@ export const Estimation: React.FC = () => {
             {/* Application Type */}
             <div className="space-y-2">
               <label className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
-                <Layers className="w-4 h-4 text-cyan-400" />
+                <Layers className="w-4 h-4 text-emerald-400" />
                 <span>Application Workload Type</span>
               </label>
               <select
                 value={formData.appType}
                 onChange={(e) => handleInputChange('appType', e.target.value)}
-                className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400"
+                className="w-full bg-[#080D14] border border-slate-700/80 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-emerald-400 focus:ring-1 focus:ring-emerald-400"
               >
                 <option value="Microservices & Web APIs">Microservices & Web APIs</option>
                 <option value="E-Commerce & High Traffic Portal">E-Commerce & High Traffic Portal</option>
@@ -174,13 +174,13 @@ export const Estimation: React.FC = () => {
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
               
               {/* vCPU */}
-              <div className="space-y-2 bg-slate-900/60 p-4 rounded-2xl border border-slate-800">
+              <div className="space-y-2 bg-[#080D14]/60 p-4 rounded-2xl border border-slate-800">
                 <div className="flex justify-between items-center text-xs font-bold">
                   <span className="text-slate-300 flex items-center gap-1.5">
-                    <Cpu className="w-4 h-4 text-cyan-400" />
+                    <Cpu className="w-4 h-4 text-emerald-400" />
                     vCPU Cores
                   </span>
-                  <span className="text-cyan-400 font-extrabold text-sm">{formData.vcpu} vCPUs</span>
+                  <span className="text-emerald-400 font-extrabold text-sm">{formData.vcpu} vCPUs</span>
                 </div>
                 <input
                   type="range"
@@ -189,7 +189,7 @@ export const Estimation: React.FC = () => {
                   step={1}
                   value={formData.vcpu}
                   onChange={(e) => handleInputChange('vcpu', Number(e.target.value))}
-                  className="w-full accent-cyan-400 cursor-pointer"
+                  className="w-full accent-emerald-400 cursor-pointer"
                 />
                 <div className="flex justify-between text-[10px] text-slate-400">
                   <span>1 Core (Free Tier)</span>
@@ -199,13 +199,13 @@ export const Estimation: React.FC = () => {
               </div>
 
               {/* RAM */}
-              <div className="space-y-2 bg-slate-900/60 p-4 rounded-2xl border border-slate-800">
+              <div className="space-y-2 bg-[#080D14]/60 p-4 rounded-2xl border border-slate-800">
                 <div className="flex justify-between items-center text-xs font-bold">
                   <span className="text-slate-300 flex items-center gap-1.5">
-                    <Server className="w-4 h-4 text-indigo-400" />
+                    <Server className="w-4 h-4 text-teal-400" />
                     System RAM
                   </span>
-                  <span className="text-indigo-400 font-extrabold text-sm">{formData.ram} GB</span>
+                  <span className="text-teal-400 font-extrabold text-sm">{formData.ram} GB</span>
                 </div>
                 <input
                   type="range"
@@ -214,7 +214,7 @@ export const Estimation: React.FC = () => {
                   step={1}
                   value={formData.ram}
                   onChange={(e) => handleInputChange('ram', Number(e.target.value))}
-                  className="w-full accent-indigo-400 cursor-pointer"
+                  className="w-full accent-teal-400 cursor-pointer"
                 />
                 <div className="flex justify-between text-[10px] text-slate-400">
                   <span>1 GB (Free Tier)</span>
@@ -229,7 +229,7 @@ export const Estimation: React.FC = () => {
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
               
               {/* Storage */}
-              <div className="space-y-2 bg-slate-900/60 p-4 rounded-2xl border border-slate-800">
+              <div className="space-y-2 bg-[#080D14]/60 p-4 rounded-2xl border border-slate-800">
                 <div className="flex justify-between items-center text-xs font-bold">
                   <span className="text-slate-300 flex items-center gap-1.5">
                     <HardDrive className="w-4 h-4 text-teal-400" />
@@ -256,13 +256,13 @@ export const Estimation: React.FC = () => {
               {/* Traffic */}
               <div className="space-y-2">
                 <label className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
-                  <Globe className="w-4 h-4 text-cyan-400" />
+                  <Globe className="w-4 h-4 text-emerald-400" />
                   <span>Expected Traffic / Requests</span>
                 </label>
                 <select
                   value={formData.traffic}
                   onChange={(e) => handleInputChange('traffic', e.target.value)}
-                  className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-cyan-400"
+                  className="w-full bg-[#080D14] border border-slate-700/80 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-emerald-400"
                 >
                   <option value="100,000 req/day">100,000 requests/day (Low)</option>
                   <option value="1,000,000 req/day">1,000,000 requests/day (Medium)</option>
@@ -281,9 +281,9 @@ export const Estimation: React.FC = () => {
                 <select
                   value={formData.region}
                   onChange={(e) => handleInputChange('region', e.target.value)}
-                  className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-3 py-2.5 text-xs text-white focus:border-cyan-400"
+                  className="w-full bg-[#080D14] border border-slate-700/80 rounded-xl px-3 py-2.5 text-xs text-white focus:border-emerald-400"
                 >
-                  <option value="Gujarat (GIFT City / Gandhinagar)">Gujarat (GIFT City / Gandhinagar)</option>
+                  <option value="US East (N. Virginia)">US East (N. Virginia)</option>
                   <option value="Mumbai (ap-south-1)">Mumbai (ap-south-1)</option>
                   <option value="Bengaluru (ap-south-2)">Bengaluru (ap-south-2)</option>
                 </select>
@@ -294,7 +294,7 @@ export const Estimation: React.FC = () => {
                 <select
                   value={formData.performanceTier}
                   onChange={(e) => handleInputChange('performanceTier', e.target.value)}
-                  className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-3 py-2.5 text-xs text-white focus:border-cyan-400"
+                  className="w-full bg-[#080D14] border border-slate-700/80 rounded-xl px-3 py-2.5 text-xs text-white focus:border-emerald-400"
                 >
                   <option value="Standard">Standard Tier</option>
                   <option value="High Performance">High Performance (Low Latency)</option>
@@ -308,7 +308,7 @@ export const Estimation: React.FC = () => {
                 <select
                   value={formData.budgetTier}
                   onChange={(e) => handleInputChange('budgetTier', e.target.value)}
-                  className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-3 py-2.5 text-xs text-white focus:border-cyan-400"
+                  className="w-full bg-[#080D14] border border-slate-700/80 rounded-xl px-3 py-2.5 text-xs text-white focus:border-emerald-400"
                 >
                   <option value="Economy">Economy (Cost Efficient)</option>
                   <option value="Balanced">Balanced (Cost & SLA)</option>
@@ -363,7 +363,7 @@ export const Estimation: React.FC = () => {
             <div className="pt-2">
               <button
                 type="submit"
-                className="w-full py-4 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-slate-950 font-bold text-sm transition-all shadow-lg shadow-cyan-500/20 active:scale-98 flex items-center justify-center gap-2"
+                className="w-full py-4 rounded-xl bg-gradient-to-r from-emerald-500 to-blue-600 hover:from-emerald-400 hover:to-blue-500 text-slate-950 font-bold text-sm transition-all shadow-lg shadow-emerald-500/20 active:scale-98 flex items-center justify-center gap-2"
               >
                 <Calculator className="w-5 h-5" />
                 <span>Calculate & Check Free Tier Compliance</span>
@@ -375,10 +375,10 @@ export const Estimation: React.FC = () => {
 
         {/* Results Card (1 Col) */}
         <div className="space-y-6">
-          <div className="glass-panel p-6 sm:p-8 rounded-3xl space-y-6 border border-cyan-500/20">
+          <div className="glass-panel p-6 sm:p-8 rounded-3xl space-y-6 border border-emerald-500/20">
             <div className="flex items-center justify-between border-b border-slate-800 pb-4">
               <h3 className="text-lg font-bold text-white flex items-center gap-2">
-                <Sparkles className="w-5 h-5 text-cyan-400" />
+                <Sparkles className="w-5 h-5 text-emerald-400" />
                 <span>Suggested Profile</span>
               </h3>
               <span className={`px-2.5 py-1 rounded text-xs font-bold border ${freeTierStatus?.isFreeTier ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40' : 'bg-amber-500/20 text-amber-300 border-amber-500/40'}`}>
@@ -389,9 +389,9 @@ export const Estimation: React.FC = () => {
             {/* Calculated specs summary */}
             <div className="space-y-4 text-xs">
               
-              <div className="bg-slate-900/80 p-4 rounded-2xl border border-slate-800 space-y-1">
+              <div className="bg-[#080D14]/80 p-4 rounded-2xl border border-slate-800 space-y-1">
                 <span className="text-slate-400 text-[11px]">Estimated Monthly Spend Range</span>
-                <p className="text-2xl sm:text-3xl font-extrabold text-cyan-400 flex items-center gap-1">
+                <p className="text-2xl sm:text-3xl font-extrabold text-emerald-400 flex items-center gap-1">
                   {freeTierStatus?.isFreeTier ? '₹0' : `${formatINR(estimation.calculatedResult.minCost)} - ${formatINR(estimation.calculatedResult.maxCost)}`}
                   <span className="text-xs font-medium text-slate-400">/ mo</span>
                 </p>
@@ -403,22 +403,22 @@ export const Estimation: React.FC = () => {
               </div>
 
               <div className="space-y-2">
-                <div className="flex justify-between items-center bg-slate-900/40 p-3 rounded-xl">
+                <div className="flex justify-between items-center bg-[#080D14]/40 p-3 rounded-xl">
                   <span className="text-slate-400">Target vCPU Cores</span>
                   <span className="text-white font-bold">{formData.vcpu} Cores</span>
                 </div>
 
-                <div className="flex justify-between items-center bg-slate-900/40 p-3 rounded-xl">
+                <div className="flex justify-between items-center bg-[#080D14]/40 p-3 rounded-xl">
                   <span className="text-slate-400">Allocated RAM</span>
                   <span className="text-white font-bold">{formData.ram} GB</span>
                 </div>
 
-                <div className="flex justify-between items-center bg-slate-900/40 p-3 rounded-xl">
+                <div className="flex justify-between items-center bg-[#080D14]/40 p-3 rounded-xl">
                   <span className="text-slate-400">Suggested Node Count</span>
-                  <span className="text-indigo-400 font-bold">{freeTierStatus?.isFreeTier ? 1 : estimation.calculatedResult.suggestedInstances} Nodes</span>
+                  <span className="text-teal-400 font-bold">{freeTierStatus?.isFreeTier ? 1 : estimation.calculatedResult.suggestedInstances} Nodes</span>
                 </div>
 
-                <div className="flex justify-between items-center bg-slate-900/40 p-3 rounded-xl">
+                <div className="flex justify-between items-center bg-[#080D14]/40 p-3 rounded-xl">
                   <span className="text-slate-400">Estimated Bandwidth</span>
                   <span className="text-teal-400 font-bold">{estimation.calculatedResult.bandwidthGB} GB / mo</span>
                 </div>

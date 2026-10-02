@@ -148,6 +148,7 @@ class ConnectValidationTests(TestCase):
                 "status",
                 "connected_at",
                 "updated_at",
+                "deployment_records",
             ],
         )
         # AssumeRole was called with the External ID (confused-deputy protection)
