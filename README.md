@@ -362,3 +362,4 @@ npm run build   # TypeScript check + Vite production build
 | `/optimization` | Optimization | Cost optimization recommendations |
 | `/about` | About | Platform information |
 | `/contact` | Contact | Contact form |
+
