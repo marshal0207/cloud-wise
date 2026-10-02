@@ -111,7 +111,7 @@ The frontend will start at `http://localhost:5173` and automatically proxy `/api
     .\.venv\Scripts\python.exe manage.py runserver 127.0.0.1:8000
 
 
-    .\.venv\Scripts\Activate.ps1
+    .\.venv\Scripts\Activate.ps1 or venv/Scripts/Activate
     python manage.py migrate
     python manage.py runserver
 ```
