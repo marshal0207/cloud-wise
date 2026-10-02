@@ -1,260 +1,146 @@
-# CloudWise - Multi-Cloud Resource Intelligence & Cost Sizing Platform
+# CloudWise — Multi-Cloud Resource Intelligence & Automated Deployment Platform
 
-CloudWise is a cloud infrastructure resource intelligence, estimation, deployment advisory, and cost tuning platform built with **React (TypeScript + Vite)** on the frontend and **Django + Django REST Framework** on the backend.
-
----
-
-## 📁 Repository Structure
-
-```
-Cloudwise-try/
-├── frontend/               # React + TypeScript + Vite + Tailwind CSS Frontend
-│   ├── src/                # Pages, Components, Context, and Styles
-│   ├── package.json
-│   ├── vite.config.ts      # Configured with proxy to http://127.0.0.1:8000
-│   └── README.md
-├── backend/                # Django + Django REST Framework Backend
-│   ├── backend/            # Django Settings, URLs, WSGI, ASGI
-│   ├── api/                # Models, Serializers, Views, Permissions, Admin
-│   ├── manage.py
-│   ├── requirements.txt
-│   └── .env.example
-└── README.md
-```
+CloudWise is a full-stack cloud infrastructure advisory and deployment platform. It analyzes a GitHub repository, estimates infrastructure costs across AWS, GCP, Azure, and DigitalOcean, generates production-ready deployment artifacts, and provisions and deploys the application to AWS EC2 — automatically, end to end.
 
 ---
 
-## 🚀 Quick Start Guide
+## What It Does
 
-### 1. Start Django Backend
+A user connects their GitHub repository, describes their workload, and CloudWise handles everything from cost estimation to a live running application on AWS. The entire workflow is driven by real data: real GitHub repository analysis, real AWS pricing API calls, real EC2 provisioning via STS AssumeRole, and real deployment logs streamed from the instance.
+
+The six-step pipeline is:
+
+**Connect Repository → Estimate Workload → Compare Cloud Costs → Generate Artifacts → Provision & Deploy → Monitor & Optimize**
+
+---
+
+## Core Features
+
+**Workload Estimation Engine**
+Accepts application type, vCPU, RAM, storage, traffic, region, and performance tier. Computes min/max monthly cost in INR with region-specific multipliers. Persists every estimation to the database.
+
+**Multi-Cloud Recommendation**
+Generates side-by-side recommendations for AWS (c6i), GCP (n2-standard), Azure (Dsv5), and DigitalOcean (CPU-Optimized) from the same estimation inputs. All costs are derived dynamically — no hardcoded values.
+
+**GitHub OAuth Integration**
+Full OAuth 2.0 flow with GitHub. Stores encrypted access tokens using Fernet symmetric encryption. Fetches the user's repositories, links a selected repository to the active project, and recursively inspects the full repository tree via the GitHub Git Trees API.
+
+**Repository Analysis & Artifact Generation**
+Detects the technology stack (Spring Boot/Maven, Spring Boot/Gradle, React/Vite, Node.js, Python/Django, Python/FastAPI) from actual repository files. If a Dockerfile already exists it is preserved. Missing deployment files are generated: `Dockerfile`, `docker-compose.yml`, `.github/workflows/aws-deploy.yml`. Files can be committed back to the repository via the GitHub Contents API.
+
+**AWS EC2 Deployment**
+Connects to the user's own AWS account via IAM Role + STS AssumeRole (no long-lived keys stored). Provisions an EC2 instance with a security group, installs Docker via SSM, uploads the application, runs `docker compose up`, and performs a real HTTP health check. The live URL is the EC2 public IP/DNS. Deployment status progresses through `QUEUED → PREPARING → BUILDING → DEPLOYING → HEALTH_CHECK → RUNNING` with structured logs streamed in real time.
+
+**MongoDB Atlas Integration**
+Connects to MongoDB Atlas via the Atlas Administration API (OAuth2 Client Credentials). Automatically adds the EC2 instance's public IP to the Atlas Project Network Access list on every deployment so the application can reach its database.
+
+**Cost Optimization Engine**
+Generates four optimization recommendations (rightsize compute, delete unattached storage, purchase savings plan, automate off-peak shutdown) derived from the selected recommendation's actual cost and specs. Savings are calculated as percentages of real costs, not hardcoded numbers.
+
+**Live Monitoring**
+Queries the latest deployment record for uptime, IP address, and endpoint URL. CPU, memory, and storage metrics are shown as "Not collected" when no agent is running — no fabricated numbers.
+
+**Role-Based Access Control**
+Four roles: Owner, Editor, Viewer, Admin. Viewer role is blocked from creating projects, modifying settings, linking repositories, applying optimizations, and deploying. All project endpoints enforce strict user ownership — cross-user access returns 403 with no existence leak.
+
+**JWT Authentication**
+SimpleJWT with 7-day access tokens and 30-day rotating refresh tokens. All project, deployment, and GitHub endpoints require a valid Bearer token.
+
+---
+
+## Technology Stack
+
+| Layer | Technology |
+|---|---|
+| Frontend framework | React 18 + TypeScript + Vite 6 |
+| Frontend styling | Tailwind CSS 3 + Framer Motion |
+| Frontend routing | React Router v6 |
+| Frontend icons | Lucide React |
+| Backend framework | Django 5 + Django REST Framework |
+| Authentication | SimpleJWT (JWT) |
+| Database (local) | SQLite |
+| Database (production) | Neon PostgreSQL via `dj-database-url` |
+| AWS SDK | boto3 |
+| Token encryption | cryptography (Fernet) |
+| CORS | django-cors-headers |
+| HTTP client (backend) | urllib (stdlib, no extra dependency) |
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+- Python 3.11 or later
+- Node.js 18 or later
+- A GitHub OAuth App (for repository integration)
+- An AWS account with an IAM role (for EC2 deployment)
+
+### Backend Setup
 
 ```bash
-# Navigate to backend directory
 cd backend
+python -m venv .venv
 
-# Install dependencies
+# Windows
+.\.venv\Scripts\Activate.ps1
+
+# macOS / Linux
+source .venv/bin/activate
+
 pip install -r requirements.txt
-
-# Run database migrations
+cp .env.example .env
+# Edit .env with your credentials (see Environment Variables section)
 python manage.py migrate
-
-# Start Django development server (runs on http://127.0.0.1:8000)
 python manage.py runserver 127.0.0.1:8000
 ```
 
-- **API Base URL**: `http://127.0.0.1:8000/api/`
-- **Django Admin Panel**: `http://127.0.0.1:8000/admin/`
+The API is available at `http://127.0.0.1:8000/api/`.
+The Django admin panel is at `http://127.0.0.1:8000/admin/`.
 
----
-
-### 2. Start React Frontend
+### Frontend Setup
 
 ```bash
-# Navigate to frontend directory
 cd frontend
-
-# Install dependencies
 npm install
-
-# Start Vite development server (runs on http://localhost:5173)
 npm run dev
 ```
 
-The frontend will start at `http://localhost:5173` and automatically proxy `/api/*` requests to the Django backend on port `8000`.
+The frontend starts at `http://localhost:5173` and proxies all `/api/*` requests to the Django backend on port 8000 via the Vite dev server proxy.
 
 ---
 
-## 🛠️ Tech Stack
+## Environment Variables
 
-### Frontend
-- **Framework**: React 18 + TypeScript + Vite
-- **Styling**: Tailwind CSS + Framer Motion
-- **Icons**: Lucide React
-- **Routing**: React Router v6
+Copy `backend/.env.example` to `backend/.env` and fill in the values.
 
-### Backend
-- **Framework**: Python 3 + Django 5 + Django REST Framework
-- **Authentication**: SimpleJWT (JWT Authentication)
-- **Database**: Django ORM + SQLite (Local Dev) / PostgreSQL (Production)
-- **CORS**: `django-cors-headers`
-
----
-
-## 🔐 Features Implemented
-- User Registration & Sign In (JWT Authentication)
-- Role-Based Access Control (RBAC: Owner, Editor, Viewer, Admin)
-- INR ₹ Resource Cost Sizing Engine
-- Multi-Cloud Comparison (AWS, GCP, Azure, DigitalOcean)
-- GitHub Repository Integration & Manifest Generation
-- Infrastructure Deployment Simulator & Logging
-- Dynamic Cost Optimization Tuning
-- Django Admin Control Panel for Data Management
-
-# Django setup
-```   
-    python -m venv .venv
-    .\.venv\Scripts\Activate.ps1 
-    python manage.py runserver
-```
-- cd backend
-- python -m venv .venv
-- .\.venv\Scripts\Activate.ps1
-- pip install -r requirements.txt
-- cp .env.example .env
-#### Edit the .env file with your credentials if necessary
-- python manage.py migrate
-- python manage.py runserver
-
-```bash
-    .\.venv\Scripts\Activate.ps1
-    .\.venv\Scripts\pip.exe install -r requirements.txt
-    .\.venv\Scripts\python.exe manage.py runserver 127.0.0.1:8000
-
-
-    .\.venv\Scripts\Activate.ps1 or venv/Scripts/Activate
-    python manage.py migrate
-    python manage.py runserver
-```
-
----
-
-# CloudWise Deployment Pipeline — Implementation Report
-
-The end-to-end deploy flow is now **GitHub OAuth → repository scan → project
-detection → AWS IAM/STS → EC2 provision → container deploy → health check →
-real live URL**, scoped to the signed-in user on every endpoint. There is no
-mock, simulated, or timer-driven data anywhere in the production path.
-
----
-
-## 1. Architecture
-
-```
-Browser
-  │  POST /api/deploy  (projectId, environmentName, envVars, region, specs)
-  ▼
-deploy_view  ── fast, synchronous validation (stage-tagged errors)
-  │   PROJECT      project exists and belongs to caller
-  │   GITHUB       repo linked, OAuth token readable, files readable
-  │   ENVIRONMENT  required env vars present, DATABASE_URL scheme allowed
-  │   AWS          caller has an active AWS connection (STS-assumable role)
-  │
-  ├─► DeploymentRecord(id=dep_…, user, github_connection, aws_connection,
-  │                    repository, commit_sha, project_type, aws_account_id,
-  │                    region, instance_id, instance_type,
-  │                    deployment_status=QUEUED, live_url=NULL)
-  │
-  └─► start_pipeline()  ── daemon thread (DEPLOYMENT_RUN_INLINE=1 in tests)
-         1. assume_role_credentials()      STS AssumeRole + external id
-         2. AwsEc2Provider.start()         security group, AMI, RunInstances
-         3. AwsEc2Provider.deploy()        upload, docker compose up, health
-         4. record → RUNNING + live_url    structured logs streamed in-band
-  ▲
-  └── GET /api/deployments/<id>/status    record state, then live EC2 query
-      GET /api/deployments/<id>/logs      structured logs
-      POST /api/deployments/<id>/health   real HTTP GET against live_url
-```
-
-Status vocabulary (`backend/api/services/deployment/status.py`):
-
-`QUEUED → PREPARING → BUILDING → DEPLOYING → HEALTH_CHECK → RUNNING`,
-with `FAILED`, `ROLLING_BACK`, `ROLLED_BACK`, `TERMINATED` as terminal or
-recovery states. Transitions are validated by `is_valid_transition()`.
-
-Progress is derived deterministically from the status (`_STATUS_PROGRESS` in
-`backend/api/views.py`) — never animated by a client-side timer.
-
----
-
-## 2. Files changed
-
-### Backend
-
-| File | Change |
-|---|---|
-| `backend/api/models.py` | `DeploymentRecord` rewritten: FKs to `project`/`github_connection`/`aws_connection`/`user`, plus `repository`, `commit_sha`, `project_type`, `aws_account_id`, `instance_id`, `instance_type`, `deployment_status`, `live_url`, `updated_at`. `status`/`endpoint_url` kept as Python `@property` aliases (not DB columns). Added `failure_stage` property. |
-| `backend/api/serializers.py` | `DeploymentRecordSerializer` emits canonical camelCase fields (`deploymentStatus`, `liveUrl`, `repository`, `commitSha`, `projectType`, `awsAccountId`, `instanceId`, `failureStage`, …). |
-| `backend/api/admin.py` | Admin list/filter switched to `deployment_status`. |
-| `backend/api/urls.py` | Deployment routes (list/detail/status/logs/health/retry/terminate/rollback); `/api/deployments/<id>/fail` removed. |
-| `backend/api/views.py` | `deploy_view` → create-then-observe (201 + `QUEUED`); shared `_prepare_repository_payload()`; `_project_type_label()`; `monitoring_view` → authenticated, user-scoped, real data; `_find_deployment_record()` (owner-enforced, accepts `dep_…` or instance id); `_deployment_payload()`, `_stored_status_payload()`; `deployments_list_view`, `deployment_detail_view`, `deployment_status_view`, `deployment_logs_view`, `deployment_health_view`, `deployment_retry_view`, `deployment_terminate_view`, `deployment_rollback_view`. |
-| `backend/api/services/deployment/pipeline.py` **(new)** | `start_pipeline()` / `run_pipeline()` / `append_log()` / `fail_deployment()` / `RecordLogStream` — STS → provision → deploy → finalize, streaming log + status updates. |
-| `backend/api/services/deployment/aws_ec2_provider.py` | `set_log_listener()` + `_new_log()` for streaming; new `terminate_instance()` (verifies tag `ManagedBy=CloudWise` before `ec2:TerminateInstances`). |
-| `backend/api/services/deployment/log_service.py` | Optional `listener` callback so log entries reach the record in-band. |
-| `backend/api/services/deployment/status.py` | Added `TERMINATED` status + transition rules. |
-| `backend/api/services/deployment_file_generator.py` | Default provider `MOCK` → `AWS`; dead `generate_vercel_config()` / `generate_render_config()` removed. |
-| `backend/api/migrations/0007_deployment_record_ownership_and_pipeline_fields.py` **(new)** | See §3. |
-| `backend/backend/settings.py` | `VERCEL_*` / `RENDER_*` removed; added `DEPLOYMENT_RUN_INLINE`. |
-
-**Deleted** (retired / mock / dead):
-
-```
-backend/api/services/deployment/mock_provider.py
-backend/api/services/deployment/vercel_provider.py
-backend/api/services/deployment/render_provider.py
-backend/api/services/deployment/health_check.py
-backend/api/services/deployment/rollback.py
-backend/debug_vercel.py
-backend/diagnose_vercel.py
-backend/api/services/tests/test_mock_deployment.py
-```
-
-### Frontend
-
-| File | Change |
-|---|---|
-| `frontend/src/pages/Deployment.tsx` | Reads new response contract (`deploymentStatus` / `liveUrl` / `ipAddress`); **Deployment Readiness checklist** (GitHub · Repository · AWS · Deployment) driven by real signals with per-stage errors, Dismiss and Retry; `handleRetryDeployment()` → `POST /retry`; "Open Live Website" + "Deployment Details" buttons. |
-| `frontend/src/pages/DeploymentDetails.tsx` **(new)** | Route `/deployment/:id` — Repository, Commit, Project type, AWS account, AWS region, Instance ID, Instance type, Instance state, Public IP, Deployment status, Failure stage, Created/Updated time, Deployment logs, Live URL, **Open Live Website**; actions: health check, refresh, retry, rollback, terminate; polls only while in-flight. |
-| `frontend/src/pages/Monitoring.tsx` | Fabricated data removed: no random CPU/mem/storage, no "99.99% SLA", no fake anomaly alerts, no "Simulate Traffic Load Spike". Unmeasured metrics render an explicit "Not collected" state. |
-| `frontend/src/context/CloudWiseContext.tsx` | `MonitoringData` fields nullable + `metricsCollected`; initial state is "not measured"; `/api/monitoring` now fetched with the JWT; exposes `refreshMonitoring()`. |
-| `frontend/src/App.tsx` | Added route `/deployment/:id`. |
-
----
-
-## 3. Database migration
-
-```bash
-python manage.py makemigrations api   # 0007_...
-python manage.py migrate
-```
-
-`0007_deployment_record_ownership_and_pipeline_fields.py`:
-
-1. `RenameField status → deployment_status` (data preserved)
-2. `RenameField endpoint_url → live_url` (data preserved)
-3. `AlterField deployment_status` default `'QUEUED'`
-4. `AddField`: `aws_account_id`, `aws_connection` (FK), `commit_sha`,
-   `github_connection` (FK), `instance_id`, `instance_type`, `project` (FK),
-   `project_type`, `repository`, `updated_at`
-5. `RunPython` — normalises legacy lowercase statuses
-   (`deployed→RUNNING`, `deploying→DEPLOYING`, `building→BUILDING`,
-   `preparing→PREPARING`, `failed→FAILED`, `rollback→ROLLED_BACK`, …)
-6. `RunPython` — backfills `instance_id` from `provider_deployment_id`
-   when it looks like `i-…`
-
-Rollback: the `RunPython` steps are no-ops in reverse; the renames reverse cleanly.
-
----
-
-## 4. Environment variables
-
-Copy `backend/.env.example` → `backend/.env` (`.env` is gitignored).
-
-**Required for GitHub**
+### Required for GitHub OAuth
 
 ```dotenv
 GITHUB_CLIENT_ID=
 GITHUB_CLIENT_SECRET=
-GITHUB_REDIRECT_URI=http://localhost:8000/api/github/oauth/callback
+GITHUB_REDIRECT_URI=http://127.0.0.1:8000/api/github/oauth/callback
 FRONTEND_URL=http://localhost:5173
-GITHUB_OAUTH_SCOPES=repo workflow
-GITHUB_OAUTH_STATE_MAX_AGE=600
-GITHUB_TOKEN_ENCRYPTION_KEY=      # Fernet key; encrypts stored OAuth tokens
 ```
 
-**Required for AWS (STS assume-role — no long-lived keys needed)**
+Create a GitHub OAuth App at **GitHub → Settings → Developer settings → OAuth Apps → New OAuth App**. Set the Authorization callback URL to `http://127.0.0.1:8000/api/github/oauth/callback`.
+
+### Required for Token Encryption
 
 ```dotenv
-AWS_TRUSTED_ACCOUNT_ID=           # the account that owns the CloudWise backend
+GITHUB_TOKEN_ENCRYPTION_KEY=
+```
+
+Generate a Fernet key:
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+### Required for AWS Deployment
+
+```dotenv
+AWS_TRUSTED_ACCOUNT_ID=        # The AWS account ID that owns the CloudWise backend
 AWS_DEFAULT_REGION=ap-south-1
 AWS_ROLE_SESSION_NAME=cloudwise-deploy
 AWS_ROLE_DURATION_SECONDS=3600
@@ -267,177 +153,212 @@ AWS_DEPLOYER_ACCESS_KEY_ID=
 AWS_DEPLOYER_SECRET_ACCESS_KEY=
 ```
 
-**Deployment behaviour**
+### Optional for MongoDB Atlas
 
 ```dotenv
-DEPLOYMENT_RUN_INLINE=            # leave empty in production (background thread)
+MONGODB_ATLAS_PUBLIC_KEY=
+MONGODB_ATLAS_PRIVATE_KEY=
+MONGODB_ATLAS_PROJECT_ID=
 ```
 
-**Removed:** `VERCEL_TOKEN`, `VERCEL_TEAM_ID`, `RENDER_API_KEY`,
-`RENDER_OWNER_ID` and every other Vercel/Render variable.
+### Database
 
-> The repository previously carried a real `VERCEL_TOKEN` in `backend/.env`.
-> It has been deleted from the file. **Revoke it in the Vercel dashboard**
-> (Settings → Tokens) — it is not needed by CloudWise.
+```dotenv
+# Leave empty to use SQLite locally
+DATABASE_URL=postgres://user:password@host:5432/cloudwisedb
+```
 
-Other: `SECRET_KEY`, `DEBUG`, `ALLOWED_HOSTS`, `CORS_ALLOWED_ORIGINS`,
-`AWS_EC2_*`, `AWS_SECURITY_GROUP_*`, `AWS_HEALTH_CHECK_*`, `AWS_SSM_*`,
-`AWS_PRICING_API_REGION`, `USD_TO_INR_RATE`.
+Tests always use SQLite regardless of `DATABASE_URL`.
+
+### Django Core
+
+```dotenv
+SECRET_KEY=your-secret-key-here
+DEBUG=True
+ALLOWED_HOSTS=localhost,127.0.0.1
+```
 
 ---
 
-## 5. GitHub setup
+## AWS IAM Setup
 
-1. GitHub → Settings → Developer settings → **OAuth Apps → New OAuth App**
-   - Homepage URL: `http://localhost:5173`
-   - Authorization callback URL: `http://localhost:8000/api/github/oauth/callback`
-2. Put the client id/secret in `backend/.env`.
-3. `GITHUB_TOKEN_ENCRYPTION_KEY` must be a valid Fernet key:
-   ```bash
-   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-   ```
-4. Flow: **Files & GitHub → Connect GitHub** → `/api/github/oauth/start` →
-   GitHub → `/api/github/oauth/callback` → JWT issued, `GitHubConnection`
-   row created with encrypted token + scopes.
+CloudWise never stores AWS access keys. Each user creates an IAM role in their own AWS account and gives CloudWise the role ARN. CloudWise assumes it with STS using a per-user external ID (confused-deputy protection).
 
----
+**Step 1** — In the CloudWise UI, go to **Connect AWS** and click **Start AWS Setup**. Copy the External ID and Trust Policy shown.
 
-## 6. AWS / IAM setup
+**Step 2** — In your AWS console: IAM → Roles → Create role → AWS account → Another AWS account. Enter the CloudWise trusted account ID and the External ID condition from the Trust Policy.
 
-CloudWise never stores AWS keys. Each user creates (or reuses) an IAM role in
-**their own** account and gives CloudWise the role ARN; CloudWise assumes it
-with STS using a per-user **external id** (confused-deputy protection).
+**Step 3** — Create a new IAM policy named `CloudWiseDeployPolicy` using the Permissions Policy JSON shown in the UI. Attach it to the role.
 
-1. **Connect AWS → GET `/api/aws/connect-info`** returns
-   - `externalId` (unique per user)
-   - `trustPolicy` (role trust with `sts:ExternalId` condition)
-   - `permissionsPolicy` (least-privilege, see below)
-2. In the user's AWS console: IAM → Roles → Create role → **AWS account →
-   Another AWS account** → paste `AWS_TRUSTED_ACCOUNT_ID` and the
-   `trustPolicy` condition → attach the returned `permissionsPolicy`.
-3. Paste the role ARN into CloudWise → **POST `/api/aws/connect`** →
-   `sts:AssumeRole` is called immediately to validate it; only
-   `role_arn`, `external_id`, `account_id`, `region`, `status` are stored.
+**Step 4** — Copy the role ARN and paste it into CloudWise → **Verify & Connect AWS**. CloudWise performs a real STS AssumeRole + permission probe before saving the connection.
 
-Permissions granted (no `*`, no `AdministratorAccess`):
+Permissions granted (least privilege, no `*` admin):
 
-```
-ec2:Describe*  |  ec2:RunInstances  ec2:Start/Stop/Reboot/TerminateInstances
-ec2:CreateTags |  ec2:CreateSecurityGroup  ec2:Authorize/RevokeSecurityGroup*
-ec2:ModifyInstanceAttribute
-ssm:SendCommand, ssm:GetCommandInvocation, ssm:Describe*      (file upload + compose)
-iam:PassRole → arn:aws:iam::*:role/cloudwise-ec2-*            (only to EC2)
-```
-
-Instances are tagged `ManagedBy=CloudWise` (plus `CloudWiseUser`,
-`CloudWiseDeployment`, `Environment`); `terminate_instance()` refuses to
-terminate anything not carrying that tag.
+- `ec2:Describe*`, `ec2:RunInstances`, `ec2:Start/Stop/Reboot/TerminateInstances`
+- `ec2:CreateTags`, `ec2:CreateSecurityGroup`, `ec2:Authorize/RevokeSecurityGroupIngress`
+- `ec2:AllocateAddress`, `ec2:AssociateAddress`
+- `ssm:SendCommand`, `ssm:GetCommandInvocation`, `ssm:Describe*`
+- `iam:PassRole` scoped to `arn:aws:iam::*:role/cloudwise-ec2-*`
 
 ---
 
-## 7. API endpoints
+## API Reference
 
-All deployment endpoints require `Authorization: Bearer <JWT>` and are scoped
-to `request.user` — a record owned by anyone else returns **404** (no
-existence leak).
+All endpoints are prefixed with `/api/`. Endpoints marked **Auth** require `Authorization: Bearer <JWT>`.
 
-| Method | Endpoint | Purpose |
+### Authentication
+
+| Method | Endpoint | Description |
 |---|---|---|
-| `POST` | `/api/deploy` | Validate (PROJECT/GITHUB/ENVIRONMENT/AWS) → create record → **201** with `deployment_id`, `stage: QUEUED` |
-| `GET` | `/api/deployments` | My deployments, newest first (`?limit=`) — no log payload |
-| `GET` | `/api/deployments/<id>` | Full details incl. logs, `progress`, `openUrl` |
-| `GET` | `/api/deployments/<id>/status` | Record state while in-flight; live `ec2:DescribeInstances` once running |
-| `GET` | `/api/deployments/<id>/logs` | Structured logs (`timestamp`, `level`, `stage`, `message`) |
-| `POST` | `/api/deployments/<id>/health` | Real `GET` against `live_url` → `detail.httpStatus`, `detail.latencyMs` |
-| `POST` | `/api/deployments/<id>/retry` | Re-run from `FAILED`/`ROLLED_BACK` (**409** otherwise); `envVars` must be re-sent |
-| `POST` | `/api/deployments/<id>/terminate` | Terminate my EC2 instance → `TERMINATED` |
-| `POST` | `/api/deployments/<id>/rollback` | Stop app containers, keep instance → `ROLLED_BACK` |
-| `GET` | `/api/monitoring` | My latest deployment's real telemetry; unmeasured metrics are `null` + `metricsCollected: false` |
+| `POST` | `/auth/signup` | Register a new user |
+| `POST` | `/auth/login` | Sign in, receive JWT |
 
-Retired (`400 status=RETIRED`, `supported: ["AWS"]`): any deploy request with
-`provider: Vercel` or `provider: Render`, and
-`POST /api/deployment/generate-files` with a non-AWS provider.
+### Projects — Auth required
 
-Canonical response fields:
-`deploymentId, deploymentStatus, progress, providerType, repository, commitSha,
-projectType, awsAccountId, region, instanceId, instanceType, ipAddress,
-liveUrl, openUrl, failureStage, logs, createdAt, updatedAt, pipelineInFlight`.
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/projects` | List projects owned by the authenticated user |
+| `POST` | `/projects` | Create a new project |
+| `GET` | `/projects/<id>` | Get project detail |
+| `PUT` | `/projects/<id>` | Update project (name, step, estimation, recommendation, deployment, optimizations) |
+| `DELETE` | `/projects/<id>` | Delete project (owner/admin only) |
+| `POST` | `/projects/<id>/github` | Link a GitHub repository to the project |
+| `POST` | `/projects/<id>/github/inspect` | Recursively inspect the linked repository |
+| `POST` | `/projects/<id>/github/push` | Commit generated files to the repository |
+
+### Deployment — Auth required
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/deploy` | Start a real deployment to AWS EC2 |
+| `POST` | `/deploy/preflight` | Validate all prerequisites without creating a record |
+| `GET` | `/deployments` | List the authenticated user's deployments |
+| `GET` | `/deployments/<id>` | Full deployment detail including logs |
+| `GET` | `/deployments/<id>/status` | Current status + live EC2 state |
+| `GET` | `/deployments/<id>/logs` | Structured deployment logs |
+| `POST` | `/deployments/<id>/health` | Real HTTP health check against the live URL |
+| `POST` | `/deployments/<id>/retry` | Re-run a failed deployment |
+| `POST` | `/deployments/<id>/stop` | Stop the EC2 instance (instance retained) |
+| `POST` | `/deployments/<id>/start` | Start a stopped EC2 instance |
+| `POST` | `/deployments/<id>/terminate` | Terminate the EC2 instance |
+| `POST` | `/deployments/<id>/rollback` | Stop containers, keep instance |
+
+### AWS Connection — Auth required
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/aws/connect-info` | Get External ID, Trust Policy, and Permissions Policy |
+| `POST` | `/aws/verify` | Probe IAM role (identity, permissions, region) |
+| `POST` | `/aws/connect` | Save verified AWS connection |
+| `GET` | `/aws/connection` | Get current AWS connection status |
+| `POST` | `/aws/disconnect` | Remove AWS connection |
+
+### MongoDB Atlas — Auth required
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/atlas/connection` | Get Atlas connection status |
+| `POST` | `/atlas/connect` | Connect Atlas (server config or manual API key) |
+| `POST` | `/atlas/disconnect` | Remove Atlas connection |
+
+### GitHub OAuth
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/github/oauth/start` | Begin OAuth flow, returns authorization URL |
+| `GET` | `/github/oauth/callback` | OAuth callback, stores token, redirects to frontend |
+| `GET` | `/github/repos` | List authenticated user's GitHub repositories |
+
+### Other
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/estimate` | Calculate infrastructure cost estimate |
+| `POST` | `/deployment/generate-files` | Generate Dockerfile, compose, and CI/CD files |
+| `GET` | `/monitoring` | Live monitoring data for the latest deployment |
+| `GET` | `/pricing/aws` | AWS instance pricing snapshot |
+| `POST` | `/contact` | Submit a contact inquiry |
+| `POST` | `/waitlist` | Subscribe to the waitlist |
+| `GET` | `/health` | API health check |
 
 ---
 
-## 8. Commands
+## Deployment Status Lifecycle
+
+```
+QUEUED → PREPARING → BUILDING → DEPLOYING → HEALTH_CHECK → RUNNING
+```
+
+Terminal states: `FAILED`, `ROLLING_BACK`, `ROLLED_BACK`, `TERMINATED`
+
+All transitions are validated by a state machine. Progress percentage is derived deterministically from status — never animated by a client-side timer.
+
+---
+
+## Database Models
+
+| Model | Purpose |
+|---|---|
+| `CustomUser` | Extended Django user with `company` and `role` fields |
+| `Project` | User-owned project with JSON fields for estimation, recommendation, deployment, and optimizations |
+| `EstimationRecord` | Persisted estimation inputs and calculated results |
+| `DeploymentRecord` | Full deployment record with FKs to user, project, GitHub connection, AWS connection, and EC2 instance |
+| `GitHubConnection` | One-to-one GitHub OAuth connection per user with encrypted access token |
+| `AWSConnection` | One-to-one AWS IAM role connection per user (no keys stored) |
+| `EC2Instance` | CloudWise-managed EC2 instance, reused across deployments |
+| `MongoDBAtlasConnection` | Atlas API credentials per user with encrypted client secret |
+| `WaitlistSubscriber` | Email waitlist |
+| `ContactInquiry` | Contact form submissions |
+
+---
+
+## Running Tests
 
 ```bash
-# Backend
 cd backend
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-.\.venv\Scripts\pip.exe install -r requirements.txt
-cp .env.example .env                    # then fill in credentials
-python manage.py migrate
-python manage.py runserver 127.0.0.1:8000
-
-# Tests (248)
 python manage.py test api
+```
 
-# Frontend
-cd ..\frontend
-npm install
-npm run dev                             # http://localhost:5173
-npm run build                           # tsc + vite build
+Tests always use SQLite regardless of the `DATABASE_URL` environment variable. The test suite covers authentication, project CRUD, user isolation, RBAC enforcement, GitHub OAuth flow, repository inspection, deployment file generation, tech stack detection, AWS connection service, EC2 lifecycle, deployment state machine, and free-tier policy.
+
+---
+
+## Frontend Build
+
+```bash
+cd frontend
+npm run build   # TypeScript check + Vite production build
 ```
 
 ---
 
-## 9. Manual end-to-end test procedure
+## Security Notes
 
-Setup: backend on `:8000`, frontend on `:5173`, `.env` filled in.
-
-1. **Auth** — Sign up at `/auth`. Refresh: you stay signed in (JWT).
-2. **GitHub** — *Files & GitHub → Connect GitHub*, authorize, pick a repo.
-   Repository appears; analysis shows detected stack.
-3. **Generate files** — *Generate* → Dockerfile / docker-compose / nginx
-   listed. No `vercel.json`, no `render.yaml`.
-4. **Estimate → Recommend** — choose a spec; note the region.
-5. **Connect AWS** — *Connect AWS* → copy the external id + policies →
-   create the role in **your** AWS account → paste the role ARN → Connect.
-   Banner shows account id + region; **no access keys stored**.
-6. **Configure env vars** — upload `.env` or add keys manually → *Confirm Env*.
-7. **Deploy** — click *Deploy to AWS EC2*.
-   201 returned; readiness checklist moves through
-   `GitHub → Repository → AWS → Deployment (provisioning → deploying →
-   health check → live)`, and the terminal prints real log lines
-   (`assuming IAM role via STS …`, `Provisioning EC2 capacity …`,
-   `Containers live at http://…`).
-8. **Verify in AWS console** — an EC2 instance appears, tagged
-   `ManagedBy=CloudWise`, with a security group opening the app port.
-9. **Live URL** — when the checklist reaches *Live*, click **Open Live
-   Website**. Your app loads from the EC2 public IP/DNS.
-10. **Deployment details** — *Deployment Details* → `/deployment/<id>`.
-    Repository, Commit, Project type, AWS account, Region, Instance ID,
-    Instance type, Deployment status, Logs, Live URL, Created time.
-11. **Health check** — *Run Health Check* → returns the real HTTP status code
-    and latency.
-12. **Refresh / Monitoring** — *View Live Metrics* → health, burn rate,
-    instance id/type/region, uptime. CPU/memory/storage show
-    **"Not collected"** (no agent). *Probe live URL now* returns a real result.
-13. **Failure path** — remove an IAM permission (e.g. `ec2:RunInstances`) and
-    deploy again → checklist **AWS/Deployment** turns red with the STS/EC2
-    message, record → `FAILED`. Re-grant, click **Retry Failed Deployment**
-    (re-enter env vars) → pipeline restarts on the same record.
-14. **Isolation** — sign in as a second account and open the first account's
-    `/deployment/<id>` → **404** for detail, status, logs, health, retry,
-    terminate and rollback.
-15. **Rollback / Terminate** — *Rollback* keeps the instance
-    (`ROLLED_BACK`); *Terminate Instance* removes it (`TERMINATED`) and the
-    record stays queryable.
+- GitHub OAuth tokens are encrypted at rest using Fernet symmetric encryption. The encryption key is stored only in `backend/.env` and never sent to the browser.
+- AWS access keys are never stored. CloudWise uses STS AssumeRole with a per-user External ID. Temporary credentials are held in memory only and expire automatically.
+- MongoDB Atlas API keys are encrypted at rest using the same Fernet key.
+- JWT tokens are issued with a 7-day lifetime. Refresh tokens rotate on use.
+- All project and deployment endpoints enforce strict user ownership. A record owned by another user returns 404 — no existence leak.
+- `CORS_ALLOW_ALL_ORIGINS = True` is set for local development. In production, set `CORS_ALLOWED_ORIGINS` to the actual frontend domain.
+- No secrets are ever included in API responses, logs, or frontend state.
 
 ---
 
-## 10. Verification
+## Pages & Routes
 
-```text
-backend : python manage.py test api   ->  248 tests, OK
-frontend: npm run build               ->  tsc + vite build, built in 20.46s
-```
-
+| Route | Page | Description |
+|---|---|---|
+| `/` | Home | Landing page with pipeline overview and waitlist |
+| `/auth` | Auth | Sign in / create account |
+| `/projects` | Projects | Project list with live deployment links |
+| `/estimation` | Estimation | Workload sizing form |
+| `/recommendation` | Recommendation | Multi-cloud cost comparison |
+| `/generate` | GenerateFiles | Repository inspection and artifact generation |
+| `/connect-aws` | ConnectAws | AWS IAM role setup and verification |
+| `/connect-atlas` | ConnectAtlas | MongoDB Atlas API key connection |
+| `/deployment` | Deployment | Deploy to AWS EC2 with real-time log stream |
+| `/deployment/:id` | DeploymentDetails | Full deployment record, logs, health check, lifecycle actions |
+| `/monitoring` | Monitoring | Live metrics for the active deployment |
+| `/optimization` | Optimization | Cost optimization recommendations |
+| `/about` | About | Platform information |
+| `/contact` | Contact | Contact form |
