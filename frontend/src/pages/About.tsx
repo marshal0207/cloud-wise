@@ -66,7 +66,7 @@ export const About: React.FC = () => {
       
       {/* Header */}
       <div className="text-center space-y-4 max-w-3xl mx-auto">
-        <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-cyan-500/10 border border-cyan-500/30 text-cyan-300 text-xs font-semibold">
+        <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs font-semibold">
           <Info className="w-3.5 h-3.5" />
           <span>About CloudWise</span>
         </div>
@@ -81,11 +81,11 @@ export const About: React.FC = () => {
       {/* Metric Highlights */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <div className="glass-card p-6 rounded-2xl text-center space-y-1 border border-slate-800">
-          <p className="text-3xl sm:text-4xl font-extrabold text-cyan-400">₹20 Cr+</p>
+          <p className="text-3xl sm:text-4xl font-extrabold text-emerald-400">₹20 Cr+</p>
           <p className="text-xs text-slate-400 font-medium">Cloud Waste Eliminated</p>
         </div>
         <div className="glass-card p-6 rounded-2xl text-center space-y-1 border border-slate-800">
-          <p className="text-3xl sm:text-4xl font-extrabold text-indigo-400">450+</p>
+          <p className="text-3xl sm:text-4xl font-extrabold text-teal-400">450+</p>
           <p className="text-xs text-slate-400 font-medium">Production Clusters Sized</p>
         </div>
         <div className="glass-card p-6 rounded-2xl text-center space-y-1 border border-slate-800">
@@ -127,9 +127,9 @@ export const About: React.FC = () => {
         </div>
 
         {/* Card 2: The CloudWise Solution */}
-        <div className="glass-panel p-8 rounded-3xl space-y-4 border border-cyan-500/30 bg-cyan-950/5">
-          <div className="w-10 h-10 rounded-xl bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center">
-            <Sparkles className="w-5 h-5 text-cyan-400" />
+        <div className="glass-panel p-8 rounded-3xl space-y-4 border border-emerald-500/30 bg-emerald-950/5">
+          <div className="w-10 h-10 rounded-xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center">
+            <Sparkles className="w-5 h-5 text-emerald-400" />
           </div>
           <h3 className="text-2xl font-bold text-white">The CloudWise Solution</h3>
           <p className="text-xs sm:text-sm text-slate-300 leading-relaxed">
@@ -137,15 +137,15 @@ export const About: React.FC = () => {
           </p>
           <ul className="space-y-2.5 text-xs text-slate-400 pt-2">
             <li className="flex items-center gap-2">
-              <CheckCircle2 className="w-4 h-4 text-cyan-400 shrink-0" />
+              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
               <span>Accurate workload sizing algorithm tailored to traffic and memory</span>
             </li>
             <li className="flex items-center gap-2">
-              <CheckCircle2 className="w-4 h-4 text-cyan-400 shrink-0" />
+              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
               <span>Side-by-side multi-cloud provider comparisons with SLA transparency</span>
             </li>
             <li className="flex items-center gap-2">
-              <CheckCircle2 className="w-4 h-4 text-cyan-400 shrink-0" />
+              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
               <span>Continuous 1-click optimization applying savings plans & rightsizing</span>
             </li>
           </ul>
@@ -156,7 +156,7 @@ export const About: React.FC = () => {
       {/* How It Works Process Section */}
       <div className="space-y-8">
         <div className="text-center space-y-2 max-w-2xl mx-auto">
-          <h2 className="text-xs font-bold text-cyan-400 uppercase tracking-widest">Architectural Methodology</h2>
+          <h2 className="text-xs font-bold text-emerald-400 uppercase tracking-widest">Architectural Methodology</h2>
           <h3 className="text-3xl font-extrabold text-white">How CloudWise Operates</h3>
           <p className="text-slate-400 text-xs sm:text-sm">
             Our 5-step pipeline bridges the gap between infrastructure design and live execution.
@@ -170,15 +170,15 @@ export const About: React.FC = () => {
               <div key={step.num} className="glass-card p-5 rounded-2xl space-y-3 flex flex-col justify-between border border-slate-800">
                 <div className="space-y-2">
                   <div className="flex justify-between items-center">
-                    <div className="w-8 h-8 rounded-lg bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center">
-                      <Icon className="w-4 h-4 text-cyan-400" />
+                    <div className="w-8 h-8 rounded-lg bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center">
+                      <Icon className="w-4 h-4 text-emerald-400" />
                     </div>
                     <span className="text-xs font-black text-slate-600">{step.num}</span>
                   </div>
                   <h4 className="text-sm font-bold text-white">{step.title}</h4>
                   <p className="text-[11px] text-slate-400 leading-relaxed">{step.desc}</p>
                 </div>
-                <Link to={step.route} className="inline-flex items-center gap-1 text-[11px] font-bold text-cyan-400 hover:text-cyan-300 pt-2 border-t border-slate-800">
+                <Link to={step.route} className="inline-flex items-center gap-1 text-[11px] font-bold text-emerald-400 hover:text-emerald-300 pt-2 border-t border-slate-800">
                   <span>Explore</span>
                   <ArrowRight size={12} />
                 </Link>
@@ -191,14 +191,14 @@ export const About: React.FC = () => {
       {/* Who It's Built For Section */}
       <div className="glass-panel p-8 sm:p-10 rounded-3xl border border-slate-800 space-y-6">
         <div className="text-center space-y-2">
-          <h2 className="text-xs font-bold text-cyan-400 uppercase tracking-widest">Built For Modern Engineering</h2>
+          <h2 className="text-xs font-bold text-emerald-400 uppercase tracking-widest">Built For Modern Engineering</h2>
           <h3 className="text-2xl sm:text-3xl font-extrabold text-white">Who Benefits from CloudWise</h3>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6 pt-2">
           
           <div className="glass-card p-6 rounded-2xl space-y-3 border border-slate-800">
-            <Users className="w-6 h-6 text-cyan-400" />
+            <Users className="w-6 h-6 text-emerald-400" />
             <h4 className="text-base font-bold text-white">DevOps & Site Reliability Engineers</h4>
             <p className="text-xs text-slate-400 leading-relaxed">
               Eliminate guesswork when launching new microservices. Model exact instance capacity before provisioning production nodes.
@@ -206,7 +206,7 @@ export const About: React.FC = () => {
           </div>
 
           <div className="glass-card p-6 rounded-2xl space-y-3 border border-slate-800">
-            <Globe2 className="w-6 h-6 text-indigo-400" />
+            <Globe2 className="w-6 h-6 text-teal-400" />
             <h4 className="text-base font-bold text-white">SaaS Founders & CTOs</h4>
             <p className="text-xs text-slate-400 leading-relaxed">
               Gain transparent multi-cloud unit economics. Compare AWS, GCP, and Azure rates before scaling your startup.
@@ -225,7 +225,7 @@ export const About: React.FC = () => {
       </div>
 
       {/* Vision CTA Banner */}
-      <div className="glass-panel p-8 sm:p-12 rounded-3xl text-center space-y-6 border border-cyan-500/20 max-w-4xl mx-auto">
+      <div className="glass-panel p-8 sm:p-12 rounded-3xl text-center space-y-6 border border-emerald-500/20 max-w-4xl mx-auto">
         <h3 className="text-2xl sm:text-3xl font-extrabold text-white">
           Our Vision: Transparent, Autonomous Cloud Operations
         </h3>
@@ -236,7 +236,7 @@ export const About: React.FC = () => {
         <div className="pt-2 flex justify-center">
           <Link
             to="/estimation"
-            className="px-8 py-4 rounded-xl bg-gradient-to-r from-cyan-400 to-blue-600 hover:from-cyan-300 hover:to-blue-500 text-slate-950 font-bold text-sm transition-all shadow-xl shadow-cyan-500/20 flex items-center gap-2"
+            className="px-8 py-4 rounded-xl bg-gradient-to-r from-emerald-400 to-blue-600 hover:from-emerald-300 hover:to-blue-500 text-slate-950 font-bold text-sm transition-all shadow-xl shadow-emerald-500/20 flex items-center gap-2"
           >
             <span>Try the CloudWise Workflow</span>
             <ArrowRight size={18} />

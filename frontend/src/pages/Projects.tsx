@@ -1,415 +1,347 @@
 import React, { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { 
-  FolderPlus, 
-  Folder, 
-  Play, 
-  Trash2, 
-  Plus, 
-  ArrowRight, 
-  Shield, 
-  Clock, 
-  CheckCircle2, 
-  Cpu, 
-  Cloud, 
-  X, 
-  AlertCircle,
-  Building2,
-  Sparkles,
-  Zap,
-  Sliders,
-  FileCode,
-  Rocket,
-  Activity,
-  Github,
-  ExternalLink,
-  Globe
+  Github, Search, ShieldCheck, ArrowRight, CheckCircle2, 
+  AlertCircle, LogOut, RefreshCw, Zap, FolderPlus
 } from 'lucide-react';
-import { useCloudWise, formatINR, Project } from '@/context/CloudWiseContext';
+import { useCloudWise } from '@/context/CloudWiseContext';
+
+interface RepositoryDeployment {
+  liveUrl: string;
+  status: string;
+}
 
 export const Projects: React.FC = () => {
   const navigate = useNavigate();
-  const { 
-    projects, 
-    projectsLoading,
-    projectsError,
-    refetchProjects,
-    activeProject, 
-    setActiveProjectById, 
-    createProject, 
-    deleteProject, 
-    user,
-    showToast
-  } = useCloudWise();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const { user, connectGitHub, showToast } = useCloudWise();
 
-  const [showCreateModal, setShowCreateModal] = useState(false);
-  const [name, setName] = useState('');
-  const [description, setDescription] = useState('');
-  const [environment, setEnvironment] = useState('Production');
-  const [role, setRole] = useState<'owner' | 'editor' | 'viewer' | 'admin'>('owner');
-  const [loading, setLoading] = useState(false);
+  const [isConnected, setIsConnected] = useState(false);
+  const [loadingRepos, setLoadingRepos] = useState(true);
+  const [repositories, setRepositories] = useState<any[]>([]);
+  const [repositoryDeployments, setRepositoryDeployments] = useState<Record<string, RepositoryDeployment>>({});
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedRepo, setSelectedRepo] = useState<string | null>(null);
+  const [connecting, setConnecting] = useState(false);
+  const [error, setError] = useState('');
+  const [oauthStarting, setOauthStarting] = useState(false);
 
-  const handleCloseModal = (e?: React.MouseEvent) => {
-    if (e) {
-      e.preventDefault();
-      e.stopPropagation();
+  useEffect(() => {
+    const oauthResult = searchParams.get('github');
+    if (oauthResult === 'connected') {
+      showToast('GitHub account connected successfully!', 'success');
+      searchParams.delete('github');
+      setSearchParams(searchParams, { replace: true });
+    } else if (oauthResult === 'error') {
+      setError('GitHub authorization failed. Please try again.');
+      searchParams.delete('github');
+      searchParams.delete('github_detail');
+      setSearchParams(searchParams, { replace: true });
     }
-    setShowCreateModal(false);
-  };
+    loadRepositories();
+  }, [searchParams, setSearchParams]);
 
-  const handleCreateSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!name.trim()) return;
-
-    setLoading(true);
+  const loadRepositories = async () => {
+    setLoadingRepos(true);
+    setError('');
     try {
-      const created = await createProject({
-        name: name.trim(),
-        description: description.trim(),
-        environment,
-        role
-      });
-
-      if (created) {
-        setShowCreateModal(false);
-        setName('');
-        setDescription('');
-        navigate('/estimation');
+      const token = localStorage.getItem('cloudwise_token');
+      const headers = { Authorization: token ? `Bearer ${token}` : '' };
+      const [repositoriesResponse, deploymentsResponse] = await Promise.all([
+        fetch('/api/github/repos', { headers, credentials: 'include' }),
+        fetch('/api/deployments?limit=100', { headers, credentials: 'include' }),
+      ]);
+      const data = await repositoriesResponse.json().catch(() => null);
+      const deploymentsData = await deploymentsResponse.json().catch(() => null);
+      if (!repositoriesResponse.ok || !data?.success) {
+        setIsConnected(false);
+        setRepositories([]);
+      } else {
+        setIsConnected(true);
+        setRepositories(data.data || []);
+        const deployments = Array.isArray(deploymentsData?.data) ? deploymentsData.data : [];
+        const deploymentMap = deployments.reduce((map: Record<string, RepositoryDeployment>, deployment: any) => {
+          const repository = String(deployment.repository || '').trim();
+          const liveUrl = String(deployment.liveUrl || deployment.openUrl || '').trim();
+          if (repository && liveUrl && !map[repository]) {
+            map[repository] = {
+              liveUrl,
+              status: String(deployment.deploymentStatus || '').toUpperCase(),
+            };
+          }
+          return map;
+        }, {});
+        setRepositoryDeployments(deploymentMap);
       }
     } catch (err: any) {
-      showToast(err.message || 'Failed to create project.', 'error');
+      setIsConnected(false);
+      setRepositories([]);
     } finally {
-      setLoading(false);
+      setLoadingRepos(false);
     }
   };
 
-  const handleResumeWorkflow = (proj: Project) => {
-    setActiveProjectById(proj.id);
-    const routeMap: Record<string, string> = {
-      estimation: '/estimation',
-      recommendation: '/recommendation',
-      generate: '/generate',
-      deployment: '/deployment',
-      optimization: '/optimization'
-    };
-    const targetRoute = routeMap[proj.currentStep] || '/estimation';
-    navigate(targetRoute);
-  };
-
-  const handleDelete = async (e: React.MouseEvent, proj: Project) => {
-    e.stopPropagation();
-    if (confirm(`Are you sure you want to delete project "${proj.name}"?`)) {
-      await deleteProject(proj.id);
+  const handleStartGithubOAuth = async () => {
+    setOauthStarting(true);
+    setError('');
+    try {
+      const token = localStorage.getItem('cloudwise_token');
+      if (!token) throw new Error('Please sign in to CloudWise before connecting your GitHub account.');
+      const response = await fetch('/api/github/oauth/start', {
+        headers: { Authorization: `Bearer ${token}` },
+        credentials: 'include',
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.success || !data?.authorizationUrl) {
+        throw new Error('Unable to start GitHub authorization.');
+      }
+      window.location.assign(data.authorizationUrl);
+    } catch (err: any) {
+      setError(err.message || 'Unable to start GitHub authorization.');
+      setOauthStarting(false);
     }
   };
 
-  const getStepLabel = (step: string) => {
-    switch (step) {
-      case 'estimation':
-        return { label: 'Step 1: Workload Sizing', icon: Cpu, color: 'text-cyan-400 bg-cyan-500/10 border-cyan-500/30' };
-      case 'recommendation':
-        return { label: 'Step 2: Cloud Matched', icon: Sparkles, color: 'text-blue-400 bg-blue-500/10 border-blue-500/30' };
-      case 'generate':
-        return { label: 'Step 3: Files Generated', icon: FileCode, color: 'text-violet-400 bg-violet-500/10 border-violet-500/30' };
-      case 'deployment':
-        return { label: 'Step 4: Provision & Deploy', icon: Rocket, color: 'text-amber-400 bg-amber-500/10 border-amber-500/30' };
-      case 'monitoring':
-        return { label: 'Step 4b: Live Monitoring', icon: Activity, color: 'text-cyan-400 bg-cyan-500/10 border-cyan-500/30' };
-      case 'optimization':
-        return { label: 'Step 5: Cost Tuning', icon: Zap, color: 'text-emerald-400 bg-emerald-500/10 border-emerald-500/30' };
-      default:
-        return { label: 'Step 1: Workload Sizing', icon: Cpu, color: 'text-cyan-400 bg-cyan-500/10 border-cyan-500/30' };
+  const handleContinue = async () => {
+    if (!selectedRepo) return;
+    setConnecting(true);
+    setError('');
+    try {
+      const { projectId, error: connectErr } = await connectGitHub(selectedRepo);
+      if (projectId) {
+        navigate('/estimation');
+      } else {
+        setError(connectErr || 'Failed to link repository.');
+      }
+    } catch (err: any) {
+      setError(err.message || 'Failed to link repository.');
+    } finally {
+      setConnecting(false);
     }
   };
+
+  const filteredRepos = repositories
+    .filter(r => 
+      r.name.toLowerCase().includes(searchQuery.toLowerCase()) || 
+      r.full_name.toLowerCase().includes(searchQuery.toLowerCase())
+    )
+    .sort((first, second) => {
+      const firstDeployment = repositoryDeployments[first.full_name];
+      const secondDeployment = repositoryDeployments[second.full_name];
+      return Number(Boolean(secondDeployment?.liveUrl)) - Number(Boolean(firstDeployment?.liveUrl));
+    });
 
   return (
-    <div className="min-h-screen max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10 space-y-10">
+    <div className="w-full space-y-8 animate-in fade-in duration-500 max-w-5xl mx-auto px-4 sm:px-6">
       
-      {/* Header & Controls */}
-      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 pb-6 border-b border-slate-800">
-        <div className="space-y-1">
-          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-cyan-500/10 border border-cyan-500/30 text-cyan-300 text-xs font-semibold">
-            <Folder className="w-3.5 h-3.5" />
-            <span>Module 2: Project Management</span>
-          </div>
-          <h1 className="text-3xl sm:text-4xl font-extrabold text-white">
-            My Cloud Projects
-          </h1>
-          <p className="text-xs sm:text-sm text-slate-400">
-            Select an existing workflow instance to resume progress or launch a new cloud advisory project.
+      {/* ── HEADER ──────────────────────────────────────────────────────── */}
+      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 border-b border-white/5 pb-6">
+        <div>
+          <h1 className="text-3xl font-black text-white tracking-tight">Projects & GitHub</h1>
+          <p className="text-sm text-slate-400 mt-1 max-w-xl">
+            Select a repository to begin the deployment analysis and cost optimization workflow.
           </p>
         </div>
-
-        <button
-          onClick={() => setShowCreateModal(true)}
-          className="px-5 py-3 rounded-xl bg-gradient-to-r from-cyan-400 to-blue-600 hover:from-cyan-300 hover:to-blue-500 text-slate-950 font-bold text-xs transition-all shadow-lg shadow-cyan-500/20 flex items-center gap-2 active:scale-95 whitespace-nowrap"
-        >
-          <Plus size={16} />
-          <span>Create New Project</span>
-        </button>
+        <div>
+          {isConnected ? (
+            <div className="status-healthy px-3 py-1.5 text-xs font-bold rounded-full flex items-center gap-1.5 border">
+              <ShieldCheck size={14} /> GitHub Connected
+            </div>
+          ) : (
+            <div className="status-idle px-3 py-1.5 text-xs font-bold rounded-full flex items-center gap-1.5 border">
+              GitHub Disconnected
+            </div>
+          )}
+        </div>
       </div>
 
-      {/* Projects List Grid / States */}
-      {projectsLoading ? (
-        <div className="glass-panel p-12 rounded-3xl text-center space-y-4 max-w-lg mx-auto border border-slate-800">
-          <div className="w-10 h-10 border-2 border-cyan-400 border-t-transparent rounded-full animate-spin mx-auto" />
-          <p className="text-xs text-slate-400">Loading your cloud projects from database...</p>
-        </div>
-      ) : projectsError ? (
-        <div className="glass-panel p-8 rounded-3xl text-center space-y-4 max-w-lg mx-auto border border-rose-500/30 bg-rose-500/5">
-          <AlertCircle className="w-10 h-10 text-rose-400 mx-auto" />
-          <h3 className="text-base font-bold text-white">Failed to load projects</h3>
-          <p className="text-xs text-slate-400">{projectsError}</p>
-          <button
-            onClick={() => refetchProjects()}
-            className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-white inline-flex items-center gap-2 border border-slate-700"
-          >
-            <span>Retry</span>
-          </button>
-        </div>
-      ) : projects.length === 0 ? (
-        <div className="glass-panel p-12 rounded-3xl text-center space-y-4 max-w-lg mx-auto border border-slate-800">
-          <div className="w-16 h-16 rounded-2xl bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center mx-auto text-cyan-400">
-            <FolderPlus size={32} />
-          </div>
-          <h3 className="text-xl font-extrabold text-white">No projects yet</h3>
-          <p className="text-xs text-slate-400 leading-relaxed">
-            Create your first cloud infrastructure project to start workload sizing, multi-cloud comparison, Dockerfile generation, and cost tuning.
-          </p>
-          <button
-            onClick={() => setShowCreateModal(true)}
-            className="px-6 py-3.5 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs transition-all shadow-lg shadow-cyan-500/20 inline-flex items-center gap-2"
-          >
-            <Plus size={16} />
-            <span>Create First Project</span>
-          </button>
-        </div>
-      ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-          {projects.map((proj) => {
-            const isCurrentActive = activeProject?.id === proj.id;
-            const stepInfo = getStepLabel(proj.currentStep);
-            const StepIcon = stepInfo.icon;
-            const roleColor = proj.userRole === 'viewer' ? 'bg-amber-500/20 text-amber-300 border-amber-500/40' : 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40';
-
-            return (
-              <motion.div
-                key={proj.id}
-                whileHover={{ y: -4 }}
-                onClick={() => setActiveProjectById(proj.id)}
-                className={`glass-card p-6 rounded-3xl flex flex-col justify-between space-y-6 cursor-pointer border transition-all ${
-                  isCurrentActive
-                    ? 'border-cyan-400 ring-2 ring-cyan-500/30 bg-slate-900/90 shadow-xl shadow-cyan-950/50'
-                    : 'border-slate-800 hover:border-slate-700'
-                }`}
-              >
-                <div className="space-y-4">
-                  {/* Top Bar: Role & Environment */}
-                  <div className="flex justify-between items-start gap-2">
-                    <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider border ${roleColor}`}>
-                      Role: {proj.userRole}
-                    </span>
-
-                    <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 text-[10px] font-semibold border border-slate-700">
-                      {proj.environment}
-                    </span>
-                  </div>
-
-                  {/* Project Name & Description */}
-                  <div>
-                    <h3 className="text-lg font-bold text-white leading-snug flex items-center justify-between">
-                      <span className="truncate">{proj.name}</span>
-                      {isCurrentActive && (
-                        <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse shrink-0 ml-2" title="Active Project" />
-                      )}
-                    </h3>
-                    <p className="text-xs text-slate-400 pt-1 line-clamp-2 leading-relaxed">
-                      {proj.description || 'No description provided'}
-                    </p>
-                    {proj.githubRepo?.name && (
-                      <div className="mt-2.5 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-xl bg-violet-500/10 border border-violet-500/30 text-violet-300 text-xs font-semibold">
-                        <Github size={13} className="shrink-0 text-violet-400" />
-                        <span className="truncate max-w-[200px]">{proj.githubRepo.name}</span>
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Live Deployment Link */}
-                  {proj.deployment?.status === 'deployed' && proj.deployment?.endpointUrl && (
-                    <a
-                      href={proj.deployment.endpointUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      onClick={(e) => e.stopPropagation()}
-                      className="flex items-center gap-2 px-3 py-2 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs font-semibold hover:bg-emerald-500/20 transition-colors"
-                    >
-                      <Globe size={13} className="shrink-0 text-emerald-400" />
-                      <span className="truncate">{proj.deployment.endpointUrl}</span>
-                      <ExternalLink size={11} className="shrink-0 ml-auto" />
-                    </a>
-                  )}
-
-                  {/* Current Step Badge */}
-                  <div className={`p-3 rounded-2xl border flex items-center justify-between text-xs ${stepInfo.color}`}>
-                    <div className="flex items-center gap-2 font-bold">
-                      <StepIcon size={16} />
-                      <span>{stepInfo.label}</span>
-                    </div>
-                  </div>
-
-                  {/* Pricing & Provider Summary */}
-                  <div className="bg-slate-950/60 p-3.5 rounded-2xl border border-slate-800/80 space-y-1 text-xs">
-                    <div className="flex justify-between text-slate-400">
-                      <span>Matched Provider</span>
-                      <span className="font-bold text-cyan-300">{proj.selectedRecommendation?.provider || 'AWS'}</span>
-                    </div>
-                    <div className="flex justify-between text-slate-400 pt-0.5">
-                      <span>Monthly Spend</span>
-                      <span className="font-extrabold text-white">{formatINR(proj.selectedRecommendation?.monthlyCost ?? proj.estimation?.calculatedResult?.minCost ?? 0)}/mo</span>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Actions Bar */}
-                <div className="flex items-center gap-3 pt-4 border-t border-slate-800/80">
-                  <button
-                    onClick={() => handleResumeWorkflow(proj)}
-                    className="flex-1 py-3 rounded-xl bg-gradient-to-r from-cyan-400 via-cyan-500 to-blue-600 hover:from-cyan-300 hover:to-blue-500 text-slate-950 font-bold text-xs transition-all shadow-md shadow-cyan-500/20 flex items-center justify-center gap-1.5 active:scale-95"
-                  >
-                    <Play size={14} fill="currentColor" />
-                    <span>Resume Workflow</span>
-                  </button>
-
-                  <button
-                    onClick={(e) => handleDelete(e, proj)}
-                    title="Delete Project"
-                    className="p-3 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-400 hover:text-rose-400 transition-colors"
-                  >
-                    <Trash2 size={16} />
-                  </button>
-                </div>
-
-              </motion.div>
-            );
-          })}
-        </div>
+      {error && (
+        <motion.div initial={{ opacity: 0, y: -6 }} animate={{ opacity: 1, y: 0 }} className="p-4 rounded-xl status-failed border text-sm flex items-center gap-3">
+          <AlertCircle size={16} className="shrink-0" />
+          <span className="font-medium">{error}</span>
+        </motion.div>
       )}
 
-      {/* Create Project Modal */}
-      <AnimatePresence>
-        {showCreateModal && (
-          <div 
-            className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md"
-            onClick={handleCloseModal}
-          >
-            <motion.div
-              initial={{ opacity: 0, scale: 0.95 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.95 }}
-              onClick={(e) => e.stopPropagation()}
-              className="glass-panel max-w-lg w-full p-6 sm:p-8 rounded-3xl space-y-6 border border-slate-700 shadow-2xl relative"
-            >
-              <button
-                type="button"
-                onClick={handleCloseModal}
-                aria-label="Close modal"
-                className="absolute top-5 right-5 text-slate-400 hover:text-white p-1.5 rounded-lg bg-slate-900 border border-slate-800 cursor-pointer z-10"
-              >
-                <X size={18} />
-              </button>
+      {/* ── MAIN CONTENT ────────────────────────────────────────────────── */}
+      {!isConnected && !loadingRepos ? (
+        <motion.div 
+          initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}
+          className="glass-card rounded-[2rem] p-12 sm:p-16 flex flex-col items-center justify-center text-center space-y-6 relative overflow-hidden group mt-10"
+        >
+          <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_top,rgba(16,185,129,0.1),transparent_50%)] pointer-events-none" />
+          
+          <div className="w-20 h-20 rounded-full bg-[#05080D] border border-white/10 flex items-center justify-center text-white shadow-xl shadow-emerald-500/10 relative">
+            <div className="absolute inset-0 rounded-full border border-emerald-500/30 animate-[spin_4s_linear_infinite]" />
+            <Github size={32} />
+          </div>
 
-              <div className="space-y-1">
-                <div className="inline-flex items-center gap-1.5 text-xs font-bold text-cyan-400 uppercase tracking-wider">
-                  <FolderPlus size={14} />
-                  <span>Module 2: Project Setup</span>
-                </div>
-                <h3 className="text-2xl font-extrabold text-white">Create New Cloud Project</h3>
-                <p className="text-xs text-slate-400">
-                  Initialize a new workload instance to model specs, compare multi-cloud costs, generate deployment code, and tune spend.
+          <div className="space-y-2 max-w-sm">
+            <h2 className="text-2xl font-bold text-white">Connect GitHub</h2>
+            <p className="text-sm text-slate-400 leading-relaxed">
+              CloudWise needs access to your repositories to analyze your stack and generate Docker configuration files.
+            </p>
+          </div>
+
+          <button
+            onClick={handleStartGithubOAuth}
+            disabled={oauthStarting}
+            className="btn-primary mt-4"
+          >
+            {oauthStarting ? <RefreshCw size={16} className="animate-spin" /> : <Github size={16} />}
+            <span>{oauthStarting ? 'Connecting...' : 'Authorize GitHub'}</span>
+          </button>
+        </motion.div>
+
+      ) : loadingRepos ? (
+        <div className="py-24 flex flex-col items-center justify-center space-y-4">
+          <RefreshCw size={24} className="animate-spin text-emerald-400" />
+          <p className="text-sm text-slate-400 font-medium">Syncing GitHub repositories...</p>
+        </div>
+      ) : (
+        <div className="space-y-8">
+          
+          {/* Account Card */}
+          <motion.div 
+            initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}
+            className="cw-card p-5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4"
+          >
+            <div className="flex items-center gap-4">
+              <div className="w-12 h-12 rounded-full bg-slate-800 flex items-center justify-center text-slate-300">
+                <Github size={20} />
+              </div>
+              <div>
+                <h3 className="text-white font-bold text-base">{user?.name || 'GitHub User'}</h3>
+                <p className="text-slate-400 text-[11px] font-medium flex items-center gap-1.5 uppercase tracking-wider mt-0.5">
+                  <span className="pulse-dot"><span className="w-1.5 h-1.5 rounded-full bg-emerald-400" /></span>
+                  Connected via OAuth
                 </p>
               </div>
+            </div>
+            <button 
+              onClick={() => { setIsConnected(false); setRepositories([]); }}
+              className="btn-ghost"
+            >
+              <LogOut size={14} /> Disconnect
+            </button>
+          </motion.div>
 
-              <form onSubmit={handleCreateSubmit} className="space-y-4">
-                
-                <div className="space-y-1.5">
-                  <label className="text-xs font-bold text-slate-300">Project Name *</label>
-                  <input
-                    type="text"
-                    required
-                    placeholder="e.g. Payment Gateway Microservice"
-                    value={name}
-                    onChange={(e) => setName(e.target.value)}
-                    className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-4 py-3 text-xs text-white focus:outline-none focus:border-cyan-400"
-                  />
-                </div>
+          {/* Repositories Grid */}
+          <div className="space-y-6">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <h2 className="text-lg font-bold text-white flex items-center gap-2">
+                <FolderPlus size={18} className="text-emerald-400" /> Repository Catalog
+              </h2>
+              <div className="relative w-full sm:w-72">
+                <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
+                <input 
+                  type="text"
+                  placeholder="Search repositories..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="cw-input pl-10"
+                />
+              </div>
+            </div>
 
-                <div className="space-y-1.5">
-                  <label className="text-xs font-bold text-slate-300">Project Description</label>
-                  <textarea
-                    rows={3}
-                    placeholder="e.g. Production cluster workload for real-time payment transaction processing..."
-                    value={description}
-                    onChange={(e) => setDescription(e.target.value)}
-                    className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-4 py-2.5 text-xs text-white focus:outline-none focus:border-cyan-400"
-                  />
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                  <div className="space-y-1.5">
-                    <label className="text-xs font-bold text-slate-300">Environment</label>
-                    <select
-                      value={environment}
-                      onChange={(e) => setEnvironment(e.target.value)}
-                      className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-3.5 py-2.5 text-xs text-white focus:outline-none focus:border-cyan-400"
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              {filteredRepos.length > 0 ? (
+                filteredRepos.map((repo) => {
+                  const isSelected = selectedRepo === repo.full_name;
+                  const deployment = repositoryDeployments[repo.full_name];
+                  return (
+                    <motion.div
+                      key={repo.id}
+                      whileHover={{ y: -2 }}
+                      onClick={() => setSelectedRepo(repo.full_name)}
+                      className={`relative p-5 cursor-pointer transition-all duration-300 flex flex-col justify-between min-h-[140px] overflow-hidden ${
+                        isSelected 
+                          ? 'cw-card border-emerald-500/50 shadow-lg shadow-emerald-500/10 bg-emerald-950/10 glow-emerald' 
+                          : 'cw-card-hover'
+                      }`}
                     >
-                      <option value="Production">Production</option>
-                      <option value="Staging">Staging</option>
-                      <option value="QA / Dev">QA / Dev</option>
-                    </select>
-                  </div>
+                      {isSelected && (
+                        <div className="absolute top-0 right-0 p-3">
+                          <CheckCircle2 size={16} className="text-emerald-400" />
+                        </div>
+                      )}
+                      
+                      <div>
+                        <div className="flex items-center gap-2 text-slate-400 mb-2">
+                          <Github size={14} />
+                          <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-slate-700 bg-slate-800/50">
+                            {repo.default_branch || 'main'}
+                          </span>
+                        </div>
+                        <h3 className={`font-bold text-[15px] truncate pr-6 ${isSelected ? 'text-emerald-300' : 'text-white'}`}>
+                          {repo.name}
+                        </h3>
+                        <p className="text-[11px] text-slate-500 mt-1 truncate">
+                          {repo.full_name}
+                        </p>
+                        {deployment?.liveUrl && (
+                          <a
+                            href={deployment.liveUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            onClick={(event) => event.stopPropagation()}
+                            className="mt-2 block truncate text-[11px] font-semibold text-cyan-300 hover:text-cyan-200"
+                          >
+                            Live: {deployment.liveUrl}
+                          </a>
+                        )}
+                      </div>
 
-                  <div className="space-y-1.5">
-                    <label className="text-xs font-bold text-slate-300">Your Access Role (RBAC)</label>
-                    <select
-                      value={role}
-                      onChange={(e) => setRole(e.target.value as any)}
-                      className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-3.5 py-2.5 text-xs text-white focus:outline-none focus:border-cyan-400"
-                    >
-                      <option value="owner">Owner (Full Read/Write/Delete)</option>
-                      <option value="editor">Editor (Can edit/deploy)</option>
-                      <option value="viewer">Viewer (Read-only Gated)</option>
-                      <option value="admin">Admin (Full Control)</option>
-                    </select>
-                  </div>
+                      <div className="mt-4 pt-4 border-t border-slate-800/60 flex items-center justify-between">
+                        <span className="text-[10px] text-emerald-400/80 flex items-center gap-1 font-semibold uppercase tracking-wider">
+                          <Zap size={10} /> {deployment?.liveUrl ? 'Deployed' : 'Compatible'}
+                        </span>
+                        {isSelected ? (
+                          <span className="text-[11px] font-bold text-emerald-400">SELECTED</span>
+                        ) : (
+                          <span className="text-[11px] font-bold text-slate-500 hover:text-white transition-colors">
+                            SELECT →
+                          </span>
+                        )}
+                      </div>
+                    </motion.div>
+                  );
+                })
+              ) : (
+                <div className="col-span-full py-16 text-center border border-dashed border-white/10 rounded-2xl bg-white/[0.02]">
+                  <p className="text-slate-500 text-sm">No repositories found matching "{searchQuery}"</p>
                 </div>
-
-                <div className="pt-2 flex gap-3">
-                  <button
-                    type="submit"
-                    disabled={loading}
-                    className="flex-1 py-3.5 rounded-xl bg-gradient-to-r from-cyan-400 via-cyan-500 to-blue-600 hover:from-cyan-300 hover:to-blue-500 text-slate-950 font-bold text-xs transition-all shadow-lg shadow-cyan-500/20 flex items-center justify-center gap-2 active:scale-98 disabled:opacity-50"
-                  >
-                    <Sparkles size={16} />
-                    <span>{loading ? 'Initializing Project...' : 'Initialize Project Workflow'}</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={handleCloseModal}
-                    className="px-4 py-3.5 rounded-xl bg-slate-900 border border-slate-800 text-slate-300 font-semibold text-xs hover:bg-slate-800 cursor-pointer"
-                  >
-                    Cancel
-                  </button>
-                </div>
-
-              </form>
-
-            </motion.div>
+              )}
+            </div>
           </div>
-        )}
-      </AnimatePresence>
+          
+          {/* Action Bar */}
+          <AnimatePresence>
+            {selectedRepo && (
+              <motion.div
+                initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 20 }}
+                className="fixed bottom-6 left-1/2 -translate-x-1/2 z-40 w-[96%] max-w-3xl"
+              >
+                <div className="glass-panel border-emerald-500/30 p-3 rounded-2xl shadow-2xl flex items-center justify-between gap-4">
+                  <div className="px-3 min-w-0">
+                    <p className="text-[10px] text-emerald-400 font-bold uppercase tracking-widest">Active Selection</p>
+                    <p className="text-sm text-white font-bold truncate">{selectedRepo}</p>
+                  </div>
+                  <button
+                    onClick={handleContinue}
+                    disabled={connecting}
+                    className="btn-primary shrink-0"
+                  >
+                    {connecting ? <RefreshCw size={16} className="animate-spin" /> : <ArrowRight size={16} />}
+                    <span>{connecting ? 'Processing...' : 'Run Estimation'}</span>
+                  </button>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
 
+        </div>
+      )}
     </div>
   );
 };

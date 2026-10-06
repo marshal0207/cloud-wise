@@ -120,26 +120,167 @@ SIMPLE_JWT = {
     'AUTH_HEADER_TYPES': ('Bearer', 'cw_token'),
 }
 
+# ---------------------------------------------------------------------------
 # GitHub OAuth configuration. Keep the client secret server-side only.
+#
+# Every value comes from the environment (see backend/.env.example). Nothing
+# about a GitHub account, token, repository or CloudWise user id is hardcoded.
+#
+# GITHUB_REDIRECT_URI must EXACTLY match the "Authorization callback URL"
+# configured on the GitHub OAuth App (GitHub rejects any other value with
+# `redirect_uri_mismatch`). For local development the canonical value is:
+#     http://localhost:8000/api/github/oauth/callback
+# ---------------------------------------------------------------------------
 GITHUB_CLIENT_ID = os.getenv('GITHUB_CLIENT_ID', '')
 GITHUB_CLIENT_SECRET = os.getenv('GITHUB_CLIENT_SECRET', '')
 GITHUB_REDIRECT_URI = os.getenv(
     'GITHUB_REDIRECT_URI',
-    'http://127.0.0.1:8000/api/github/oauth/callback'
+    'http://localhost:8000/api/github/oauth/callback'
+).strip()
+# Space separated OAuth scopes requested from GitHub.
+#   repo         -> read/write private + public repositories
+#   workflow     -> push files into .github/workflows
+GITHUB_OAUTH_SCOPES = os.getenv('GITHUB_OAUTH_SCOPES', 'repo workflow').strip() or 'repo workflow'
+FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:5173').rstrip('/')
+# Symmetric key used to encrypt stored GitHub access tokens.
+# Falls back to SECRET_KEY when unset (see api.services.token_encryption).
+GITHUB_TOKEN_ENCRYPTION_KEY = os.getenv('GITHUB_TOKEN_ENCRYPTION_KEY', '')
+# OAuth state (CSRF) validity window, in seconds.
+GITHUB_OAUTH_STATE_MAX_AGE = int(os.getenv('GITHUB_OAUTH_STATE_MAX_AGE', '600'))
+
+# Retired deployment targets (Vercel, Render) are no longer supported.
+# CloudWise deploys to AWS EC2 only; their credentials are intentionally
+# not read anywhere in the application.
+
+# When True the AWS deployment pipeline runs synchronously inside the
+# request thread instead of on a background thread. The test suite sets
+# this so deployment outcomes are deterministic; production leaves it
+# False so POST /api/deploy returns immediately and the client polls
+# GET /api/deployments/<id>/status.
+DEPLOYMENT_RUN_INLINE = os.getenv('DEPLOYMENT_RUN_INLINE', '').lower() in ('1', 'true', 'yes')
+
+# ------------------------------------------------------------------
+# AWS account connection (Part 3) — IAM role + STS temporary credentials
+#
+# CloudWise platform deployer credentials (server-side only). Used ONLY to
+# call sts:AssumeRole into the USER's AWS account. Users never provide
+# permanent AWS access keys; a connection stores only a Role ARN + External
+# ID, and short-lived STS credentials are obtained per operation in memory.
+# When unset, boto3's default credential chain (env vars / instance role)
+# is used.
+# ------------------------------------------------------------------
+AWS_DEPLOYER_ACCESS_KEY_ID = os.getenv('AWS_DEPLOYER_ACCESS_KEY_ID', '')
+AWS_DEPLOYER_SECRET_ACCESS_KEY = os.getenv('AWS_DEPLOYER_SECRET_ACCESS_KEY', '')
+AWS_DEPLOYER_REGION = os.getenv('AWS_DEPLOYER_REGION', 'us-east-1')
+AWS_ROLE_SESSION_NAME = os.getenv('AWS_ROLE_SESSION_NAME', 'cloudwise-deploy')
+AWS_ROLE_DURATION_SECONDS = int(os.getenv('AWS_ROLE_DURATION_SECONDS', '3600'))
+# AWS account id that appears in the user's role trust policy.
+# Empty -> auto-detected from the deployer credentials via sts:GetCallerIdentity.
+AWS_TRUSTED_ACCOUNT_ID = os.getenv('AWS_TRUSTED_ACCOUNT_ID', '')
+
+# EC2 provisioning configuration (configurable — never hardcoded in the provider)
+AWS_DEFAULT_REGION = os.getenv('AWS_DEFAULT_REGION', 'ap-south-1')
+AWS_EC2_INSTANCE_TYPE = os.getenv('AWS_EC2_INSTANCE_TYPE', 't3.micro')
+AWS_EC2_AMI_ID = os.getenv('AWS_EC2_AMI_ID', '')
+AWS_EC2_AMI_SSM_PARAMETER = os.getenv(
+    'AWS_EC2_AMI_SSM_PARAMETER',
+    '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64',
 )
-FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:5173')
+AWS_EC2_KEY_NAME = os.getenv('AWS_EC2_KEY_NAME', '')
+AWS_EC2_INSTANCE_PROFILE = os.getenv('AWS_EC2_INSTANCE_PROFILE', '')
+AWS_EC2_ROOT_VOLUME_GB = int(os.getenv('AWS_EC2_ROOT_VOLUME_GB', '30'))
+AWS_EC2_WAIT_FOR_RUNNING = os.getenv('AWS_EC2_WAIT_FOR_RUNNING', 'true').lower() in ('1', 'true', 't')
+AWS_EC2_WAIT_TIMEOUT_SECONDS = int(os.getenv('AWS_EC2_WAIT_TIMEOUT_SECONDS', '300'))
 
-# Vercel deployment credentials (server-side only — never expose to frontend)
-VERCEL_TOKEN = os.getenv('VERCEL_TOKEN', '')
-VERCEL_TEAM_ID = os.getenv('VERCEL_TEAM_ID', '')  # optional, for team-owned projects
+# Stable public IP: attach an Elastic IP to each deployment instance so the
+# address stays the same across rebuilds and a database network access list
+# (MongoDB Atlas, Postgres, ...) keeps matching. Optional — when disabled,
+# or when the role lacks the ec2:*Address permissions, the pipeline keeps
+# using the instance's dynamic public IP.
+AWS_USE_ELASTIC_IP = os.getenv('AWS_USE_ELASTIC_IP', 'true').lower() in ('1', 'true', 't')
 
-# Render deployment credentials (server-side only — never expose to frontend)
-RENDER_API_KEY = os.getenv('RENDER_API_KEY', '')
-RENDER_OWNER_ID = os.getenv('RENDER_OWNER_ID', '')  # user or team owner ID from Render dashboard
+# ---------------------------------------------------------------------------
+# MongoDB Atlas Network Access (optional automation)
+#
+# These are *Atlas administration* credentials for the CloudWise operator —
+# they are completely separate from the application's MongoDB connection
+# string, which stays in the deployment environment and is never logged.
+#
+# When all three are set, CloudWise adds a narrow <public-ip>/32 entry to the
+# project's Atlas access list after the instance gets its address. When they
+# are not set, nothing is faked: the deployment reports that Atlas Network
+# Access must allow the EC2 public IP instead.
+# ---------------------------------------------------------------------------
+MONGODB_ATLAS_PUBLIC_KEY = os.getenv('MONGODB_ATLAS_PUBLIC_KEY', '')
+MONGODB_ATLAS_PRIVATE_KEY = os.getenv('MONGODB_ATLAS_PRIVATE_KEY', '')
+MONGODB_ATLAS_PROJECT_ID = os.getenv('MONGODB_ATLAS_PROJECT_ID', '')
+MONGODB_ATLAS_AUTO_ALLOWLIST = os.getenv(
+    'MONGODB_ATLAS_AUTO_ALLOWLIST', 'true'
+).lower() in ('1', 'true', 't')
 
-# CORS Configuration
-CORS_ALLOW_ALL_ORIGINS = True
+# Security group — only these ports are ever opened publicly (80/443/22).
+# Application ports (3000/8000/8080...) are intentionally NOT exposed.
+AWS_SECURITY_GROUP_NAME = os.getenv('AWS_SECURITY_GROUP_NAME', 'cloudwise-sg')
+AWS_SECURITY_GROUP_PORTS = [
+    int(p.strip())
+    for p in os.getenv('AWS_SECURITY_GROUP_PORTS', '80,443,22').split(',')
+    if p.strip()
+]
+AWS_SECURITY_GROUP_HTTP_CIDR = os.getenv('AWS_SECURITY_GROUP_HTTP_CIDR', '0.0.0.0/0')
+AWS_SECURITY_GROUP_SSH_CIDR = os.getenv('AWS_SECURITY_GROUP_SSH_CIDR', '0.0.0.0/0')
+
+# Install Docker + Docker Compose on first boot via EC2 user data
+AWS_INSTALL_DOCKER = os.getenv('AWS_INSTALL_DOCKER', 'true').lower() in ('1', 'true', 't')
+
+# Container deployment via SSM RunShellScript (Part 4)
+# Remote project root on each EC2 instance (per-project isolation).
+AWS_DEPLOY_ROOT = os.getenv('AWS_DEPLOY_ROOT', '/opt/cloudwise/projects')
+# SSM command polling / timeout (seconds)
+AWS_SSM_POLL_SECONDS = int(os.getenv('AWS_SSM_POLL_SECONDS', '3'))
+AWS_SSM_TIMEOUT_SECONDS = int(os.getenv('AWS_SSM_TIMEOUT_SECONDS', '600'))
+# Post-deploy HTTP health check against the live URL
+AWS_HEALTH_CHECK_RETRIES = int(os.getenv('AWS_HEALTH_CHECK_RETRIES', '30'))
+AWS_HEALTH_CHECK_INTERVAL_SECONDS = float(os.getenv('AWS_HEALTH_CHECK_INTERVAL_SECONDS', '2'))
+AWS_HEALTH_CHECK_TIMEOUT_SECONDS = float(os.getenv('AWS_HEALTH_CHECK_TIMEOUT_SECONDS', '10'))
+# URL schemes accepted for DATABASE_URL / MONGO_URI style values
+AWS_ALLOWED_DB_URL_SCHEMES = (
+    'postgres://', 'postgresql://', 'mysql://', 'mariadb://',
+    'mongodb://', 'mongodb+srv://', 'redis://', 'rediss://',
+    'sqlserver://', 'mysql2://',
+)
+
+# CloudWise repository analysis limits (platform limits, configurable via env).
+# Enforced by api.services.github_repository_service when scanning repositories.
+MAX_REPOSITORY_SIZE_MB = int(os.getenv('MAX_REPOSITORY_SIZE_MB', '500'))
+MAX_FILES = int(os.getenv('MAX_FILES', '10000'))
+MAX_SINGLE_FILE_MB = int(os.getenv('MAX_SINGLE_FILE_MB', '10'))
+MAX_ANALYSIS_TIME_MINUTES = int(os.getenv('MAX_ANALYSIS_TIME_MINUTES', '5'))
+
+# ---------------------------------------------------------------------------
+# CORS / CSRF
+#
+# In local development the Vite dev server proxies /api/* to Django, so the
+# browser talks to a single origin and no CORS headers are needed. When the
+# React app is served from a *different* origin (production build, second
+# dev machine, ...) its origin must be listed explicitly.
+#
+# CORS_ALLOW_ALL_ORIGINS=True together with CORS_ALLOW_CREDENTIALS=True is
+# rejected by browsers (the spec forbids `Access-Control-Allow-Origin: *` on
+# credentialed responses), so the default is an explicit origin whitelist.
+# ---------------------------------------------------------------------------
+DEFAULT_CORS_ORIGINS = [
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+]
+_env_cors_origins = [o.strip() for o in os.getenv('CORS_ALLOWED_ORIGINS', '').split(',') if o.strip()]
+CORS_ALLOWED_ORIGINS = list(dict.fromkeys(
+    _env_cors_origins or ([FRONTEND_URL] if FRONTEND_URL else []) + DEFAULT_CORS_ORIGINS
+))
+CORS_ALLOW_ALL_ORIGINS = os.getenv('CORS_ALLOW_ALL_ORIGINS', 'false').lower() in ('true', '1', 't')
 CORS_ALLOW_CREDENTIALS = True
+CSRF_TRUSTED_ORIGINS = list(CORS_ALLOWED_ORIGINS)
 CORS_ALLOW_HEADERS = [
     'accept',
     'accept-encoding',

@@ -1,5 +1,6 @@
 import base64
 import json
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -10,6 +11,32 @@ class GitHubApiError(RuntimeError):
         super().__init__(message)
         self.status_code = status_code
         self.details = details or message
+
+
+_RATE_LIMIT_STATUS_CODES = {403, 429}
+_MAX_RETRIES = 3
+_INITIAL_RETRY_DELAY = 1.0
+
+
+def _is_rate_limit_response(exc):
+    """Return True when GitHub indicates the API rate limit is exhausted."""
+    if exc.code not in _RATE_LIMIT_STATUS_CODES:
+        return False
+    remaining = exc.headers.get('X-RateLimit-Remaining')
+    if remaining is not None and remaining == '0':
+        return True
+    try:
+        body = json.loads(exc.read().decode(errors='replace') or '{}')
+        return body.get('message', '').lower().startswith('api rate limit')
+    except (ValueError, AttributeError):
+        return False
+
+
+def _read_details(exc):
+    try:
+        return exc.read().decode(errors='replace')
+    except Exception:
+        return str(exc)
 
 
 def normalize_github_repo_url(repo_input):
@@ -63,53 +90,103 @@ def normalize_github_repo_url(repo_input):
         raise ValueError("GitHub repository is missing or not configured.")
 
 
-def _request_json(url, token=None, method='GET', payload=None, allow_404=True, try_unauthenticated_on_401=True):
-    def _make_req(use_token):
+def _request_json(url, token=None, method='GET', payload=None, allow_404=True, max_retries=3):
+    """
+    Perform a GitHub API request with exponential-backoff retries for
+    rate-limit (403/429) and transient network errors.
+
+    Never falls back to an unauthenticated request: a private repository
+    must only be reachable with the caller's own token, so silently
+    falling through would leak data or give the wrong result.
+    """
+    last_exc = None
+    delay = _INITIAL_RETRY_DELAY
+
+    for attempt in range(max_retries + 1):
         body = json.dumps(payload).encode() if payload is not None else None
         headers = {
             'Accept': 'application/vnd.github+json',
             'Content-Type': 'application/json',
             'User-Agent': 'CloudWise',
         }
-        if use_token and token:
+        if token:
             headers['Authorization'] = f'Bearer {token}'
-        return urllib.request.Request(url, data=body, headers=headers, method=method)
 
-    try:
-        req = _make_req(use_token=True)
-        with urllib.request.urlopen(req, timeout=20) as response:
-            return json.loads(response.read().decode())
-    except urllib.error.HTTPError as exc:
-        details = exc.read().decode(errors='replace')
-        if exc.code == 401:
-            if token and method == 'GET' and try_unauthenticated_on_401:
-                # Try unauthenticated request as fallback (for public repos with expired token)
-                try:
-                    req = _make_req(use_token=False)
-                    with urllib.request.urlopen(req, timeout=20) as response:
-                        return json.loads(response.read().decode())
-                except urllib.error.HTTPError as fallback_exc:
-                    # If the unauthenticated fallback got a 404 and allow_404 is set, treat as not-found
-                    if fallback_exc.code == 404 and allow_404:
-                        return None
-                    # If fallback got 404 but allow_404 is False, raise not-found error
-                    if fallback_exc.code == 404:
-                        raise GitHubApiError('GitHub repository or resource not found.', status_code=404, details=details)
-                    # Any other fallback error (403, 500, etc) → raise 401 since auth is the root cause
-                    raise GitHubApiError('GitHub authentication failed or token expired.', status_code=401, details=details)
-                except (urllib.error.URLError, json.JSONDecodeError):
-                    pass
-            raise GitHubApiError('GitHub authentication failed or token expired.', status_code=401, details=details)
-        if exc.code == 403:
-            raise GitHubApiError('GitHub permission denied or API rate limit exceeded.', status_code=403, details=details)
-        if exc.code == 404:
-            if allow_404:
-                return None
-            raise GitHubApiError('GitHub repository or resource not found.', status_code=404, details=details)
-        raise GitHubApiError(f'GitHub API returned HTTP {exc.code}: {details}', status_code=exc.code, details=details)
-    except (urllib.error.URLError, json.JSONDecodeError) as exc:
-        raise GitHubApiError(f'GitHub API request failed: {exc}', status_code=502, details=str(exc))
+        try:
+            req = urllib.request.Request(url, data=body, headers=headers, method=method)
+            with urllib.request.urlopen(req, timeout=30) as response:
+                raw = response.read().decode()
+                return json.loads(raw) if raw else {}
 
+        except urllib.error.HTTPError as exc:
+            details = _read_details(exc)
+
+            if exc.code in _RATE_LIMIT_STATUS_CODES and _is_rate_limit_response(exc):
+                if attempt < max_retries:
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                raise GitHubApiError(
+                    'GitHub API rate limit exceeded. Please wait a few minutes before retrying.',
+                    status_code=429, details=details
+                )
+
+            if exc.code == 401:
+                raise GitHubApiError(
+                    'GitHub authentication failed or token expired. Re-authorize your GitHub account.',
+                    status_code=401, details=details
+                )
+
+            if exc.code == 403 and not _is_rate_limit_response(exc):
+                raise GitHubApiError(
+                    'GitHub permission denied — the connected account does not have access to this repository.',
+                    status_code=403, details=details
+                )
+
+            if exc.code == 404:
+                if allow_404:
+                    return None
+                raise GitHubApiError(
+                    'GitHub repository or resource not found.',
+                    status_code=404, details=details
+                )
+
+            if exc.code == 422:
+                raise GitHubApiError(
+                    'Invalid repository data. Confirm the repository exists and is accessible.',
+                    status_code=422, details=details
+                )
+
+            raise GitHubApiError(
+                f'GitHub API returned HTTP {exc.code}: {details}',
+                status_code=exc.code, details=details
+            )
+
+        except urllib.error.URLError as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise GitHubApiError(
+                f'GitHub API request failed (network error): {exc}',
+                status_code=502, details=str(exc)
+            )
+        except json.JSONDecodeError as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise GitHubApiError(
+                'Failed to parse GitHub API response.',
+                status_code=502, details=str(exc)
+            )
+
+    raise GitHubApiError(
+        'GitHub API request failed after retries.',
+        status_code=502, details=str(last_exc) if last_exc else 'Unknown error'
+    )
 
 
 def push_files_to_repository(token, repository, files, commit_message):
@@ -144,4 +221,4 @@ def push_files_to_repository(token, repository, files, commit_message):
         'repository': full_name,
         'branch': branch,
         'files': list(files.keys()),
-    }
+    }

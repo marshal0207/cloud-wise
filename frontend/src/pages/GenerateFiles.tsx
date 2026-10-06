@@ -36,7 +36,7 @@ export const GenerateFiles: React.FC = () => {
     activeProject
   } = useCloudWise();
 
-  const [activeTab, setActiveTab] = useState<'dockerfile' | 'cicd' | 'compose' | 'vercel' | 'render'>('dockerfile');
+  const [activeTab, setActiveTab] = useState<'dockerfile' | 'cicd' | 'compose' | 'nginx'>('dockerfile');
   const [copied, setCopied] = useState(false);
   const [showGithubModal, setShowGithubModal] = useState(false);
   const [repoInput, setRepoInput] = useState(githubRepo?.name || activeProject?.githubRepo?.name || '');
@@ -47,11 +47,13 @@ export const GenerateFiles: React.FC = () => {
   const [pushingFiles, setPushingFiles] = useState(false);
   const [inspectionLoading, setInspectionLoading] = useState(false);
   const [githubError, setGithubError] = useState('');
-  const [tokenExpired, setTokenExpired] = useState(false);
-  const [rateLimited, setRateLimited] = useState(false);
-  const [cachedScan, setCachedScan] = useState(false);
-  
-  const [repoTree, setRepoTree] = useState<Array<{ path: string; type: string; size?: number; sha?: string }>>([]);
+   const [tokenExpired, setTokenExpired] = useState(false);
+   const [rateLimited, setRateLimited] = useState(false);
+   const [cachedScan, setCachedScan] = useState(false);
+   const [scanProgress, setScanProgress] = useState<Array<{stage: string; message: string; progress: number}>>([]);
+   const [retryCount, setRetryCount] = useState(0);
+   
+   const [repoTree, setRepoTree] = useState<Array<{ path: string; type: string; size?: number; sha?: string }>>([]);
   const [scanMetadata, setScanMetadata] = useState<{
     repository?: string;
     branch?: string;
@@ -67,6 +69,21 @@ export const GenerateFiles: React.FC = () => {
     composePreserved?: boolean;
     cicdPreserved?: boolean;
     port?: number;
+    detection?: {
+      frontend?: string;
+      backend?: string;
+      database?: string;
+      applicationType?: string;
+    };
+    deploymentPlan?: {
+      target?: string;
+      containers?: string[];
+      generatedFiles?: string[];
+      database?: { type?: string | null; detected?: boolean };
+      requiredEnvVars?: string[];
+      ports?: number[];
+      requiresNginx?: boolean;
+    };
   }>({});
 
   const [generatedFiles, setGeneratedFiles] = useState<Record<string, string> | null>(null);
@@ -81,6 +98,55 @@ export const GenerateFiles: React.FC = () => {
 
   const providerName = selectedRecommendation.provider;
 
+  // Backend failures are always reported as {success, error}; Django/DRF can
+  // also answer with {detail}. Surface whichever reason the server sent
+  // instead of a generic message, and fall back to a useful default.
+  const readJson = async (response: Response): Promise<any | null> => {
+    try {
+      return await response.json();
+    } catch {
+      return null;
+    }
+  };
+
+  const apiErrorMessage = (status: number, body: any, fallback: string): string => {
+    const message = body?.error || body?.message || body?.detail;
+    if (typeof message === 'string' && message.trim()) return message;
+    if (status === 401) {
+      return 'Your CloudWise session has expired or you are not signed in. Please sign in again.';
+    }
+    if (status === 403) return 'You do not have permission to perform this action.';
+    if (status === 404) return 'The requested resource was not found on the CloudWise backend.';
+    if (status === 503) {
+      return 'The CloudWise backend is unavailable. Check the backend logs and try again.';
+    }
+    return fallback;
+  };
+
+  const GITHUB_OAUTH_ERROR_MESSAGES: Record<string, string> = {
+    access_denied:
+      'GitHub authorization was denied. Nothing was changed — choose "Authorize GitHub Account" again and approve access.',
+    invalid_code:
+      'The GitHub authorization expired before it finished. Please try authorizing again.',
+    state_expired:
+      'The GitHub authorization took too long to complete. Please try authorizing again.',
+    state_invalid:
+      'The GitHub authorization could not be verified. Please try authorizing again.',
+    missing_code:
+      'GitHub did not return an authorization code. Please try authorizing again.',
+    redirect_uri_mismatch:
+      'The GitHub OAuth app callback URL does not match GITHUB_REDIRECT_URI. Set the "Authorization callback URL" in your GitHub OAuth app to the exact value of GITHUB_REDIRECT_URI (http://localhost:8000/api/github/oauth/callback).',
+    bad_client_credentials:
+      'GitHub rejected the configured client ID/secret. Check GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET in backend/.env.',
+    exchange_failed:
+      'GitHub could not complete the token exchange. Check the backend logs for the exact reason.',
+    profile_failed:
+      'GitHub authorized the account but the profile lookup failed. Check the backend logs.',
+    cloudwise_user_missing:
+      'Your CloudWise session is no longer valid. Please sign in again and retry.',
+    save_failed: 'The GitHub connection could not be saved. Check the backend logs.',
+  };
+
   const loadRepositories = async () => {
     setLoadingRepositories(true);
     setGithubError('');
@@ -92,9 +158,11 @@ export const GenerateFiles: React.FC = () => {
         },
         credentials: 'include',
       });
-      const data = await response.json();
-      if (!response.ok || !data.success) {
-        throw new Error(data.error || 'Unable to retrieve GitHub repositories.');
+      const data = await readJson(response);
+      if (!response.ok || !data?.success) {
+        throw new Error(
+          apiErrorMessage(response.status, data, 'Unable to retrieve GitHub repositories.')
+        );
       }
       setRepositories(data.data || []);
       if (data.data && data.data.length > 0 && !repoInput) {
@@ -108,9 +176,26 @@ export const GenerateFiles: React.FC = () => {
   };
 
   useEffect(() => {
-    if (searchParams.get('github') === 'connected') {
+    const oauthResult = searchParams.get('github');
+    const oauthDetail = searchParams.get('github_detail');
+
+    if (oauthResult === 'error') {
+      setShowGithubModal(true);
+      setGithubError(
+        (oauthDetail && GITHUB_OAUTH_ERROR_MESSAGES[oauthDetail]) ||
+          'GitHub authorization failed. Check the backend logs for details.'
+      );
+      searchParams.delete('github');
+      searchParams.delete('github_detail');
+      setSearchParams(searchParams, { replace: true });
+      return;
+    }
+
+    if (oauthResult === 'connected') {
       setShowGithubModal(true);
       setSyncedStatus(false);
+      setGithubError('');
+      showToast('GitHub account connected. Choose a repository to scan.', 'success');
       loadRepositories();
       searchParams.delete('github');
       setSearchParams(searchParams, { replace: true });
@@ -130,15 +215,20 @@ export const GenerateFiles: React.FC = () => {
     setGithubError('');
     try {
       const token = localStorage.getItem('cloudwise_token');
+      if (!token) {
+        throw new Error('Please sign in to CloudWise before connecting your GitHub account.');
+      }
       const response = await fetch('/api/github/oauth/start', {
         headers: {
-          Authorization: token ? `Bearer ${token}` : '',
+          Authorization: `Bearer ${token}`,
         },
         credentials: 'include',
       });
-      const data = await response.json();
-      if (!response.ok || !data.success) {
-        throw new Error(data.error || 'Unable to start GitHub authorization.');
+      const data = await readJson(response);
+      if (!response.ok || !data?.success || !data?.authorizationUrl) {
+        throw new Error(
+          apiErrorMessage(response.status, data, 'Unable to start GitHub authorization.')
+        );
       }
       window.location.assign(data.authorizationUrl);
     } catch (error: any) {
@@ -151,15 +241,13 @@ export const GenerateFiles: React.FC = () => {
     if (generatedFiles) {
       switch (activeTab) {
         case 'dockerfile':
-          return generatedFiles['Dockerfile'] || '# Dockerfile not generated';
+          return generatedFiles['Dockerfile'] || generatedFiles['frontend/Dockerfile'] || '# Dockerfile not generated';
         case 'compose':
           return generatedFiles['docker-compose.yml'] || '# docker-compose.yml not generated';
         case 'cicd':
           return generatedFiles['.github/workflows/aws-deploy.yml'] || generatedFiles['.github/workflows/deploy.yml'] || '# CI/CD pipeline not generated';
-        case 'vercel':
-          return generatedFiles['vercel.json'] || '# vercel.json configuration';
-        case 'render':
-          return generatedFiles['render.yaml'] || '# render.yaml configuration';
+        case 'nginx':
+          return generatedFiles['nginx.conf'] || '# nginx.conf not generated';
       }
     }
 
@@ -194,10 +282,16 @@ jobs:
       - uses: actions/checkout@v4
       - run: docker build -t cloudwise-app .`;
     }
-    if (activeTab === 'vercel') {
-      return `{\n  "version": 2,\n  "builds": [{ "src": "package.json", "use": "@vercel/node" }]\n}`;
+    return `# nginx.conf routes / to the frontend and /api to the backend
+server {
+    listen 80;
+    location /api/ {
+        proxy_pass http://backend:8080;
     }
-    return `services:\n  - type: web\n    name: cloudwise-app\n    env: docker\n    dockerfilePath: ./Dockerfile`;
+    location / {
+        proxy_pass http://frontend:80;
+    }
+}`;
   };
 
   const handleCopy = () => {
@@ -212,8 +306,7 @@ jobs:
       dockerfile: 'Dockerfile',
       cicd: 'aws-deploy.yml',
       compose: 'docker-compose.yml',
-      vercel: 'vercel.json',
-      render: 'render.yaml'
+      nginx: 'nginx.conf'
     };
     const content = getActiveCode();
     const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
@@ -228,133 +321,210 @@ jobs:
     showToast(`Downloaded ${filenames[activeTab]}`, 'success');
   };
 
-  const handleConnectSubmit = async (e?: React.FormEvent, repoToSelect?: string) => {
-    if (e) e.preventDefault();
-    const repoName = (repoToSelect || repoInput).trim();
-    if (!repoName) return;
+   const handleConnectSubmit = async (e?: React.FormEvent, repoToSelect?: string) => {
+     if (e) e.preventDefault();
+     const repoName = (repoToSelect || repoInput).trim();
+     if (!repoName) return;
 
-    setConnecting(true);
-    setGithubError('');
-    try {
-      const success = await connectGitHub(repoName);
-      if (success) {
-        setRepoInput(repoName);
-        setShowGithubModal(false);
-        setSyncedStatus(true);
-        // Reset old repo tree before scanning new repo
-        setRepoTree([]);
-        setScanMetadata({});
-        await new Promise((r) => setTimeout(r, 500));
-        void handleInspectRepository(repoName);
-      } else {
-        setGithubError('Failed to link repository. Please try again.');
-      }
-    } catch (err: any) {
-      setGithubError(err?.message || 'Failed to link repository. Please try again.');
-    } finally {
-      setConnecting(false);
-    }
-  };
+     setConnecting(true);
+     setGithubError('');
+     setScanProgress([]);
+     setRetryCount(0);
+     try {
+       const { projectId, error } = await connectGitHub(repoName);
+       if (projectId) {
+         setRepoInput(repoName);
+         setShowGithubModal(false);
+         setSyncedStatus(true);
+         // Reset old repo tree before scanning new repo
+         setRepoTree([]);
+         setScanMetadata({});
+         void handleInspectRepository(repoName, projectId);
+       } else {
+         setGithubError(error || 'Failed to link repository. Please try again.');
+       }
+     } catch (err: any) {
+       setGithubError(err?.message || 'Failed to link repository. Please try again.');
+     } finally {
+       setConnecting(false);
+     }
+   };
 
-  const handleInspectRepository = async (overrideRepoName?: string) => {
-    const targetRepo = overrideRepoName || repoInput || activeProject?.githubRepo?.name;
-    if (!targetRepo) {
-      setGithubError('Connect and select a GitHub repository before inspecting it.');
-      setShowGithubModal(true);
-      return;
-    }
+   const handleRetryInspect = async () => {
+     setRetryCount(prev => prev + 1);
+     setGithubError('');
+     setTokenExpired(false);
+     setRateLimited(false);
+     setCachedScan(false);
+     setScanProgress([]);
+     const currentRetry = retryCount + 1;
+     try {
+       const projectId = activeProject?.id;
+       if (!projectId || !repoInput) throw new Error('No project or repository selected.');
+       const token = localStorage.getItem('cloudwise_token');
+       if (!token) throw new Error('Your CloudWise session has expired.');
+       const inspectUrl = `/api/projects/${encodeURIComponent(projectId)}/github/inspect`;
+       const inspectResponse = await fetch(inspectUrl, {
+         method: 'POST',
+         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+         body: JSON.stringify({ repoName: repoInput }),
+       });
+       const inspectData = await readJson(inspectResponse);
+       if (inspectData?.progress && Array.isArray(inspectData.progress)) {
+         setScanProgress(inspectData.progress);
+       }
+       if (inspectData?.token_expired) setTokenExpired(true);
+       if (inspectData?.rate_limited) setRateLimited(true);
+       if (inspectData?.cached) setCachedScan(true);
+       if (!inspectResponse.ok || !inspectData?.success) {
+         if (inspectData?.token_expired) throw new Error('Your GitHub token has expired. Please re-authenticate.');
+         if (inspectData?.rate_limited) throw new Error('GitHub API rate limit reached. Please wait a few minutes.');
+         throw new Error(apiErrorMessage(inspectResponse.status, inspectData, 'Unable to inspect the selected repository.'));
+       }
+       setRepoTree(inspectData.data.tree || []);
+       setScanMetadata({
+         repository: inspectData.data.repository?.full_name || repoInput,
+         branch: inspectData.data.branch || 'main',
+         commitSha: inspectData.data.commitSha,
+         totalFiles: inspectData.data.totalFiles ?? (inspectData.data.tree?.length || 0),
+         totalDirectories: inspectData.data.totalDirectories ?? 0,
+         truncated: inspectData.data.truncated ?? false,
+         scannedAt: inspectData.data.scannedAt || new Date().toISOString(),
+       });
+       showToast(`Scan retry #${currentRetry} completed — ${inspectData.data.totalFiles || 0} files inspected.`, 'success');
+     } catch (error: any) {
+       setGithubError(error.message || 'Retry failed.');
+       showToast(error.message || 'Retry failed.', 'error');
+     }
+   };
 
-    setInspectionLoading(true);
-    setGithubError('');
-    setTokenExpired(false);
-    setRateLimited(false);
-    setCachedScan(false);
-    try {
-      const token = localStorage.getItem('cloudwise_token');
-      const inspectUrl = activeProject?.id 
-        ? `/api/projects/${activeProject.id}/github/inspect`
-        : `/api/projects/default/github/inspect`;
+   const handleInspectRepository = async (overrideRepoName?: string, projectIdOverride?: string) => {
+     const targetRepo = overrideRepoName || repoInput || activeProject?.githubRepo?.name;
+     if (!targetRepo) {
+       setGithubError('Connect and select a GitHub repository before inspecting it.');
+       setShowGithubModal(true);
+       return;
+     }
 
-      const inspectResponse = await fetch(inspectUrl, {
-        method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          Authorization: token ? `Bearer ${token}` : '' 
-        },
-        body: JSON.stringify({ repoName: targetRepo }),
-      });
-      const inspectData = await inspectResponse.json();
+     const projectId = projectIdOverride || activeProject?.id;
+     if (!projectId) {
+       setGithubError('Connect a repository first — a CloudWise project is required to store the scan.');
+       setShowGithubModal(true);
+       return;
+     }
 
-      // Handle token-expired or rate-limited errors that include cached tree data
-      if (inspectData.token_expired) setTokenExpired(true);
-      if (inspectData.rate_limited) setRateLimited(true);
-      if (inspectData.cached) setCachedScan(true);
+     setInspectionLoading(true);
+     setGithubError('');
+     setTokenExpired(false);
+     setRateLimited(false);
+     setCachedScan(false);
+     setScanProgress([]);
+     const currentRetry = retryCount;
+     try {
+       const token = localStorage.getItem('cloudwise_token');
+       if (!token) {
+         throw new Error('Your CloudWise session has expired. Please sign in again to scan a repository.');
+       }
+       const inspectUrl = `/api/projects/${encodeURIComponent(projectId)}/github/inspect`;
 
-      if (!inspectResponse.ok || !inspectData.success) {
-        // If we have token_expired or rate_limited flags, show specific messaging
-        if (inspectData.token_expired) {
-          throw new Error('Your GitHub token has expired. Please re-authenticate with GitHub to scan a fresh copy of your repository.');
-        }
-        if (inspectData.rate_limited) {
-          throw new Error('GitHub API rate limit reached. Please connect a GitHub account or wait a few minutes before retrying.');
-        }
-        throw new Error(inspectData.error || inspectData.message || 'Unable to inspect the selected repository.');
-      }
+       const inspectResponse = await fetch(inspectUrl, {
+         method: 'POST',
+         headers: { 
+           'Content-Type': 'application/json',
+           Authorization: `Bearer ${token}`
+         },
+         body: JSON.stringify({ repoName: targetRepo }),
+       });
+       const inspectData = await readJson(inspectResponse);
 
-      const repoInfo = inspectData.data.repository;
-      const repoFullName = typeof repoInfo === 'object' ? repoInfo?.full_name || repoInfo?.name : repoInfo;
-      
-      setScanMetadata({
-        repository: repoFullName || targetRepo,
-        branch: inspectData.data.branch || 'main',
-        commitSha: inspectData.data.commitSha,
-        totalFiles: inspectData.data.totalFiles ?? (inspectData.data.tree?.length || 0),
-        totalDirectories: inspectData.data.totalDirectories ?? 0,
-        truncated: inspectData.data.truncated ?? false,
-        scannedAt: inspectData.data.scannedAt || new Date().toISOString(),
-      });
+       // Show progress stages if the server returned them
+       if (inspectData?.progress && Array.isArray(inspectData.progress)) {
+         setScanProgress(inspectData.progress);
+       }
 
-      setRepoTree(inspectData.data.tree || []);
+       // Handle token-expired or rate-limited errors that include cached tree data
+       if (inspectData?.token_expired) setTokenExpired(true);
+       if (inspectData?.rate_limited) setRateLimited(true);
+       if (inspectData?.cached) setCachedScan(true);
 
-      // Only generate deployment files if we have actual file contents (not just cached paths)
-      const fileContents = inspectData.data.files || {};
-      const hasFileContents = Object.values(fileContents).some((v) => v && (v as string).length > 0);
+       if (!inspectResponse.ok || !inspectData?.success) {
+         if (inspectData?.token_expired) {
+           throw new Error('Your GitHub token has expired. Please re-authenticate with GitHub to scan a fresh copy of your repository.');
+         }
+         if (inspectData?.rate_limited) {
+           throw new Error('GitHub API rate limit reached. Please wait a few minutes before retrying.');
+         }
+         throw new Error(
+           apiErrorMessage(inspectResponse.status, inspectData, 'Unable to inspect the selected repository.')
+         );
+       }
 
-      if (hasFileContents) {
-        const generateResponse = await fetch('/api/deployment/generate-files', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ provider: providerName, files: fileContents }),
-        });
-        const generateData = await generateResponse.json();
-        if (!generateResponse.ok || !generateData.success) {
-          throw new Error(generateData.error || 'Unable to generate deployment files.');
-        }
+       const repoInfo = inspectData.data.repository;
+       const repoFullName = typeof repoInfo === 'object' ? repoInfo?.full_name || repoInfo?.name : repoInfo;
+       
+       setScanMetadata({
+         repository: repoFullName || targetRepo,
+         branch: inspectData.data.branch || 'main',
+         commitSha: inspectData.data.commitSha,
+         totalFiles: inspectData.data.totalFiles ?? (inspectData.data.tree?.length || 0),
+         totalDirectories: inspectData.data.totalDirectories ?? 0,
+         truncated: inspectData.data.truncated ?? false,
+         scannedAt: inspectData.data.scannedAt || new Date().toISOString(),
+       });
 
-        setDetectedInfo({
-          technology: generateData.data.technology?.technology || inspectData.data.technology?.technology,
-          dockerfilePreserved: generateData.data.dockerfile_preserved,
-          composePreserved: generateData.data.compose_preserved,
-          cicdPreserved: generateData.data.cicd_preserved,
-          port: generateData.data.port,
-        });
-        setGeneratedFiles(generateData.data.files);
-      }
+       setRepoTree(inspectData.data.tree || []);
+       setScanProgress(inspectData.progress || []);
 
-      if (inspectData.cached && inspectData.token_expired) {
-        showToast(`Showing cached tree (${inspectData.data.totalFiles || inspectData.data.tree?.length || 0} files). Re-authenticate GitHub for a fresh scan.`, 'warning');
-      } else if (inspectData.cached && inspectData.rate_limited) {
-        showToast(`Showing cached tree. GitHub rate limit reached — retry in a few minutes.`, 'warning');
-      } else {
-        showToast(`Scanned ${inspectData.data.totalFiles || inspectData.data.tree?.length || 0} repository files from ${repoFullName || targetRepo}.`, 'success');
-      }
-    } catch (error: any) {
-      setGithubError(error.message || 'Repository inspection failed.');
-      showToast(error.message || 'Repository inspection failed.', 'error');
-    } finally {
-      setInspectionLoading(false);
-    }
-  };
+       // Only generate deployment files if we have actual file contents (not just cached paths)
+       const fileContents = inspectData.data.files || {};
+       const hasFileContents = Object.values(fileContents).some((v) => v && (v as string).length > 0);
+
+       if (hasFileContents) {
+         const generateResponse = await fetch('/api/deployment/generate-files', {
+           method: 'POST',
+           headers: {
+             'Content-Type': 'application/json',
+             Authorization: token ? `Bearer ${token}` : '',
+           },
+           body: JSON.stringify({
+             provider: providerName,
+             files: fileContents,
+             tree: inspectData.data.tree || [],
+           }),
+         });
+         const generateData = await readJson(generateResponse);
+         if (!generateResponse.ok || !generateData?.success) {
+           throw new Error(
+             apiErrorMessage(generateResponse.status, generateData, 'Unable to generate deployment files.')
+           );
+         }
+
+         setDetectedInfo({
+           technology: generateData.data.technology?.technology || inspectData.data.technology?.technology,
+           dockerfilePreserved: generateData.data.dockerfile_preserved,
+           composePreserved: generateData.data.compose_preserved,
+           cicdPreserved: generateData.data.cicd_preserved,
+           port: generateData.data.port,
+           detection: generateData.data.detection,
+           deploymentPlan: generateData.data.deploymentPlan,
+         });
+         setGeneratedFiles(generateData.data.files);
+       }
+
+       if (inspectData.cached && inspectData.token_expired) {
+         showToast(`Showing cached tree (${inspectData.data.totalFiles || inspectData.data.tree?.length || 0} files). Re-authenticate GitHub for a fresh scan.`, 'warning');
+       } else if (inspectData.cached && inspectData.rate_limited) {
+         showToast(`Showing cached tree. GitHub rate limit reached — retry in a few minutes.`, 'warning');
+       } else {
+         showToast(`Scanned ${inspectData.data.totalFiles || inspectData.data.tree?.length || 0} repository files from ${repoFullName || targetRepo}.`, 'success');
+       }
+     } catch (error: any) {
+       setGithubError(error.message || 'Repository inspection failed.');
+       showToast(error.message || 'Repository inspection failed.', 'error');
+     } finally {
+       setInspectionLoading(false);
+     }
+   };
 
   const handleProceedToDeployment = () => {
     updateActiveProject({ currentStep: 'deployment' });
@@ -387,9 +557,9 @@ jobs:
           commit_message: 'Add CloudWise deployment configuration',
         }),
       });
-      const data = await response.json();
-      if (!response.ok || !data.success) {
-        throw new Error(data.error || 'Unable to push generated files.');
+      const data = await readJson(response);
+      if (!response.ok || !data?.success) {
+        throw new Error(apiErrorMessage(response.status, data, 'Unable to push generated files.'));
       }
       showToast(`Files committed to ${data.data.repository}.`, 'success');
     } catch (error: any) {
@@ -413,14 +583,14 @@ jobs:
           Repository File Inspection & Infrastructure Code
         </h1>
         <p className="text-slate-400 text-sm sm:text-base leading-relaxed">
-          CloudWise inspects every file in your GitHub repository. If a Dockerfile exists, CloudWise preserves it and generates matching docker-compose & AWS/Vercel/Render pipeline files.
+          CloudWise inspects every file in your GitHub repository, detects your stack, and generates Docker deployment files (Dockerfile, docker-compose, nginx routing) ready for AWS EC2. Existing Dockerfiles are preserved.
         </p>
       </div>
 
       {/* GitHub Integration Banner */}
       <div className="glass-panel p-6 rounded-3xl border border-violet-500/30 bg-violet-950/10 flex flex-col md:flex-row items-center justify-between gap-6">
         <div className="flex items-center gap-4">
-          <div className="w-12 h-12 rounded-2xl bg-slate-900 border border-slate-700 flex items-center justify-center text-white shrink-0">
+          <div className="w-12 h-12 rounded-2xl bg-[#080D14] border border-slate-700 flex items-center justify-center text-white shrink-0">
             <Github size={24} />
           </div>
           <div>
@@ -450,7 +620,7 @@ jobs:
               setShowGithubModal(true);
               loadRepositories();
             }}
-            className="px-6 py-3 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-white font-bold text-xs transition-colors flex items-center gap-2"
+            className="px-6 py-3 rounded-xl bg-[#080D14] hover:bg-slate-800 border border-slate-700 text-white font-bold text-xs transition-colors flex items-center gap-2"
           >
             <Github size={16} />
             <span>{syncedStatus || activeProject?.githubRepo ? 'Change GitHub Repo' : 'Connect GitHub Repo'}</span>
@@ -459,7 +629,7 @@ jobs:
           <button
             onClick={() => handleInspectRepository()}
             disabled={inspectionLoading}
-            className="px-5 py-3 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs transition-colors flex items-center gap-2 disabled:opacity-50"
+            className="px-5 py-3 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs transition-colors flex items-center gap-2 disabled:opacity-50"
           >
             {inspectionLoading ? <RefreshCw size={16} className="animate-spin" /> : <GitBranch size={16} />}
             <span>{inspectionLoading ? 'Scanning Tree...' : 'Scan Repo Tree'}</span>
@@ -474,7 +644,7 @@ jobs:
           <div>
             <span className="font-extrabold text-sm block text-emerald-300">Existing Dockerfile Preserved!</span>
             <span className="text-emerald-200/90 text-xs">
-              CloudWise detected your existing Dockerfile (Port {detectedInfo.port || 3000}). Preserved original Dockerfile instructions and generated matching <code className="text-white">docker-compose.yml</code> and AWS/Vercel/Render CI/CD files.
+              CloudWise detected your existing Dockerfile (Port {detectedInfo.port || 3000}). Preserved original Dockerfile instructions and generated matching <code className="text-white">docker-compose.yml</code> and AWS CI/CD pipeline files.
             </span>
           </div>
         </div>
@@ -515,13 +685,68 @@ jobs:
       )}
 
 
+      {/* Deployment Preview: Detected + Generated */}
+      {generatedFiles && (detectedInfo.detection || detectedInfo.deploymentPlan) && (
+        <div className="glass-panel p-6 rounded-3xl border border-slate-800 grid grid-cols-1 md:grid-cols-2 gap-6">
+          <div className="space-y-3">
+            <h3 className="text-sm font-bold text-white flex items-center gap-2">
+              <Sparkles className="w-4 h-4 text-violet-400" />
+              <span>Detected</span>
+            </h3>
+            <div className="space-y-1.5 text-xs">
+              <div className="flex gap-2">
+                <span className="text-slate-500 w-20 shrink-0 font-semibold">Frontend:</span>
+                <span className="text-emerald-300 font-bold">{detectedInfo.detection?.frontend || 'Not detected'}</span>
+              </div>
+              <div className="flex gap-2">
+                <span className="text-slate-500 w-20 shrink-0 font-semibold">Backend:</span>
+                <span className="text-emerald-300 font-bold">{detectedInfo.detection?.backend || 'Not detected'}</span>
+              </div>
+              <div className="flex gap-2">
+                <span className="text-slate-500 w-20 shrink-0 font-semibold">Database:</span>
+                <span className="text-emerald-300 font-bold">
+                  {detectedInfo.detection?.database || 'Not detected'}
+                  {detectedInfo.detection?.database && (
+                    <span className="ml-2 text-[10px] text-slate-400 font-normal">(external — you provide it)</span>
+                  )}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div className="space-y-3">
+            <h3 className="text-sm font-bold text-white flex items-center gap-2">
+              <FileCode className="w-4 h-4 text-emerald-400" />
+              <span>Generated</span>
+            </h3>
+            <ul className="space-y-1.5 text-xs font-mono">
+              {(detectedInfo.deploymentPlan?.generatedFiles || Object.keys(generatedFiles)).map((filePath) => (
+                <li key={filePath} className="flex items-center gap-2 text-emerald-300">
+                  <CheckCircle2 size={14} className="text-emerald-400 shrink-0" />
+                  <span>{filePath}</span>
+                </li>
+              ))}
+            </ul>
+            {detectedInfo.deploymentPlan?.target && (
+              <p className="text-[11px] text-slate-500">
+                Target: <span className="text-slate-300 font-bold">{detectedInfo.deploymentPlan.target}</span>
+                {detectedInfo.deploymentPlan.requiresNginx && (
+                  <> · Nginx routes <code className="text-slate-300">/</code> → frontend, <code className="text-slate-300">/api</code> → backend</>
+                )}
+              </p>
+            )}
+          </div>
+        </div>
+      )}
+
+
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         
         {/* Repo File Tree (1 Col) */}
         <div className="glass-panel p-5 rounded-3xl border border-slate-800 space-y-4 max-h-[600px] overflow-y-auto">
           <div className="flex items-center justify-between border-b border-slate-800 pb-3">
             <h3 className="text-sm font-bold text-white flex items-center gap-2">
-              <Folder className="w-4 h-4 text-cyan-400" />
+              <Folder className="w-4 h-4 text-emerald-400" />
               <span>Full Repository File Tree</span>
             </h3>
             <span className="text-[10px] text-slate-400 font-mono">
@@ -531,8 +756,8 @@ jobs:
 
           {/* Scan Metadata Badge */}
           {scanMetadata.repository && (
-            <div className="p-3 rounded-2xl bg-slate-900/80 border border-slate-800 text-xs space-y-1.5 font-mono">
-              <div className="text-cyan-300 font-extrabold truncate flex items-center gap-1.5">
+            <div className="p-3 rounded-2xl bg-[#080D14]/80 border border-slate-800 text-xs space-y-1.5 font-mono">
+              <div className="text-emerald-300 font-extrabold truncate flex items-center gap-1.5">
                 <Github size={13} className="shrink-0" />
                 <span className="truncate">{scanMetadata.repository}</span>
               </div>
@@ -549,46 +774,68 @@ jobs:
             </div>
           )}
 
-          {/* Loading state */}
-          {inspectionLoading && (
-            <div className="text-center py-10 text-cyan-400 text-xs space-y-3">
-              <RefreshCw size={28} className="mx-auto animate-spin text-cyan-400" />
-              <p className="font-semibold text-white">Fetching repository tree...</p>
-              <p className="text-[11px] text-slate-400">Analyzing repository structure recursively...</p>
-            </div>
-          )}
+           {/* Loading state with progress steps */}
+           {inspectionLoading && (
+             <div className="text-center py-6 space-y-3">
+               <RefreshCw size={28} className="mx-auto animate-spin text-emerald-400" />
+               <p className="font-semibold text-white text-sm">Scanning repository...</p>
+               {scanProgress.length > 0 ? (
+                 <ul className="space-y-1.5 text-[11px]">
+                   {scanProgress.map((step, i) => (
+                     <li key={i} className={`flex items-center gap-1.5 ${i === scanProgress.length - 1 ? 'text-emerald-300' : 'text-slate-400'}`}>
+                       {i < scanProgress.length - 1 ? <CheckCircle2 size={12} className="text-green-400 shrink-0" /> : <RefreshCw size={12} className="animate-spin shrink-0" />}
+                       <span>{step.message}</span>
+                       {step.progress > 0 && step.progress < 100 && (
+                         <div className="w-16 h-1 bg-slate-700 rounded-full overflow-hidden ml-auto">
+                           <div className="h-full bg-emerald-400 rounded-full transition-all" style={{ width: `${step.progress}%` }} />
+                         </div>
+                       )}
+                     </li>
+                   ))}
+                 </ul>
+               ) : (
+                 <div className="space-y-1 text-slate-500">
+                   <p>→ Connecting to GitHub...</p>
+                   <p>→ Fetching repository...</p>
+                   <p>→ Reading repository tree...</p>
+                   <p>→ Detecting project type...</p>
+                   <p>→ Analyzing deployment requirements...</p>
+                 </div>
+               )}
+             </div>
+           )}
 
-          {/* Error state */}
-          {!inspectionLoading && githubError && (
-            <div className="p-4 rounded-2xl bg-red-500/10 border border-red-500/30 text-red-300 text-xs space-y-2">
-              <div className="flex items-center gap-2 font-bold text-red-200 text-sm">
-                <AlertCircle size={16} className="text-red-400 shrink-0" />
-                <span>Repository Scan Failed</span>
-              </div>
-              <p className="text-slate-300 leading-relaxed text-[11px]">
-                {githubError}
-              </p>
-              <div className="flex items-center gap-2 flex-wrap">
-                <button
-                  onClick={() => handleInspectRepository()}
-                  className="px-3 py-1.5 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-200 border border-red-500/40 text-[11px] font-bold transition-colors flex items-center gap-1.5"
-                >
-                  <RefreshCw size={12} />
-                  <span>Retry Scan</span>
-                </button>
-                {tokenExpired && (
-                  <button
-                    onClick={handleStartGithubOAuth}
-                    disabled={oauthStarting}
-                    className="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/40 text-[11px] font-bold transition-colors flex items-center gap-1.5 disabled:opacity-50"
-                  >
-                    <Github size={12} />
-                    <span>{oauthStarting ? 'Starting...' : 'Re-authenticate GitHub'}</span>
-                  </button>
-                )}
-              </div>
-            </div>
-          )}
+           {/* Error state */}
+           {!inspectionLoading && githubError && (
+             <div className="p-4 rounded-2xl bg-red-500/10 border border-red-500/30 text-red-300 text-xs space-y-2">
+               <div className="flex items-center gap-2 font-bold text-red-200 text-sm">
+                 <AlertCircle size={16} className="text-red-400 shrink-0" />
+                 <span>Repository Scan Failed</span>
+               </div>
+               <p className="text-slate-300 leading-relaxed text-[11px]">
+                 {githubError}
+               </p>
+               <div className="flex items-center gap-2 flex-wrap">
+                 <button
+                   onClick={handleRetryInspect}
+                   className="px-3 py-1.5 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-200 border border-red-500/40 text-[11px] font-bold transition-colors flex items-center gap-1.5"
+                 >
+                   <RefreshCw size={12} />
+                   <span>Retry Scan</span>
+                 </button>
+                 {tokenExpired && (
+                   <button
+                     onClick={handleStartGithubOAuth}
+                     disabled={oauthStarting}
+                     className="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/40 text-[11px] font-bold transition-colors flex items-center gap-1.5 disabled:opacity-50"
+                   >
+                     <Github size={12} />
+                     <span>{oauthStarting ? 'Starting...' : 'Re-authenticate GitHub'}</span>
+                   </button>
+                 )}
+               </div>
+             </div>
+           )}
 
 
           {/* Tree items */}
@@ -609,8 +856,8 @@ jobs:
                 return (
                   <div 
                     key={idx} 
-                    className={`flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-slate-900 transition-colors ${
-                      isDockerfile ? 'text-cyan-300 font-bold bg-cyan-950/30 border border-cyan-500/30' : 
+                    className={`flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-[#080D14] transition-colors ${
+                      isDockerfile ? 'text-emerald-300 font-bold bg-emerald-950/30 border border-emerald-500/30' : 
                       isCompose ? 'text-amber-300 font-bold bg-amber-950/20' : 
                       isCicd ? 'text-violet-300 font-bold bg-violet-950/20' :
                       'text-slate-300'
@@ -623,7 +870,7 @@ jobs:
                     )}
                     <span className="truncate">{item.path}</span>
                     {isDockerfile && (
-                      <span className="ml-auto text-[9px] px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shrink-0 font-sans">
+                      <span className="ml-auto text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 shrink-0 font-sans">
                         Dockerfile
                       </span>
                     )}
@@ -644,12 +891,12 @@ jobs:
         <div className="lg:col-span-2 glass-panel rounded-3xl border border-slate-800 overflow-hidden flex flex-col">
           
           {/* Header & Tabs */}
-          <div className="bg-slate-900/90 px-6 py-4 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3">
-            <div className="flex bg-slate-950 p-1 rounded-2xl border border-slate-800 text-xs font-semibold overflow-x-auto">
+          <div className="bg-[#080D14]/90 px-6 py-4 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex bg-[#05080D] p-1 rounded-2xl border border-slate-800 text-xs font-semibold overflow-x-auto">
               <button
                 onClick={() => setActiveTab('dockerfile')}
                 className={`px-3.5 py-2 rounded-xl transition-all flex items-center gap-1.5 ${
-                  activeTab === 'dockerfile' ? 'bg-cyan-500 text-slate-950 font-bold shadow' : 'text-slate-400 hover:text-white'
+                  activeTab === 'dockerfile' ? 'bg-emerald-500 text-slate-950 font-bold shadow' : 'text-slate-400 hover:text-white'
                 }`}
               >
                 <Code size={14} />
@@ -659,7 +906,7 @@ jobs:
               <button
                 onClick={() => setActiveTab('compose')}
                 className={`px-3.5 py-2 rounded-xl transition-all flex items-center gap-1.5 ${
-                  activeTab === 'compose' ? 'bg-cyan-500 text-slate-950 font-bold shadow' : 'text-slate-400 hover:text-white'
+                  activeTab === 'compose' ? 'bg-emerald-500 text-slate-950 font-bold shadow' : 'text-slate-400 hover:text-white'
                 }`}
               >
                 <Layers size={14} />
@@ -669,36 +916,29 @@ jobs:
               <button
                 onClick={() => setActiveTab('cicd')}
                 className={`px-3.5 py-2 rounded-xl transition-all flex items-center gap-1.5 ${
-                  activeTab === 'cicd' ? 'bg-cyan-500 text-slate-950 font-bold shadow' : 'text-slate-400 hover:text-white'
+                  activeTab === 'cicd' ? 'bg-emerald-500 text-slate-950 font-bold shadow' : 'text-slate-400 hover:text-white'
                 }`}
               >
                 <GitBranch size={14} />
                 <span>AWS CI/CD</span>
               </button>
 
-              <button
-                onClick={() => setActiveTab('vercel')}
-                className={`px-3.5 py-2 rounded-xl transition-all flex items-center gap-1.5 ${
-                  activeTab === 'vercel' ? 'bg-cyan-500 text-slate-950 font-bold shadow' : 'text-slate-400 hover:text-white'
-                }`}
-              >
-                <span>vercel.json</span>
-              </button>
-
-              <button
-                onClick={() => setActiveTab('render')}
-                className={`px-3.5 py-2 rounded-xl transition-all flex items-center gap-1.5 ${
-                  activeTab === 'render' ? 'bg-cyan-500 text-slate-950 font-bold shadow' : 'text-slate-400 hover:text-white'
-                }`}
-              >
-                <span>render.yaml</span>
-              </button>
+              {generatedFiles?.['nginx.conf'] && (
+                <button
+                  onClick={() => setActiveTab('nginx')}
+                  className={`px-3.5 py-2 rounded-xl transition-all flex items-center gap-1.5 ${
+                    activeTab === 'nginx' ? 'bg-emerald-500 text-slate-950 font-bold shadow' : 'text-slate-400 hover:text-white'
+                  }`}
+                >
+                  <span>nginx.conf</span>
+                </button>
+              )}
             </div>
 
             <div className="flex items-center gap-2">
               <button
                 onClick={handleCopy}
-                className="px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-300 font-semibold text-xs flex items-center gap-1.5"
+                className="px-3 py-1.5 rounded-xl bg-[#080D14] hover:bg-slate-800 border border-slate-700 text-slate-300 font-semibold text-xs flex items-center gap-1.5"
               >
                 {copied ? <Check size={14} className="text-emerald-400" /> : <Copy size={14} />}
                 <span>{copied ? 'Copied!' : 'Copy'}</span>
@@ -706,7 +946,7 @@ jobs:
 
               <button
                 onClick={handleDownload}
-                className="px-3 py-1.5 rounded-xl bg-cyan-500/10 hover:bg-cyan-500/20 border border-cyan-500/30 text-cyan-300 font-semibold text-xs flex items-center gap-1.5"
+                className="px-3 py-1.5 rounded-xl bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30 text-emerald-300 font-semibold text-xs flex items-center gap-1.5"
               >
                 <Download size={14} />
                 <span>Download</span>
@@ -715,7 +955,7 @@ jobs:
           </div>
 
           {/* Code Body */}
-          <div className="p-6 bg-slate-950 font-mono text-xs text-slate-300 leading-relaxed overflow-x-auto min-h-[380px] max-h-[500px]">
+          <div className="p-6 bg-[#05080D] font-mono text-xs text-slate-300 leading-relaxed overflow-x-auto min-h-[380px] max-h-[500px]">
             <pre className="text-slate-200">
               <code>{getActiveCode()}</code>
             </pre>
@@ -725,15 +965,15 @@ jobs:
       </div>
 
       {/* Action Bar */}
-      <div className="glass-panel p-6 rounded-3xl text-center space-y-4 max-w-xl mx-auto border border-cyan-500/20">
-        <h4 className="text-base font-bold text-white">Ready for Multi-Cloud Deployment?</h4>
+      <div className="glass-panel p-6 rounded-3xl text-center space-y-4 max-w-xl mx-auto border border-emerald-500/20">
+        <h4 className="text-base font-bold text-white">Ready for AWS EC2 Deployment?</h4>
         <p className="text-xs text-slate-400">
-          Generated artifacts ready. Proceed to launch live deployment pipeline targeting <strong className="text-cyan-300">Vercel</strong>, <strong className="text-cyan-300">Render</strong>, or <strong className="text-cyan-300">AWS Free Tier</strong>.
+          Docker deployment artifacts are ready. Proceed to the deployment pipeline targeting <strong className="text-emerald-300">AWS EC2</strong> with your external database.
         </p>
         <div className="flex flex-col sm:flex-row items-center gap-3">
           <button
             onClick={handleProceedToDeployment}
-            className="flex-1 py-4 rounded-xl bg-gradient-to-r from-cyan-400 via-cyan-500 to-blue-600 hover:from-cyan-300 hover:to-blue-500 text-slate-950 font-bold text-sm transition-all shadow-xl shadow-cyan-500/20 flex items-center justify-center gap-2 group"
+            className="flex-1 py-4 rounded-xl bg-gradient-to-r from-emerald-400 via-emerald-500 to-blue-600 hover:from-emerald-300 hover:to-blue-500 text-slate-950 font-bold text-sm transition-all shadow-xl shadow-emerald-500/20 flex items-center justify-center gap-2 group"
           >
             <span>Proceed to Deployment Page</span>
             <ArrowRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
@@ -753,7 +993,7 @@ jobs:
       {/* GitHub OAuth Modal */}
       <AnimatePresence>
         {showGithubModal && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-[#05080D]/80 backdrop-blur-md">
             <motion.div
               initial={{ opacity: 0, scale: 0.95 }}
               animate={{ opacity: 1, scale: 1 }}
@@ -762,13 +1002,13 @@ jobs:
             >
               <button
                 onClick={() => setShowGithubModal(false)}
-                className="absolute top-5 right-5 text-slate-400 hover:text-white p-1 rounded-lg bg-slate-900 border border-slate-800"
+                className="absolute top-5 right-5 text-slate-400 hover:text-white p-1 rounded-lg bg-[#080D14] border border-slate-800"
               >
                 <X size={18} />
               </button>
 
               <div className="space-y-1">
-                <div className="w-10 h-10 rounded-xl bg-slate-900 border border-slate-700 flex items-center justify-center text-white mb-2">
+                <div className="w-10 h-10 rounded-xl bg-[#080D14] border border-slate-700 flex items-center justify-center text-white mb-2">
                   <Github size={20} />
                 </div>
                 <h3 className="text-xl font-extrabold text-white">Connect GitHub Repository</h3>
@@ -787,14 +1027,14 @@ jobs:
                 type="button"
                 onClick={handleStartGithubOAuth}
                 disabled={oauthStarting}
-                className="w-full py-3 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-white font-bold text-xs transition-colors flex items-center justify-center gap-2 disabled:opacity-50"
+                className="w-full py-3 rounded-xl bg-[#080D14] hover:bg-slate-800 border border-slate-700 text-white font-bold text-xs transition-colors flex items-center justify-center gap-2 disabled:opacity-50"
               >
                 {oauthStarting ? <RefreshCw size={16} className="animate-spin" /> : <Github size={16} />}
                 <span>{oauthStarting ? 'Opening GitHub OAuth...' : 'Authorize GitHub Account'}</span>
               </button>
 
               {loadingRepositories && (
-                <p className="text-xs text-cyan-300 flex items-center gap-2">
+                <p className="text-xs text-emerald-300 flex items-center gap-2">
                   <RefreshCw size={14} className="animate-spin" /> Loading repositories...
                 </p>
               )}
@@ -807,7 +1047,7 @@ jobs:
                     value={repoInput}
                     onChange={(e) => setRepoInput(e.target.value)}
                     placeholder="e.g. Tirth-22/doctor-appointment-management-system"
-                    className="w-full bg-slate-900 border border-slate-700 rounded-xl px-4 py-3 text-xs text-white focus:border-cyan-400"
+                    className="w-full bg-[#080D14] border border-slate-700 rounded-xl px-4 py-3 text-xs text-white focus:border-emerald-400"
                   />
                 </div>
 
@@ -831,15 +1071,15 @@ jobs:
                             }}
                             className={`w-full p-3 rounded-xl text-xs flex items-center justify-between border cursor-pointer transition-all text-left disabled:cursor-wait ${
                               isSelected
-                                ? 'bg-cyan-500/20 border-cyan-400 text-white font-bold ring-1 ring-cyan-500/50 shadow-md'
-                                : 'bg-slate-900/80 border-slate-800 text-slate-300 hover:border-cyan-500/50 hover:bg-slate-800/80'
+                                ? 'bg-emerald-500/20 border-emerald-400 text-white font-bold ring-1 ring-emerald-500/50 shadow-md'
+                                : 'bg-[#080D14]/80 border-slate-800 text-slate-300 hover:border-emerald-500/50 hover:bg-slate-800/80'
                             }`}
                           >
                             <div className="flex items-center gap-2 min-w-0 pr-2">
                               {isLinking ? (
-                                <RefreshCw size={15} className="text-cyan-400 shrink-0 animate-spin" />
+                                <RefreshCw size={15} className="text-emerald-400 shrink-0 animate-spin" />
                               ) : isSelected ? (
-                                <CheckCircle2 size={15} className="text-cyan-400 shrink-0" />
+                                <CheckCircle2 size={15} className="text-emerald-400 shrink-0" />
                               ) : (
                                 <Github size={15} className="text-slate-500 shrink-0" />
                               )}
@@ -853,10 +1093,10 @@ jobs:
 
                             <span className={`ml-2 px-2.5 py-1 rounded-lg font-bold text-[10px] shrink-0 whitespace-nowrap ${
                               isLinking
-                                ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30'
+                                ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
                                 : isSelected
                                 ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
-                                : 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/30'
+                                : 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
                             }`}>
                               {isLinking ? 'Linking...' : isSelected ? '✓ Linked' : 'Select & Link'}
                             </span>
@@ -871,7 +1111,7 @@ jobs:
                   type="button"
                   onClick={(e) => handleConnectSubmit(e)}
                   disabled={connecting}
-                  className="w-full py-3.5 rounded-xl bg-gradient-to-r from-cyan-400 to-blue-600 hover:from-cyan-300 hover:to-blue-500 text-slate-950 font-bold text-xs transition-colors flex items-center justify-center gap-2 disabled:opacity-50"
+                  className="w-full py-3.5 rounded-xl bg-gradient-to-r from-emerald-400 to-blue-600 hover:from-emerald-300 hover:to-blue-500 text-slate-950 font-bold text-xs transition-colors flex items-center justify-center gap-2 disabled:opacity-50"
                 >
                   {connecting ? <RefreshCw size={16} className="animate-spin" /> : <Check size={16} />}
                   <span>{connecting ? 'Linking Repository...' : 'Confirm Repository Selection'}</span>

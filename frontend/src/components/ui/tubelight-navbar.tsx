@@ -26,7 +26,7 @@ export function NavBar({ items, className }: NavBarProps) {
         className,
       )}
     >
-      <div className="flex items-center gap-0.5 sm:gap-1.5 bg-slate-950/85 border border-slate-800/80 backdrop-blur-xl py-1.5 px-2 rounded-full shadow-2xl shadow-cyan-950/50">
+      <div className="flex items-center gap-0.5 sm:gap-1.5 bg-[#05080D]/85 border border-slate-800/80 backdrop-blur-xl py-1.5 px-2 rounded-full shadow-2xl shadow-emerald-950/50">
         {items.map((item) => {
           const Icon = item.icon
           // Handle root route accurately vs sub-routes
@@ -42,8 +42,8 @@ export function NavBar({ items, className }: NavBarProps) {
               title={item.name}
               className={cn(
                 "relative cursor-pointer text-xs sm:text-sm font-medium px-2.5 sm:px-4 py-1.5 sm:py-2 rounded-full transition-all duration-200 flex items-center gap-2 select-none",
-                "text-slate-400 hover:text-cyan-300",
-                isActive && "text-cyan-300 font-semibold shadow-inner",
+                "text-slate-400 hover:text-emerald-300",
+                isActive && "text-emerald-300 font-semibold shadow-inner",
               )}
             >
               <Icon
@@ -51,7 +51,7 @@ export function NavBar({ items, className }: NavBarProps) {
                 strokeWidth={isActive ? 2.5 : 2}
                 className={cn(
                   "transition-all duration-200",
-                  isActive ? "text-cyan-400 scale-110" : "text-slate-400 group-hover:text-cyan-300"
+                  isActive ? "text-emerald-400 scale-110" : "text-slate-400 group-hover:text-emerald-300"
                 )}
               />
               
@@ -62,7 +62,7 @@ export function NavBar({ items, className }: NavBarProps) {
               {isActive && (
                 <motion.div
                   layoutId="lamp"
-                  className="absolute inset-0 w-full bg-cyan-500/10 rounded-full -z-10 border border-cyan-500/25"
+                  className="absolute inset-0 w-full bg-emerald-500/10 rounded-full -z-10 border border-emerald-500/25"
                   initial={false}
                   transition={{
                     type: "spring",
@@ -71,10 +71,10 @@ export function NavBar({ items, className }: NavBarProps) {
                   }}
                 >
                   {/* Glowing Top Line / Beam */}
-                  <div className="absolute -top-2 left-1/2 -translate-x-1/2 w-8 h-1 bg-cyan-400 rounded-t-full shadow-[0_-4px_14px_rgba(6,182,212,0.9)]">
-                    <div className="absolute w-12 h-6 bg-cyan-400/30 rounded-full blur-md -top-2 -left-2" />
-                    <div className="absolute w-8 h-6 bg-cyan-400/25 rounded-full blur-md -top-1" />
-                    <div className="absolute w-4 h-4 bg-cyan-400/40 rounded-full blur-sm top-0 left-2" />
+                  <div className="absolute -top-2 left-1/2 -translate-x-1/2 w-8 h-1 bg-emerald-400 rounded-t-full shadow-[0_-4px_14px_rgba(6,182,212,0.9)]">
+                    <div className="absolute w-12 h-6 bg-emerald-400/30 rounded-full blur-md -top-2 -left-2" />
+                    <div className="absolute w-8 h-6 bg-emerald-400/25 rounded-full blur-md -top-1" />
+                    <div className="absolute w-4 h-4 bg-emerald-400/40 rounded-full blur-sm top-0 left-2" />
                   </div>
                 </motion.div>
               )}
