@@ -84,7 +84,7 @@ The frontend will start at `http://localhost:5173` and automatically proxy `/api
 - User Registration & Sign In (JWT Authentication)
 - Role-Based Access Control (RBAC: Owner, Editor, Viewer, Admin)
 - INR ₹ Resource Cost Sizing Engine
-- Multi-Cloud Comparison (AWS, GCP, Azure, DigitalOcean)
+- Multi-Cloud Comparison (AWS, GCP, Azure)
 - GitHub Repository Integration & Manifest Generation
 - Infrastructure Deployment Simulator & Logging
 - Dynamic Cost Optimization Tuning

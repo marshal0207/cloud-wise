@@ -1,5 +1,6 @@
 import random
 import math
+import os
 import re
 import secrets
 import urllib.error
@@ -24,7 +25,9 @@ from .models import (
     EstimationRecord, 
     DeploymentRecord, 
     WaitlistSubscriber,
-        GitHubConnection,
+    GitHubConnection,
+    PriceSnapshot,
+    CostDataPoint,
     default_estimation,
     default_recommendation,
     default_deployment,
@@ -38,10 +41,17 @@ from .serializers import (
     ContactInquirySerializer,
     EstimationRecordSerializer,
     DeploymentRecordSerializer,
-    WaitlistSubscriberSerializer
+    WaitlistSubscriberSerializer,
+    PriceSnapshotSerializer
 )
 from .permissions import IsProjectRolePermission
 from .services.deployment_file_generator import generate_deployment_files
+from .services import (
+    recommendation_service,
+    optimization_service,
+    synthetic_data_service,
+    forecasting_service,
+)
 from .services.github_service import GitHubApiError, push_files_to_repository
 from .services.github_repository_service import inspect_repository
 from .services.tech_stack_detector import UnsupportedTechStackError, detect_tech_stack
@@ -1399,18 +1409,143 @@ def github_repositories_view(request):
 
 @api_view(['POST'])
 @permission_classes([permissions.AllowAny])
-def ai_recommend_view(request):
+def project_recommend_view(request, pk):
+    """
+    POST /api/projects/:id/recommend
+    Runs the recommendation engine against cached PriceSnapshot data for a specific project.
+    Accepts optional specification overrides or defaults to project's estimation.
+    Returns clear 400 error if PriceSnapshot has zero rows.
+    """
+    project = Project.objects.filter(pk=pk).first()
+    if not project:
+        return Response({
+            'success': False,
+            'error': f"Project '{pk}' not found."
+        }, status=status.HTTP_404_NOT_FOUND)
+
+    data = request.data or {}
+    estimation = project.estimation or {}
+    calc = estimation.get('calculatedResult') or estimation.get('calculated_result') or {}
+
+    payload = {
+        'vcpu': int(data.get('vcpu') or estimation.get('vcpu') or 2),
+        'ramGB': float(data.get('ramGB') or data.get('ram') or estimation.get('ramGB') or estimation.get('ram') or 4.0),
+        'storageGB': float(data.get('storageGB') or data.get('storage') or estimation.get('storageGB') or estimation.get('storage') or 50.0),
+        'bandwidthGB': float(data.get('bandwidthGB') or calc.get('bandwidthGB') or calc.get('bandwidth_gb') or 100.0),
+        'region': data.get('region') or estimation.get('region') or 'Asia Pacific (Mumbai)',
+        'workloadType': data.get('workloadType') or estimation.get('appType') or estimation.get('app_type') or 'Web APIs',
+        'trafficTier': data.get('trafficTier') or estimation.get('trafficTier') or estimation.get('traffic_tier') or 'medium',
+        'preference': data.get('preference') or estimation.get('budgetTier') or estimation.get('budget_tier') or 'balanced',
+    }
+
+    try:
+        recommendation_result = recommendation_service.generate_recommendation(payload)
+    except recommendation_service.NoPriceDataError as exc:
+        return Response({
+            'success': False,
+            'error': str(exc)
+        }, status=status.HTTP_400_BAD_REQUEST)
+    except Exception as exc:
+        return Response({
+            'success': False,
+            'error': f"Failed to compute recommendation: {exc}"
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    # Persist the top recommendation in the project record
+    rec = recommendation_result['recommended']
+    usd_to_inr = float(os.getenv('USD_TO_INR_RATE', '83'))
+    monthly_inr = round(rec['monthlyCostUsd'] * usd_to_inr)
+    hourly_cost = round(rec['monthlyCostUsd'] / 730.0, 2)
+
+    project.selected_recommendation = {
+        'id': f"{rec['provider'].lower()}-rec-{rec['instanceType'].lower().replace('.', '-')}",
+        'title': f"{rec['provider']} {rec['instanceType']} Recommended Node",
+        'provider': rec['provider'],
+        'badge': 'Recommended',
+        'specs': {
+            'vcpu': rec['vcpu'],
+            'ram': round(rec['memoryGiB']),
+            'storage': f"{int(payload['storageGB'])} GB SSD",
+            'network': 'Up to 10 Gbps',
+        },
+        'monthlyCost': monthly_inr,
+        'hourlyCost': hourly_cost,
+        'reliability': '99.99% SLA' if 'Reserved' in rec['pricingModel'] else '99.95% SLA',
+        'features': [
+            f"{rec['vcpu']} vCPU / {rec['memoryGiB']} GiB RAM",
+            f"Pricing Model: {rec['pricingModel']}",
+            f"Priority: {payload['preference'].capitalize()}",
+            f"Normalized Score: {rec['score']}",
+        ],
+        'reasoning': rec['reasoning'],
+    }
+    project.current_step = 'recommendation'
+    project.save(update_fields=['selected_recommendation', 'current_step', 'updated_at'])
+
+    options = [project.selected_recommendation]
+    for idx, alt in enumerate(recommendation_result.get('alternatives', [])):
+        alt_monthly_inr = round(alt['monthlyCostUsd'] * usd_to_inr)
+        alt_hourly = round(alt['monthlyCostUsd'] / 730.0, 2)
+        badge = 'Alternative'
+        if idx == 0:
+            badge = 'Budget Option' if alt['monthlyCostUsd'] < rec['monthlyCostUsd'] else 'Performance Option'
+        elif idx == 1:
+            badge = 'Alternative'
+
+        options.append({
+            'id': f"{alt['provider'].lower()}-rec-{alt['instanceType'].lower().replace('.', '-')}",
+            'title': f"{alt['provider']} {alt['instanceType']} Node",
+            'provider': alt['provider'],
+            'badge': badge,
+            'specs': {
+                'vcpu': alt['vcpu'],
+                'ram': round(alt['memoryGiB']),
+                'storage': f"{int(payload['storageGB'])} GB SSD",
+                'network': 'Up to 10 Gbps',
+            },
+            'monthlyCost': alt_monthly_inr,
+            'hourlyCost': alt_hourly,
+            'reliability': '99.99% SLA' if 'Reserved' in alt['pricingModel'] else '99.95% SLA',
+            'features': [
+                f"{alt['vcpu']} vCPU / {alt['memoryGiB']} GiB RAM",
+                f"Pricing Model: {alt['pricingModel']}",
+                f"Normalized Score: {alt['score']}",
+            ],
+            'reasoning': alt['reasoning'],
+        })
+
     return Response({
         'success': True,
-        'status': 'stub_pending_ml_model',
-        'message': 'CloudWise ML inference stub called.',
-        'aiRecommendations': {
-            'suggestedVcpu': 6,
-            'suggestedRam': 24,
-            'confidenceScore': 0.94,
-            'predictedCostSavingsPercent': 28.5
-        }
+        'data': recommendation_result,
+        'selectedRecommendation': project.selected_recommendation,
+        'options': options,
     }, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+@permission_classes([permissions.AllowAny])
+def ai_recommend_view(request):
+    """
+    POST /api/ai/recommend-workload
+    Direct recommendation endpoint powered by recommendation_service.
+    """
+    data = request.data or {}
+    try:
+        result = recommendation_service.generate_recommendation(data)
+        return Response({
+            'success': True,
+            'data': result
+        }, status=status.HTTP_200_OK)
+    except recommendation_service.NoPriceDataError as exc:
+        return Response({
+            'success': False,
+            'error': str(exc)
+        }, status=status.HTTP_400_BAD_REQUEST)
+    except Exception as exc:
+        return Response({
+            'success': False,
+            'error': f"Failed to compute recommendation: {exc}"
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 @api_view(['POST'])
@@ -1469,6 +1604,7 @@ def aws_pricing_view(request):
     return Response({'success': True, 'data': snapshot}, status=status.HTTP_200_OK)
 
 
+<<<<<<< Updated upstream
 # -------------------------------------------------------------
 # Deployment Management Endpoints (REAL provider status polling)
 # -------------------------------------------------------------
@@ -1669,11 +1805,91 @@ def deployment_status_view(request, deployment_id):
             'ip_address': record.ip_address,
             'message': f'Returning stored status for provider {provider}.',
         }
+=======
+@api_view(['GET'])
+@permission_classes([permissions.AllowAny])
+def pricing_compare_view(request):
+    """
+    GET /api/pricing/compare
+    Returns normalized pricing snapshots across providers sorted by pricePerUnit ascending.
+    Supports optional query filters:
+      - ?minVcpu=<int>
+      - ?minMemoryGiB=<float>
+      - ?provider=<str> (AWS, Azure, GCP)
+    """
+    queryset = PriceSnapshot.objects.all()
+
+    min_vcpu = request.query_params.get('minVcpu')
+    if min_vcpu:
+        try:
+            queryset = queryset.filter(vcpu__gte=int(min_vcpu))
+        except (ValueError, TypeError):
+            pass
+
+    min_memory = request.query_params.get('minMemoryGiB')
+    if min_memory:
+        try:
+            queryset = queryset.filter(memoryGiB__gte=float(min_memory))
+        except (ValueError, TypeError):
+            pass
+
+    provider = request.query_params.get('provider')
+    if provider:
+        queryset = queryset.filter(provider__iexact=provider.strip())
+
+    queryset = queryset.order_by('pricePerUnit')
+    serializer = PriceSnapshotSerializer(queryset, many=True)
+    return Response({
+        'success': True,
+        'count': len(serializer.data),
+        'data': serializer.data,
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['GET', 'POST'])
+@permission_classes([permissions.AllowAny])
+def project_optimize_view(request, pk):
+    """
+    GET/POST /api/projects/:id/optimize
+    Runs rule-based optimization engine and anomaly detection on project telemetry.
+    Matches the schema expected by Optimization.tsx.
+    """
+    project = Project.objects.filter(pk=pk).first()
+    if not project:
+        return Response({
+            'success': False,
+            'error': f"Project '{pk}' not found."
+        }, status=status.HTTP_404_NOT_FOUND)
+
+    # Check if telemetry exists, else synthesize realistic 90-day telemetry
+    if not CostDataPoint.objects.filter(project_id_str=pk).exists():
+        synthetic_data_service.generate_project_timeseries(
+            project_id=pk,
+            days=90,
+            seed=abs(hash(pk)) % 10000,
+            inject_anomaly=True,
+        )
+
+    custom_metrics = request.data.get('metrics') if isinstance(request.data, dict) else None
+    result = optimization_service.generate_optimization_suggestions(
+        project_id=pk,
+        custom_metrics=custom_metrics,
+    )
+
+    if result.get('suggestions'):
+        project.optimizations = result['suggestions']
+        project.save(update_fields=['optimizations', 'updated_at'])
+
+    return Response({
+        'success': True,
+        'data': result,
+>>>>>>> Stashed changes
     }, status=status.HTTP_200_OK)
 
 
 @api_view(['GET'])
 @permission_classes([permissions.AllowAny])
+<<<<<<< Updated upstream
 def deployment_logs_view(request, deployment_id):
     """
     Return real deployment logs.
@@ -1947,3 +2163,77 @@ def deployment_rollback_view(request, deployment_id):
         'success': False,
         'error': f'Rollback not supported for provider "{provider}".'
     }, status=status.HTTP_400_BAD_REQUEST)
+=======
+def project_forecast_view(request, pk):
+    """
+    GET /api/projects/:id/forecast
+    Produces a 30-day daily cost forecast with widening confidence bounds using Holt-Winters.
+    """
+    project = Project.objects.filter(pk=pk).first()
+    if not project:
+        return Response({
+            'success': False,
+            'error': f"Project '{pk}' not found."
+        }, status=status.HTTP_404_NOT_FOUND)
+
+    horizon_days = int(request.query_params.get('horizonDays', 30))
+
+    points = list(CostDataPoint.objects.filter(project_id_str=pk).order_by('date'))
+    if not points:
+        points = synthetic_data_service.generate_project_timeseries(
+            project_id=pk,
+            days=90,
+            seed=abs(hash(pk)) % 10000,
+        )
+
+    forecast = forecasting_service.forecast_cost(points, horizon_days=horizon_days)
+
+    history_snippet = [
+        {
+            'date': str(p.date),
+            'costUsd': p.cost_usd,
+            'cpuPercent': p.cpu_percent,
+            'ramPercent': p.ram_percent,
+        }
+        for p in points[-30:]
+    ]
+
+    return Response({
+        'success': True,
+        'projectId': pk,
+        'forecast': forecast,
+        'history': history_snippet,
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+@permission_classes([permissions.AllowAny])
+def project_anomalies_view(request, pk):
+    """
+    GET /api/projects/:id/anomalies
+    Returns rolling 14-day z-score cost anomalies for telemetry dashboard.
+    """
+    project = Project.objects.filter(pk=pk).first()
+    if not project:
+        return Response({
+            'success': False,
+            'error': f"Project '{pk}' not found."
+        }, status=status.HTTP_404_NOT_FOUND)
+
+    points = list(CostDataPoint.objects.filter(project_id_str=pk).order_by('date'))
+    if not points:
+        points = synthetic_data_service.generate_project_timeseries(
+            project_id=pk,
+            days=90,
+            seed=abs(hash(pk)) % 10000,
+            inject_anomaly=True,
+        )
+
+    anomalies = optimization_service.detect_cost_anomalies(points)
+    return Response({
+        'success': True,
+        'projectId': pk,
+        'anomalies': anomalies,
+    }, status=status.HTTP_200_OK)
+
+>>>>>>> Stashed changes

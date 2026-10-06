@@ -1,6 +1,7 @@
 import uuid
 from django.db import models
 from django.contrib.auth.models import AbstractUser
+from django.utils import timezone
 
 def generate_custom_id(prefix):
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
@@ -156,3 +157,46 @@ class GitHubConnection(models.Model):
 
     def __str__(self):
         return f"GitHub connection for {self.user.email or self.user.username}"
+
+
+class PriceSnapshot(models.Model):
+    provider = models.CharField(max_length=50, db_index=True)
+    service = models.CharField(max_length=100)
+    region = models.CharField(max_length=100, db_index=True)
+    sku = models.CharField(max_length=255, blank=True, default='')
+    instanceType = models.CharField(max_length=100, db_index=True)
+    vcpu = models.IntegerField()
+    memoryGiB = models.FloatField()
+    storageType = models.CharField(max_length=100, null=True, blank=True)
+    unit = models.CharField(max_length=50, default='Hrs')
+    pricePerUnit = models.FloatField(db_index=True)
+    currency = models.CharField(max_length=10, default='USD')
+    pricingModel = models.CharField(max_length=50, default='OnDemand')
+    fetchedAt = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        unique_together = ('provider', 'instanceType', 'region')
+        ordering = ['pricePerUnit']
+
+    def __str__(self):
+        return f"{self.provider} {self.instanceType} ({self.region}): ${self.pricePerUnit}/{self.unit}"
+
+
+class CostDataPoint(models.Model):
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='cost_history', null=True, blank=True)
+    project_id_str = models.CharField(max_length=100, db_index=True)
+    date = models.DateField(db_index=True)
+    cost_usd = models.FloatField()
+    cpu_percent = models.FloatField(default=0.0)
+    ram_percent = models.FloatField(default=0.0)
+    storage_percent = models.FloatField(default=0.0)
+    requests_count = models.IntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['date']
+        unique_together = ('project_id_str', 'date')
+
+    def __str__(self):
+        return f"{self.project_id_str} on {self.date}: ${self.cost_usd:.2f} (CPU: {self.cpu_percent:.1f}%)"
+

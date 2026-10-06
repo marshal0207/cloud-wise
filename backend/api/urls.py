@@ -12,6 +12,10 @@ urlpatterns = [
     # Projects API
     path('projects', views.projects_list_create_view, name='projects_list_create'),
     path('projects/<str:pk>', views.project_detail_view, name='project_detail'),
+    path('projects/<str:pk>/recommend', views.project_recommend_view, name='project_recommend'),
+    path('projects/<str:pk>/optimize', views.project_optimize_view, name='project_optimize'),
+    path('projects/<str:pk>/forecast', views.project_forecast_view, name='project_forecast'),
+    path('projects/<str:pk>/anomalies', views.project_anomalies_view, name='project_anomalies'),
     path('projects/<str:pk>/github', views.project_github_connect_view, name='project_github_connect'),
     path('projects/<str:pk>/github/inspect', views.project_github_inspect_view, name='project_github_inspect'),
     path('projects/<str:pk>/github/push', views.project_github_push_view, name='project_github_push'),
@@ -38,4 +42,6 @@ urlpatterns = [
     path('github/oauth/callback', views.github_oauth_callback_view, name='github_oauth_callback'),
     path('github/repos', views.github_repositories_view, name='github_repositories'),
     path('pricing/aws', views.aws_pricing_view, name='aws_pricing'),
+    path('pricing/compare', views.pricing_compare_view, name='pricing_compare'),
 ]
+

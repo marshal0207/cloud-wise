@@ -17,41 +17,51 @@ import { useCloudWise, RecommendationOption, formatINR } from '@/context/CloudWi
 
 export const Recommendation: React.FC = () => {
   const navigate = useNavigate();
-  const { estimation, availableRecommendations, selectedRecommendation, setSelectedRecommendation } = useCloudWise();
+  const { activeProject, estimation, availableRecommendations, selectedRecommendation, setSelectedRecommendation } = useCloudWise();
   
   const [detailModalItem, setDetailModalItem] = useState<RecommendationOption | null>(null);
   const [recommendations, setRecommendations] = useState(availableRecommendations);
-  const [awsPricingStatus, setAwsPricingStatus] = useState<'loading' | 'live' | 'estimate'>('loading');
+  const [engineStatus, setEngineStatus] = useState<'loading' | 'live' | 'fallback'>('loading');
 
   useEffect(() => {
-    const loadAwsPricing = async () => {
+    const fetchRecommendations = async () => {
       try {
-        const response = await fetch(
-          `/api/pricing/aws?instanceType=c6i.xlarge&region=${encodeURIComponent('Asia Pacific (Mumbai)')}`
-        );
-        const data = await response.json();
-        if (!response.ok || !data.success) {
-          throw new Error(data.error || 'AWS pricing unavailable');
-        }
+        const projectId = activeProject?.id || 'proj_default';
+        const preference = estimation.budgetTier?.toLowerCase().includes('perf')
+          ? 'performance'
+          : estimation.budgetTier?.toLowerCase().includes('cost') || estimation.budgetTier?.toLowerCase().includes('econ')
+          ? 'cost'
+          : 'balanced';
 
-        setRecommendations((current) => current.map((recommendation) => (
-          recommendation.id === 'aws-rec-1'
-            ? {
-                ...recommendation,
-                monthlyCost: data.data.monthlyInr,
-                hourlyCost: data.data.hourlyUsd,
-                reasoning: `${(recommendation.reasoning || '').split(' Live AWS Pricing API rate:')[0]} Live AWS Pricing API rate: $${data.data.hourlyUsd}/hour, converted at ₹${data.data.usdToInrRate}/USD.`
-              }
-            : recommendation
-        )));
-        setAwsPricingStatus('live');
-      } catch {
-        setAwsPricingStatus('estimate');
+        const response = await fetch(`/api/projects/${projectId}/recommend`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            vcpu: estimation.vcpu,
+            ramGB: estimation.ram,
+            storageGB: estimation.storage,
+            region: estimation.region,
+            preference: preference,
+          })
+        });
+
+        const resData = await response.json();
+        if (response.ok && resData.success && Array.isArray(resData.options) && resData.options.length > 0) {
+          setRecommendations(resData.options);
+          if (resData.selectedRecommendation) {
+            setSelectedRecommendation(resData.selectedRecommendation);
+          }
+          setEngineStatus('live');
+          return;
+        }
+      } catch (err) {
+        console.warn('Live recommendation engine fallback', err);
       }
+      setEngineStatus('fallback');
     };
 
-    loadAwsPricing();
-  }, []);
+    fetchRecommendations();
+  }, [activeProject?.id, estimation.vcpu, estimation.ram, estimation.storage, estimation.region, estimation.budgetTier]);
 
   const selectedDisplayRecommendation = recommendations.find(
     (recommendation) => recommendation.id === selectedRecommendation.id
@@ -80,7 +90,7 @@ export const Recommendation: React.FC = () => {
           Based on your workload profile (<strong className="text-cyan-300">{estimation.appType}</strong> requiring ~{estimation.vcpu} vCPUs & {estimation.ram}GB RAM in {estimation.region}), we matched 4 top cloud configurations.
         </p>
         <p className="text-[11px] text-slate-500">
-          AWS pricing: {awsPricingStatus === 'loading' ? 'loading live rate...' : awsPricingStatus === 'live' ? 'live AWS Pricing API' : 'estimated fallback'}; other providers are estimated.
+          Scoring status: {engineStatus === 'loading' ? 'evaluating multi-cloud catalog...' : engineStatus === 'live' ? 'live multi-criteria scoring active (AWS, GCP, Azure)' : 'baseline recommendation'}; ranked by normalized price-performance.
         </p>
       </div>
 

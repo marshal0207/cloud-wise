@@ -1,7 +1,7 @@
 import re
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
-from .models import Project, ContactInquiry, EstimationRecord, DeploymentRecord, WaitlistSubscriber
+from .models import Project, ContactInquiry, EstimationRecord, DeploymentRecord, WaitlistSubscriber, PriceSnapshot
 
 User = get_user_model()
 
@@ -176,3 +176,25 @@ class WaitlistSubscriberSerializer(serializers.ModelSerializer):
     class Meta:
         model = WaitlistSubscriber
         fields = ['id', 'email', 'source', 'createdAt']
+
+
+class PriceSnapshotSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PriceSnapshot
+        fields = [
+            'id',
+            'provider',
+            'service',
+            'region',
+            'sku',
+            'instanceType',
+            'vcpu',
+            'memoryGiB',
+            'storageType',
+            'unit',
+            'pricePerUnit',
+            'currency',
+            'pricingModel',
+            'fetchedAt',
+        ]
+

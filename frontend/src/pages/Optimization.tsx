@@ -7,20 +7,44 @@ import {
   Sliders, 
   Info, 
   X, 
-  Sparkles
+  Sparkles,
+  RefreshCw
 } from 'lucide-react';
 import { useCloudWise, OptimizationItem, formatINR } from '@/context/CloudWiseContext';
 
 export const Optimization: React.FC = () => {
   const { 
+    activeProject,
     selectedRecommendation, 
     optimizations, 
+    setOptimizations,
     applyOptimization, 
     totalMonthlySavings, 
-    effectiveMonthlyCost 
+    effectiveMonthlyCost,
+    showToast
   } = useCloudWise();
 
   const [detailItem, setDetailItem] = useState<OptimizationItem | null>(null);
+  const [loadingBackend, setLoadingBackend] = useState(false);
+
+  const fetchOptimizations = async () => {
+    if (!activeProject?.id) return;
+    setLoadingBackend(true);
+    try {
+      const res = await fetch(`/api/projects/${activeProject.id}/optimize`);
+      if (res.ok) {
+        const payload = await res.json();
+        if (payload?.data?.suggestions && Array.isArray(payload.data.suggestions) && payload.data.suggestions.length > 0) {
+          setOptimizations(payload.data.suggestions);
+          showToast('Updated recommendations from live telemetry scan.', 'success');
+        }
+      }
+    } catch (err) {
+      console.warn('Backend optimize fetch skipped', err);
+    } finally {
+      setLoadingBackend(false);
+    }
+  };
 
   const initialCost = selectedRecommendation.monthlyCost;
   const savingsPercent = Math.round((totalMonthlySavings / initialCost) * 100) || 0;
@@ -83,9 +107,19 @@ export const Optimization: React.FC = () => {
             <Sliders className="w-5 h-5 text-cyan-400" />
             <span>Actionable Optimization Opportunities</span>
           </h2>
-          <span className="text-xs text-slate-400">
-            {optimizations.filter((o) => o.applied).length} of {optimizations.length} Applied
-          </span>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={fetchOptimizations}
+              disabled={loadingBackend}
+              className="px-3.5 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-xs font-semibold text-cyan-300 flex items-center gap-1.5 transition-all active:scale-95 disabled:opacity-50"
+            >
+              <RefreshCw size={12} className={loadingBackend ? 'animate-spin' : ''} />
+              <span>{loadingBackend ? 'Scanning...' : 'Live Telemetry Scan'}</span>
+            </button>
+            <span className="text-xs text-slate-400">
+              {optimizations.filter((o) => o.applied).length} of {optimizations.length} Applied
+            </span>
+          </div>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">

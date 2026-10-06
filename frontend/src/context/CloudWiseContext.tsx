@@ -34,7 +34,7 @@ export interface EstimationData {
 export interface RecommendationOption {
   id: string;
   title: string;
-  provider: 'AWS' | 'Azure' | 'GCP' | 'DigitalOcean';
+  provider: 'AWS' | 'Azure' | 'GCP';
   badge: 'Recommended' | 'Alternative' | 'Budget Option' | 'Performance Option';
   specs: {
     vcpu: number;
@@ -96,6 +96,7 @@ export interface MonitoringData {
   ipAddress: string;
   endpointUrl: string | null;
 }
+
 
 export interface Project {
   id: string;
@@ -287,6 +288,7 @@ interface CloudWiseContextType {
   resetDeployment: () => void;
 
   optimizations: OptimizationItem[];
+  setOptimizations: (opts: OptimizationItem[]) => void;
   applyOptimization: (id: string) => void;
   totalMonthlySavings: number;
   effectiveMonthlyCost: number;
@@ -862,6 +864,7 @@ export const CloudWiseProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         rollbackDeployment,
         resetDeployment,
         optimizations,
+        setOptimizations: (opts: OptimizationItem[]) => updateActiveProject({ optimizations: opts }),
         applyOptimization,
         totalMonthlySavings,
         effectiveMonthlyCost,
