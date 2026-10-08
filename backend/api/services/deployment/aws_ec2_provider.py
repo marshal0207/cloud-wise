@@ -715,9 +715,11 @@ class AwsEc2Provider(DeploymentProvider):
             sg_id, sg_name = self._ensure_security_group(ec2, log)
             image = self._resolve_image(ec2)
 
-            key_name = str(
-                self.config.get("key_name") or settings.AWS_EC2_KEY_NAME or ""
-            )
+            # CloudWise deployments use AWS Systems Manager (SSM) for all
+            # instance access and deployment operations.  Do not depend on
+            # an EC2 SSH key pair, because key pairs are account-specific
+            # and are not required when SSM is configured.
+            key_name = ""
             # SSM is mandatory for CloudWise deployments. Never allow an
             # empty instance-profile setting to launch an instance without
             # the CloudWise SSM profile.
@@ -732,7 +734,7 @@ class AwsEc2Provider(DeploymentProvider):
                 f"instanceType={instance_type}, ami={image.get('ImageId', '')}, "
                 f"securityGroup={sg_name} ({sg_id}), "
                 f"ports={settings.AWS_SECURITY_GROUP_PORTS}, "
-                f"ssh={'key' if key_name else 'none'}"
+                "ssh=ssm-only"
                 + (", instanceProfile" if instance_profile else ""),
             )
 
@@ -3950,8 +3952,12 @@ class AwsEc2Provider(DeploymentProvider):
                     },
                 }
             ]
-        if key_name:
-            params["KeyName"] = key_name
+        # SSM is mandatory for CloudWise deployments. Never send an EC2
+        # KeyName here: SSH key pairs are account-specific and CloudWise
+        # must work in a user's AWS account without requiring them to
+        # manually create or configure an SSH key pair.
+        #
+        # SSM access is provided by IamInstanceProfile below.
         # SSM is mandatory for CloudWise deployments. Always launch the
         # instance with the configured profile, falling back to the
         # CloudWise-managed SSM profile when settings are empty.
